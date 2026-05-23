@@ -42,3 +42,9 @@ Sub-folders matter: place under `Edit/` to make the script appear when the Edit 
 
 ## Fusion scripting
 Available via `resolve.Fusion()` and via per-clip `fusionComp` objects. Standard Fusion scripting API applies — `AddTool`, parameter set, animation via `BezierSpline` / `LinearSpline` modifiers — same as Fusion standalone.
+
+## Bridge gotchas
+
+- **`scriptapp("Resolve")` will crash the host interpreter** (Windows: exit code `-1073741819` / `0xC0000005` access violation) if no Resolve process is running — `fusionscript.dll` segfaults rather than returning `None`. Always pre-check for a running Resolve process before calling it (see `slideshow.resolve_bridge.is_resolve_running`).
+- The SDK directory **is already installed** by Resolve at `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting` — no separate SDK download is required on Windows.
+- Verified working from an external Python 3.12 interpreter: path resolution and SDK module discovery succeed without setting any env vars manually.
