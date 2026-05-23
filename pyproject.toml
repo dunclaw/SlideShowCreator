@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slideshow-creator"
+version = "0.0.0"
+description = "DaVinci Resolve plug-in for building polished slideshows from an ordered media list."
+readme = "README.md"
+requires-python = ">=3.6"
+authors = [{ name = "SlideShowCreator contributors" }]
+license = { text = "TBD" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: Plugins",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+]
+# Runtime deps are intentionally empty: the in-Resolve script must run under
+# Resolve's bundled Python 3.6 with stdlib only. Optional audio analysis runs
+# in a sidecar venv (see [project.optional-dependencies] below).
+dependencies = []
+
+[project.optional-dependencies]
+audio = [
+    "librosa>=0.10",
+    "numpy>=1.23",
+    "soundfile>=0.12",
+]
+dev = [
+    "pytest>=7",
+    "ruff>=0.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py36"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
