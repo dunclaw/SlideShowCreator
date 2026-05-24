@@ -53,11 +53,55 @@ We use forward slashes (`os.path.abspath(p).replace("\\", "/")`) before passing
 paths to Resolve on Windows — both APIs accept either style in theory but
 forward slashes are noticeably more reliable in practice.
 
-### Important assumption to verify
-`SetProperty` looks like it sets a *constant* value, not a keyframed one. For animated transitions (scale/position/rotation/transparency over time), we plan to use `AddFusionComp()` and build a Transform node with animated spline inputs.
+### `SetProperty` is constant-only (confirmed)
+
+The README enumerates every supported `SetProperty` key and **none** accept a
+keyframe / time component, nor is there an `AddKeyframe` method on
+`TimelineItem`. For animated transitions (scale, position, rotation,
+transparency over time) we must use `AddFusionComp()` plus a Fusion node graph
+with animated inputs.
+
+### Per-clip placement with `AppendToTimeline`
+
+The `clipInfo` dict accepted by `MediaPool.AppendToTimeline([{...}])` supports
+these keys (per the SDK README):
+
+- `mediaPoolItem` *(required)*
+- `startFrame` / `endFrame` — source range
+- `mediaType` — `1` = video only, `2` = audio only
+- **`trackIndex`** — target track (e.g. `2` for V2)
+- **`recordFrame`** — target timeline frame where the clip is placed
+
+This is what makes the **V1/V2 overlap pattern** (used by the transitions
+framework) work: place every slide on V1 sequentially, then drop the incoming
+half of each transition on V2 at the precise overlap frame, and animate that
+V2 clip with a Fusion comp.
 
 ## Fusion scripting
-Available via `resolve.Fusion()` and via per-clip `fusionComp` objects. Standard Fusion scripting API applies — `AddTool`, parameter set, animation via `BezierSpline` / `LinearSpline` modifiers — same as Fusion standalone.
+
+Available via `resolve.Fusion()` for the global Fusion app object and via
+per-clip `fusionComp` objects returned from `TimelineItem.AddFusionComp()` /
+`GetFusionCompByName(name)`. The standard Fusion Python scripting API
+applies:
+
+- `comp.Lock()` / `comp.Unlock()` — batch edits inside the bracket.
+- `comp.FindTool(name)` — fetch an existing tool (e.g. `"MediaIn1"`).
+- `comp.AddTool(toolType, x, y)` — add a new tool. Common types we use:
+  `"Transform"`, `"Merge"`, `"Background"`, `"Blur"`.
+- `dst.ConnectInput(input_name, src.Output)` — wire outputs to inputs.
+- `tool.SetInput(name, value, time)` — set a parameter. Calling with the
+  same `(name)` at multiple `time` values produces an animated input (Fusion
+  auto-creates a BezierSpline modifier behind the scenes). For `Point`-type
+  inputs (e.g. `Transform.Center`, `Transform.Pivot`) the value is a
+  `(x, y)` tuple in normalized coords (`(0.5, 0.5)` is frame center).
+
+A Resolve-attached comp comes pre-wired with `MediaIn1` and `MediaOut1`;
+we just splice tools in between them.
+
+These conventions are implemented as thin helpers in
+`src/slideshow/fusion_comps.py` (`attach_or_get_comp`, `insert_transform_chain`,
+`set_scalar_keyframes`, `set_point_keyframes`, `TransformAnimation`,
+`attach_transform_animation`).
 
 ## Bridge gotchas
 
