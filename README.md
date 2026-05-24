@@ -15,8 +15,10 @@ Project bootstrap. See `docs/PLAN.md` (or the session plan) for the implementati
 
 ## Target environment
 
-- DaVinci Resolve 18+ (free or Studio) on Windows / macOS / Linux
-- Python 3.6+ (64-bit) — required by Resolve's scripting API
+- DaVinci Resolve 20+ (free or Studio) on Windows / macOS / Linux
+- Python 3.10 or 3.14 (64-bit) — required by Resolve's scripting API.
+  **Avoid Python 3.12** on Windows: it crashes loading `fusionscript.dll`.
+  Use `py -3.14 ...` (or `py -3.10 ...`) to invoke the helper scripts.
 - Installed via the `Workspace → Scripts → Edit` menu
 
 ## License

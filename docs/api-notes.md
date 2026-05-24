@@ -47,4 +47,20 @@ Available via `resolve.Fusion()` and via per-clip `fusionComp` objects. Standard
 
 - **`scriptapp("Resolve")` will crash the host interpreter** (Windows: exit code `-1073741819` / `0xC0000005` access violation) if no Resolve process is running — `fusionscript.dll` segfaults rather than returning `None`. Always pre-check for a running Resolve process before calling it (see `slideshow.resolve_bridge.is_resolve_running`).
 - The SDK directory **is already installed** by Resolve at `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting` — no separate SDK download is required on Windows.
-- Verified working from an external Python 3.12 interpreter: path resolution and SDK module discovery succeed without setting any env vars manually.
+- Verified working from an external Python 3.14 interpreter against **DaVinci Resolve Studio 20.3.1.6** on Windows 11.
+
+### Python version compatibility (observed empirically)
+
+`fusionscript.dll` is built against Python 3's stable ABI (`python3.dll`), so in
+theory it works with any Python ≥ 3.6. In practice, certain interpreter builds
+crash on `import DaVinciResolveScript`:
+
+| Python  | Result |
+| ------- | ------ |
+| 3.12.0 (python.org install) | Access violation while loading `fusionscript.dll` |
+| 3.14.3 (Windows Python Manager) | Works |
+
+If you see exit code `-1073741819` immediately after the "import" step in
+`scripts/diagnose.py`, try a different Python build (3.10 or 3.14 are known
+good). The Resolve SDK README still officially lists Python 3.6 / 3.10 as
+preferred.
