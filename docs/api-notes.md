@@ -37,6 +37,22 @@ Sub-folders matter: place under `Edit/` to make the script appear when the Edit 
 - `GetFusionCompCount()` / `GetFusionCompByIndex(i)` / `LoadFusionCompByName(name)` / `GetFusionCompNameList()`
 - `SetClipColor(...)` for visual tagging.
 
+### MediaPool import gotcha
+
+There are **two different APIs** that look similar but behave very differently:
+
+- `MediaStorage.AddItemListToMediaPool(paths)` — only accepts paths that live
+  under one of Resolve's **configured Media Storage roots**. For any path
+  outside those roots, Resolve pops a "file does not exist" dialog for each
+  file (even when the file is plainly there on disk).
+- `MediaPool.ImportMedia(paths)` — accepts arbitrary absolute filesystem
+  paths. This is the right call for a plug-in operating on user-chosen
+  folders.
+
+We use forward slashes (`os.path.abspath(p).replace("\\", "/")`) before passing
+paths to Resolve on Windows — both APIs accept either style in theory but
+forward slashes are noticeably more reliable in practice.
+
 ### Important assumption to verify
 `SetProperty` looks like it sets a *constant* value, not a keyframed one. For animated transitions (scale/position/rotation/transparency over time), we plan to use `AddFusionComp()` and build a Transform node with animated spline inputs.
 

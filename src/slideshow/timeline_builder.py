@@ -53,10 +53,18 @@ def _media_pool_subfolder(
     return new_folder or root
 
 
-def _import_media(
-    media_storage: Any, media_pool: Any, paths: Sequence[str]
-) -> List[Any]:
+def _normalize_for_resolve(path: str) -> str:
+    """Return an absolute path using forward slashes (Resolve prefers them on Windows)."""
+    return os.path.abspath(path).replace("\\", "/")
+
+
+def _import_media(media_pool: Any, paths: Sequence[str]) -> List[Any]:
     """Import a list of absolute file paths into the *current* media-pool folder.
+
+    Uses ``MediaPool.ImportMedia()`` (which accepts arbitrary filesystem paths),
+    NOT ``MediaStorage.AddItemListToMediaPool()`` (which only accepts paths
+    under Resolve's configured Media Storage roots and pops "file does not
+    exist" dialogs otherwise).
 
     Returns the created ``MediaPoolItem`` objects in the **same order** as
     ``paths``. We index returned items by file name to recover the order
@@ -65,8 +73,8 @@ def _import_media(
     if not paths:
         return []
 
-    abs_paths = [os.path.abspath(p) for p in paths]
-    created = media_storage.AddItemListToMediaPool(abs_paths) or []
+    norm_paths = [_normalize_for_resolve(p) for p in paths]
+    created = media_pool.ImportMedia(norm_paths) or []
 
     by_name = {}
     for item in created:
@@ -78,7 +86,7 @@ def _import_media(
             by_name.setdefault(fname, []).append(item)
 
     ordered: List[Any] = []
-    for p in abs_paths:
+    for p in norm_paths:
         bucket = by_name.get(os.path.basename(p))
         if bucket:
             ordered.append(bucket.pop(0))
@@ -134,7 +142,6 @@ class TimelineBuilder:
         ctx = self.context
         resolve_project = ctx.project
         media_pool = ctx.media_pool
-        media_storage = ctx.media_storage
 
         fps = _timeline_fps(resolve_project)
 
@@ -142,7 +149,7 @@ class TimelineBuilder:
         media_pool.SetCurrentFolder(folder)
 
         paths = [it.path for it in self.project.items]
-        media_items = _import_media(media_storage, media_pool, paths)
+        media_items = _import_media(media_pool, paths)
 
         missing = [
             it.path for it, mpi in zip(self.project.items, media_items) if mpi is None

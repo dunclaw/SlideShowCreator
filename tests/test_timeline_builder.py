@@ -79,7 +79,6 @@ def test_timeline_fps_falls_back_when_setting_invalid():
 
 
 def test_import_media_preserves_input_order():
-    storage = MagicMock()
     pool = MagicMock()
 
     # Resolve will return items in arbitrary order — simulate that.
@@ -90,25 +89,33 @@ def test_import_media_preserves_input_order():
     item_c = MagicMock()
     item_c.GetClipProperty.return_value = "c.jpg"
 
-    storage.AddItemListToMediaPool.return_value = [item_b, item_c, item_a]
+    pool.ImportMedia.return_value = [item_b, item_c, item_a]
 
-    paths = ["/abs/a.jpg", "/abs/b.jpg", "/abs/c.jpg"]
-    result = tb._import_media(storage, pool, paths)
+    paths = [r"D:\abs\a.jpg", r"D:\abs\b.jpg", r"D:\abs\c.jpg"]
+    result = tb._import_media(pool, paths)
 
     assert result == [item_a, item_b, item_c]
+    # And confirm we normalized to forward slashes before calling Resolve.
+    called_paths = pool.ImportMedia.call_args[0][0]
+    assert all("\\" not in p for p in called_paths)
 
 
 def test_import_media_reports_missing_as_none():
-    storage = MagicMock()
     pool = MagicMock()
     found = MagicMock()
     found.GetClipProperty.return_value = "present.jpg"
-    storage.AddItemListToMediaPool.return_value = [found]
+    pool.ImportMedia.return_value = [found]
 
     result = tb._import_media(
-        storage, pool, ["/abs/present.jpg", "/abs/missing.jpg"]
+        pool, [r"D:\abs\present.jpg", r"D:\abs\missing.jpg"]
     )
     assert result == [found, None]
+
+
+def test_normalize_for_resolve_uses_forward_slashes():
+    out = tb._normalize_for_resolve(r"C:\foo\bar\baz.jpg")
+    assert "\\" not in out
+    assert out.endswith("/foo/bar/baz.jpg")
 
 
 # --------------------------------------------------------------------------- #
@@ -134,33 +141,33 @@ def _wire_mock_context(*, fps="24"):
     timeline.GetName.return_value = "Slideshow"
     media_pool.CreateTimelineFromClips.return_value = timeline
 
-    media_storage = MagicMock()
-
     ctx.resolve.GetProjectManager.return_value.GetCurrentProject.return_value = project
     project.GetMediaPool.return_value = media_pool
-    ctx.resolve.GetMediaStorage.return_value = media_storage
 
-    return ctx, project, media_pool, media_storage, new_folder, timeline
+    return ctx, project, media_pool, new_folder, timeline
 
 
 def test_builder_creates_subfolder_and_imports_media():
-    ctx, project, mp, ms, new_folder, timeline = _wire_mock_context()
+    ctx, project, mp, new_folder, timeline = _wire_mock_context()
 
     items = []
-    for i, name in enumerate(["a.jpg", "b.jpg"]):
+    for name in ["a.jpg", "b.jpg"]:
         m = MagicMock()
         m.GetClipProperty.return_value = name
         items.append(m)
-    ms.AddItemListToMediaPool.return_value = items
+    mp.ImportMedia.return_value = items
 
-    proj = SlideshowProject.from_paths(["/abs/a.jpg", "/abs/b.jpg"], name="Demo")
+    proj = SlideshowProject.from_paths([r"D:\abs\a.jpg", r"D:\abs\b.jpg"], name="Demo")
 
     out = tb.TimelineBuilder(proj, context=ctx).build()
 
     assert out is timeline
     mp.AddSubFolder.assert_called_once()
     mp.SetCurrentFolder.assert_called_once_with(new_folder)
-    ms.AddItemListToMediaPool.assert_called_once()
+    mp.ImportMedia.assert_called_once()
+    # Confirm the paths passed to ImportMedia are absolute & forward-slashed.
+    called = mp.ImportMedia.call_args[0][0]
+    assert all("\\" not in p for p in called)
 
     args, _ = mp.CreateTimelineFromClips.call_args
     assert args[0] == "Demo"
@@ -172,13 +179,13 @@ def test_builder_creates_subfolder_and_imports_media():
 
 
 def test_builder_raises_when_import_partially_fails():
-    ctx, project, mp, ms, _new, _tl = _wire_mock_context()
+    ctx, project, mp, _new, _tl = _wire_mock_context()
 
     found = MagicMock()
     found.GetClipProperty.return_value = "a.jpg"
-    ms.AddItemListToMediaPool.return_value = [found]
+    mp.ImportMedia.return_value = [found]
 
-    proj = SlideshowProject.from_paths(["/abs/a.jpg", "/abs/missing.jpg"])
+    proj = SlideshowProject.from_paths([r"D:\abs\a.jpg", r"D:\abs\missing.jpg"])
     with pytest.raises(RuntimeError, match="Failed to import"):
         tb.TimelineBuilder(proj, context=ctx).build()
 
@@ -190,20 +197,20 @@ def test_builder_raises_on_empty_project():
 
 
 def test_builder_raises_when_resolve_returns_no_timeline():
-    ctx, project, mp, ms, _new, _tl = _wire_mock_context()
+    ctx, project, mp, _new, _tl = _wire_mock_context()
     mp.CreateTimelineFromClips.return_value = None
 
     found = MagicMock()
     found.GetClipProperty.return_value = "a.jpg"
-    ms.AddItemListToMediaPool.return_value = [found]
+    mp.ImportMedia.return_value = [found]
 
-    proj = SlideshowProject.from_paths(["/abs/a.jpg"])
+    proj = SlideshowProject.from_paths([r"D:\abs\a.jpg"])
     with pytest.raises(RuntimeError, match="returned None"):
         tb.TimelineBuilder(proj, context=ctx).build()
 
 
 def test_builder_reuses_existing_subfolder():
-    ctx, project, mp, ms, _new, _tl = _wire_mock_context()
+    ctx, project, mp, _new, _tl = _wire_mock_context()
 
     existing = MagicMock()
     existing.GetName.return_value = "SlideShowCreator"
@@ -211,9 +218,9 @@ def test_builder_reuses_existing_subfolder():
 
     found = MagicMock()
     found.GetClipProperty.return_value = "a.jpg"
-    ms.AddItemListToMediaPool.return_value = [found]
+    mp.ImportMedia.return_value = [found]
 
-    proj = SlideshowProject.from_paths(["/abs/a.jpg"])
+    proj = SlideshowProject.from_paths([r"D:\abs\a.jpg"])
     tb.TimelineBuilder(proj, context=ctx).build()
 
     mp.AddSubFolder.assert_not_called()
@@ -221,20 +228,20 @@ def test_builder_reuses_existing_subfolder():
 
 
 def test_per_item_duration_overrides_default():
-    ctx, project, mp, ms, _new, _tl = _wire_mock_context(fps="30")
+    ctx, project, mp, _new, _tl = _wire_mock_context(fps="30")
 
     items = []
     for name in ["a.jpg", "b.jpg"]:
         m = MagicMock()
         m.GetClipProperty.return_value = name
         items.append(m)
-    ms.AddItemListToMediaPool.return_value = items
+    mp.ImportMedia.return_value = items
 
     proj = SlideshowProject(
         name="X",
         items=[
-            MediaItem(path="/abs/a.jpg", duration_seconds=2.0),
-            MediaItem(path="/abs/b.jpg"),  # falls back to default
+            MediaItem(path=r"D:\abs\a.jpg", duration_seconds=2.0),
+            MediaItem(path=r"D:\abs\b.jpg"),  # falls back to default
         ],
         default_item_duration_seconds=3.0,
     )
