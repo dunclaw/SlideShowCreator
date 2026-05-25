@@ -1,0 +1,62 @@
+"""Transition planning framework.
+
+Pure-Python layer that maps each :class:`~slideshow.project_model.TransitionChoice`
+to a :class:`TransitionPlan` describing what the Fusion-comp applier
+should do for the outgoing and incoming sides of the transition. This
+package never imports Resolve and is fully unit-testable.
+
+Entry points:
+
+* :func:`plan_transition` — high-level dispatcher; takes a
+  ``TransitionChoice`` from the project model, returns a
+  ``TransitionPlan``.
+* :func:`get_transition` — lower-level lookup of the
+  :class:`Transition` impl for one kind name.
+* :func:`registered_kinds` — list every concrete kind that has an
+  implementation registered. Should match
+  ``project_model.TRANSITION_KINDS`` minus ``{"auto"}``.
+
+Importing this package eagerly imports every implementation module so
+each one's :func:`~slideshow.transitions.base.register` decorator runs
+and the registry is fully populated.
+"""
+
+from __future__ import annotations
+
+from .base import (
+    COMPOSITE_MODES,
+    ClipPlan,
+    PointKeyframe,
+    RgbColor,
+    ScalarKeyframe,
+    Transition,
+    TransitionPlan,
+    get_transition,
+    plan_transition,
+    register,
+    registered_kinds,
+)
+
+# Eagerly import every implementation module so their @register decorators
+# populate the registry. Each import is a no-op if already loaded.
+from . import dissolves as _dissolves  # noqa: F401
+from . import fades as _fades  # noqa: F401
+from . import effects as _effects  # noqa: F401
+from . import geometry as _geometry  # noqa: F401
+from . import flip as _flip  # noqa: F401
+from . import drop as _drop  # noqa: F401
+
+
+__all__ = [
+    "COMPOSITE_MODES",
+    "ClipPlan",
+    "PointKeyframe",
+    "RgbColor",
+    "ScalarKeyframe",
+    "Transition",
+    "TransitionPlan",
+    "get_transition",
+    "plan_transition",
+    "register",
+    "registered_kinds",
+]
