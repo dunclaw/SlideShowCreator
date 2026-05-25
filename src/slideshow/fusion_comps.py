@@ -6,37 +6,38 @@ real transitions: slide, push, zoom, flip, drop, dissolve), every transition
 attaches a Fusion composition to a timeline item and constructs a small node
 graph: MediaIn1 → Transform → MediaOut1 (plus optional Merge/Background/Blur).
 
-This module deliberately stays:
+The Fusion scripting API in DaVinci Resolve 20.3 has a number of sharp edges
+this module hides:
 
-* **Stdlib-only** so it runs under Resolve's bundled Python 3.6 interpreter.
-* **Thin** — one verb per function — so transition modules can compose without
-  re-discovering Fusion API conventions.
-* **Mockable** — every public function takes the Resolve/Fusion object as an
-  argument; nothing reaches out to the global ``ResolveContext`` itself.
+* ``clip.AddFusionComp()`` returns a *stub* handle whose edits silently do not
+  persist. Don't use it. Always go through
+  ``clip.LoadFusionCompByName(name)`` and edit through *that* return value.
+* ``fusion.GetCurrentComp()`` follows the **UI selection**, not the comp you
+  just loaded — using it for scripted edits routes them to the wrong clip.
+* ``clip.RenameFusionCompByName(...)`` returns ``False`` and is a no-op, so
+  we never rely on giving a comp a custom name. We always edit the FIRST
+  comp on the clip (the one Resolve actually renders on the timeline).
+* ``tool.SetInput(name, value, time)`` does NOT keyframe — the ``time``
+  argument is ignored and only the last value survives as a constant. To
+  animate a scalar input, build a ``BezierSpline`` modifier and connect it.
+  To animate a Point input (Center, Pivot, …), use
+  ``tool.AddModifier(input, "XYPath")`` then drive the XYPath's X and Y
+  child inputs with their own BezierSpline children. Plain
+  ``comp.AddTool("XYPath") + ConnectInput`` does NOT work for Point inputs
+  because the XYPath's ``.Output`` is a Path type, not a Point — Fusion
+  silently drops the connection.
+* Even after correct edits, Resolve will not re-render the clip on the
+  Edit page until ``comp.SetAttrs({"COMPB_Modified": True})`` is called.
+  That flag is what produces the "3 yellow dots" modified marker.
 
-Fusion API notes (the bits we rely on):
-
-* ``timeline_item.AddFusionComp()`` adds a comp and returns it. Resolve
-  auto-wires a ``MediaIn1`` → ``MediaOut1`` graph inside.
-* ``comp.Lock() / comp.Unlock()`` brackets atomic edits.
-* ``comp.FindTool(name)`` returns a tool by its name (``"MediaIn1"`` etc.).
-* ``comp.AddTool(toolType, x, y)`` adds a tool at the given flow position.
-* ``dst_tool.ConnectInput(input_name, src_tool.Output)`` wires outputs to
-  inputs. ``dst_tool.Input = src_tool.Output`` is a shorthand for the default
-  ``"Input"`` parameter.
-* ``tool.SetInput(name, value, time)`` sets a parameter; supplying multiple
-  time values creates an animated spline behind the scenes. For ``Point``
-  inputs (e.g. ``Center``) the value is a ``(x, y)`` tuple or list.
-
-If the live behavior of ``SetInput`` keyframing turns out to differ in any
-Resolve build, the breakage is isolated to ``_apply_keyframes`` and the rest
-of the abstraction stays intact.
+If any of these behaviors change in a future Resolve build, the breakage will
+be isolated to the helpers in this file.
 """
 
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
 
 
 # --------------------------------------------------------------------------- #
@@ -47,7 +48,6 @@ ScalarKeyframe = Tuple[Union[int, float], float]
 PointKeyframe = Tuple[Union[int, float], Tuple[float, float]]
 
 
-DEFAULT_COMP_NAME = "SlideShowCreator"
 DEFAULT_TRANSFORM_NAME = "SlideShowXf"
 
 
@@ -57,11 +57,10 @@ DEFAULT_TRANSFORM_NAME = "SlideShowXf"
 
 @contextlib.contextmanager
 def locked(comp: Any):
-    """Context manager that brackets edits in ``comp.Lock()`` / ``Unlock()``.
+    """Bracket a batch of edits in ``comp.Lock()`` / ``Unlock()``.
 
     Fusion strongly prefers batched edits to land inside a Lock/Unlock pair —
-    otherwise every micro-change triggers a UI refresh and may produce a
-    visible flicker in the Fusion page.
+    otherwise every micro-change triggers a UI refresh.
     """
     comp.Lock()
     try:
@@ -74,43 +73,65 @@ def locked(comp: Any):
 # Comp lifecycle on a timeline item
 # --------------------------------------------------------------------------- #
 
-def attach_or_get_comp(timeline_item: Any, name: str = DEFAULT_COMP_NAME) -> Any:
-    """Return the comp named *name* on *timeline_item*, creating it if missing.
+def get_active_comp(timeline_item: Any) -> Any:
+    """Return a handle to the *active* Fusion comp on *timeline_item*.
 
-    Resolve happily lets a single timeline item carry multiple comps — we want
-    exactly one named comp for SlideShowCreator's use, so the function is
-    idempotent: calling it again returns the same comp rather than stacking
-    duplicates.
+    "Active" = the first comp on the clip; that is the one Resolve renders
+    on the Edit-page timeline. If the clip has no comp yet (a fresh clip
+    that was never opened on the Fusion page), one is created here so we
+    have something to edit.
+
+    The returned handle is obtained via ``LoadFusionCompByName`` — that is
+    the *only* call whose return value gives a comp object that scripted
+    edits actually persist through. ``GetFusionCompByName`` and the value
+    returned by ``AddFusionComp`` look superficially the same but do NOT
+    let edits land in the comp Resolve renders.
     """
-    existing_names = timeline_item.GetFusionCompNameList() or []
-    if name in existing_names:
-        return timeline_item.GetFusionCompByName(name)
-
-    comp = timeline_item.AddFusionComp()
+    names = timeline_item.GetFusionCompNameList() or []
+    if not names:
+        added_name = timeline_item.AddFusionComp()
+        if not added_name:
+            raise RuntimeError(
+                "TimelineItem.AddFusionComp() did not create a comp on {0!r}.".format(
+                    _safe_name(timeline_item)
+                )
+            )
+        names = timeline_item.GetFusionCompNameList() or []
+        if not names:
+            raise RuntimeError(
+                "TimelineItem reports no comps after AddFusionComp() on {0!r}.".format(
+                    _safe_name(timeline_item)
+                )
+            )
+    comp = timeline_item.LoadFusionCompByName(names[0])
     if comp is None:
         raise RuntimeError(
-            "TimelineItem.AddFusionComp() returned None for {0!r}.".format(
-                timeline_item.GetName() if hasattr(timeline_item, "GetName") else "?"
+            "LoadFusionCompByName({0!r}) returned None on {1!r}.".format(
+                names[0], _safe_name(timeline_item)
             )
         )
-
-    # Newly-added comps get an auto-generated name ("Composition 1", etc.).
-    # Rename so subsequent calls find it.
-    try:
-        current = comp.GetAttrs("COMPS_Name") if hasattr(comp, "GetAttrs") else None
-    except Exception:
-        current = None
-    if current and current != name:
-        timeline_item.RenameFusionCompByName(current, name)
     return comp
 
 
-def remove_comp(timeline_item: Any, name: str = DEFAULT_COMP_NAME) -> bool:
-    """Delete the named comp from *timeline_item* if present."""
-    existing_names = timeline_item.GetFusionCompNameList() or []
-    if name not in existing_names:
-        return False
-    return bool(timeline_item.DeleteFusionCompByName(name))
+# Backwards-compatible alias used by older callers / tests.
+attach_or_get_comp = get_active_comp
+
+
+def mark_modified(comp: Any) -> None:
+    """Tell Resolve that *comp* has changed, so it re-renders the clip.
+
+    Without this call, our scripted edits land in the comp data fine but
+    Resolve's Edit-page renderer keeps showing the unmodified frame and
+    the clip never gets the "3 yellow dots" modified marker.
+
+    Should be called once after a batch of edits (outside the Lock/Unlock).
+    """
+    try:
+        comp.SetAttrs({"COMPB_Modified": True})
+    except Exception:
+        # Be tolerant: if a future Resolve build removes this attr we'd
+        # rather lose the auto-rerender than crash all consumers.
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -129,12 +150,7 @@ def find_or_add_tool(
     *,
     position: Tuple[int, int] = (0, 0),
 ) -> Any:
-    """Return the tool named *name*, creating it as *tool_type* if missing.
-
-    The Fusion flow-view position (used only to keep node graphs readable when
-    a user opens the comp) is honored when creating; existing tools are not
-    moved.
-    """
+    """Return the tool named *name*, creating it as *tool_type* if missing."""
     existing = comp.FindTool(name)
     if existing is not None:
         return existing
@@ -147,21 +163,12 @@ def find_or_add_tool(
     try:
         tool.SetAttrs({"TOOLS_Name": name})
     except Exception:
-        # Older Fusion builds reject some attr keys; the tool still works.
         pass
     return tool
 
 
-def connect(
-    src_tool: Any,
-    dst_tool: Any,
-    dst_input: str = "Input",
-) -> None:
-    """Wire ``src_tool.Output`` into ``dst_tool[dst_input]``.
-
-    Uses ``ConnectInput(name, output)`` which works regardless of whether the
-    Python binding exposes inputs as attributes.
-    """
+def connect(src_tool: Any, dst_tool: Any, dst_input: str = "Input") -> None:
+    """Wire ``src_tool.Output`` into ``dst_tool[dst_input]``."""
     out = getattr(src_tool, "Output", None)
     if out is None:
         out = src_tool.GetOutput("Output") if hasattr(src_tool, "GetOutput") else None
@@ -173,50 +180,166 @@ def connect(
 
 
 # --------------------------------------------------------------------------- #
-# Keyframe application
+# Keyframe application via BezierSpline modifiers
 # --------------------------------------------------------------------------- #
 
-def _apply_keyframes(
-    tool: Any,
-    input_name: str,
-    keyframes: Sequence[Tuple[Union[int, float], Any]],
-) -> None:
-    """Apply a sorted list of ``(time, value)`` keyframes to a tool input.
+def _tool_attr_name(tool: Any) -> str:
+    """Return the tool's name attribute, or ''.
 
-    Calling ``SetInput(name, value, time)`` repeatedly is the Fusion pattern
-    that produces an animated input. With a single keyframe the input becomes
-    a constant at that value; with two or more, Fusion auto-creates a spline.
-
-    Values for vector inputs (Point) should be a ``(x, y)`` tuple or list.
-    Scalar values are plain ``float`` / ``int``.
+    Used so we can detect a previously-created modifier from a prior run and
+    reuse it rather than orphaning splines in the node graph.
     """
-    if not keyframes:
-        return
-    ordered = sorted(keyframes, key=lambda kv: kv[0])
-    for time, value in ordered:
-        tool.SetInput(input_name, value, time)
+    try:
+        return tool.GetAttrs("TOOLS_Name") or ""
+    except Exception:
+        return ""
 
 
 def set_scalar_keyframes(
+    comp: Any,
     tool: Any,
     input_name: str,
     keyframes: Sequence[ScalarKeyframe],
-) -> None:
-    """Animate a scalar input (Size, Angle, Gain, Blend, …)."""
-    _apply_keyframes(tool, input_name, list(keyframes))
+) -> Optional[Any]:
+    """Animate a scalar input (Size, Angle, Gain, Blend, …).
+
+    With zero keyframes: no-op.
+    With one keyframe:   set as a non-animated constant.
+    With two or more:    create a ``BezierSpline`` modifier, populate its
+                         keyframes, and connect it to ``tool[input_name]``.
+                         Fusion automatically renames the spline to
+                         ``<tool><input>`` (e.g. ``SlideShowXfAngle``)
+                         when ConnectInput is called.
+
+    Returns the BezierSpline tool created (or ``None`` if no spline was
+    needed).
+    """
+    kfs = sorted(keyframes, key=lambda kv: kv[0]) if keyframes else []
+    if not kfs:
+        return None
+    if len(kfs) == 1:
+        tool.SetInput(input_name, float(kfs[0][1]))
+        return None
+
+    # Try to reuse an existing connected modifier of the expected name so
+    # repeated calls don't pile up orphan splines in the comp.
+    expected_name = "{0}{1}".format(_tool_attr_name(tool), input_name)
+    spline = comp.FindTool(expected_name) if expected_name else None
+    if spline is None:
+        spline = comp.AddTool("BezierSpline")
+        if spline is None:
+            raise RuntimeError(
+                "comp.AddTool('BezierSpline') returned None for input {0!r}".format(
+                    input_name
+                )
+            )
+    spline.SetKeyFrames({int(t): [float(v)] for t, v in kfs})
+    tool.ConnectInput(input_name, spline)
+    return spline
+
+
+def _connected_tool(tool: Any, input_name: str) -> Optional[Any]:
+    """Return the tool currently driving ``tool.<input_name>``, or ``None``.
+
+    Used both to detect an already-wired modifier (so we don't add duplicates
+    on a re-run) and to navigate from an input to the tool that the
+    ``AddModifier`` call just attached.
+    """
+    inp = getattr(tool, input_name, None)
+    if inp is None:
+        return None
+    gco = getattr(inp, "GetConnectedOutput", None)
+    if gco is None:
+        return None
+    try:
+        out = gco()
+    except Exception:
+        return None
+    if out is None:
+        return None
+    gt = getattr(out, "GetTool", None)
+    if gt is None:
+        return None
+    try:
+        return gt()
+    except Exception:
+        return None
 
 
 def set_point_keyframes(
+    comp: Any,
     tool: Any,
     input_name: str,
     keyframes: Sequence[PointKeyframe],
-) -> None:
-    """Animate a Point input (Center, Pivot, …). Values are ``(x, y)`` tuples.
+) -> Optional[Any]:
+    """Animate a Point input (Center, Pivot, …) using an XYPath modifier.
 
-    Fusion's coordinate space for Point inputs is normalized: ``(0.5, 0.5)``
-    is the frame center; ``(0, 0.5)`` is the left edge.
+    Fusion's Point inputs cannot be animated by a single BezierSpline — they
+    require an ``XYPath`` modifier whose own ``X`` and ``Y`` inputs are each
+    driven by a BezierSpline child. The canonical wiring is::
+
+        tool.AddModifier(input_name, "XYPath")
+        xypath = tool.<input>.GetConnectedOutput().GetTool()
+        xypath.AddModifier("X", "BezierSpline")
+        xypath.AddModifier("Y", "BezierSpline")
+        x_spline = xypath.X.GetConnectedOutput().GetTool()
+        y_spline = xypath.Y.GetConnectedOutput().GetTool()
+        x_spline.SetKeyFrames({frame: [x_value]})
+        y_spline.SetKeyFrames({frame: [y_value]})
+
+    The crucial difference vs. naive ``comp.AddTool("XYPath")`` +
+    ``ConnectInput`` is that ``AddModifier`` creates AND binds the modifier
+    into the Point input in one atomic step. Plain ``ConnectInput`` does not
+    work because the XYPath's ``.Output`` is a ``Path`` type, not a
+    ``Point`` — Fusion silently drops the connection.
+
+    With zero keyframes: no-op.
+    With one keyframe:   set as a non-animated constant ``(x, y)``.
+    With two or more:    build the XYPath + child splines and populate.
+
+    Returns the XYPath tool (or ``None`` if no animation was needed).
     """
-    _apply_keyframes(tool, input_name, list(keyframes))
+    kfs = sorted(keyframes, key=lambda kv: kv[0]) if keyframes else []
+    if not kfs:
+        return None
+    if len(kfs) == 1:
+        x, y = kfs[0][1]
+        tool.SetInput(input_name, [float(x), float(y)])
+        return None
+
+    # Reuse an existing XYPath if a previous run already wired one.
+    xypath = _connected_tool(tool, input_name)
+    if xypath is None:
+        added = tool.AddModifier(input_name, "XYPath")
+        if added is False:
+            raise RuntimeError(
+                "tool.AddModifier({0!r}, 'XYPath') returned False".format(input_name)
+            )
+        xypath = _connected_tool(tool, input_name)
+        if xypath is None:
+            raise RuntimeError(
+                "AddModifier({0!r}, 'XYPath') did not wire an XYPath".format(input_name)
+            )
+
+    # Same dance for X and Y child splines.
+    x_spline = _connected_tool(xypath, "X")
+    if x_spline is None:
+        xypath.AddModifier("X", "BezierSpline")
+        x_spline = _connected_tool(xypath, "X")
+    y_spline = _connected_tool(xypath, "Y")
+    if y_spline is None:
+        xypath.AddModifier("Y", "BezierSpline")
+        y_spline = _connected_tool(xypath, "Y")
+    if x_spline is None or y_spline is None:
+        raise RuntimeError(
+            "Could not access XYPath X/Y child splines for input {0!r}".format(
+                input_name
+            )
+        )
+
+    x_spline.SetKeyFrames({int(t): [float(v[0])] for t, v in kfs})
+    y_spline.SetKeyFrames({int(t): [float(v[1])] for t, v in kfs})
+    return xypath
 
 
 def set_constant(tool: Any, input_name: str, value: Any) -> None:
@@ -236,10 +359,10 @@ def insert_transform_chain(
     media_out_name: str = "MediaOut1",
     position: Tuple[int, int] = (1, 0),
 ) -> Any:
-    """Insert a Transform tool between MediaIn1 and MediaOut1, return it.
+    """Insert a Transform tool between MediaIn1 and MediaOut1 and return it.
 
-    Idempotent: if a Transform named *transform_name* is already chained in,
-    returns it without re-inserting. The graph after the call is always::
+    Idempotent: re-using a Transform named *transform_name* is fine, and the
+    wiring is always (re)established. The graph after the call is always::
 
         MediaIn1.Output ─> Transform.Input
         Transform.Output ─> MediaOut1.Input
@@ -258,9 +381,7 @@ def insert_transform_chain(
                 media_out_name
             )
         )
-
     xform = find_or_add_tool(comp, "Transform", transform_name, position=position)
-
     connect(media_in, xform, "Input")
     connect(xform, media_out, "Input")
     return xform
@@ -271,7 +392,7 @@ def insert_transform_chain(
 # --------------------------------------------------------------------------- #
 
 class TransformAnimation:
-    """A declarative description of a Transform tool's animation.
+    """Declarative description of a Transform tool's animation.
 
     Each field is an optional list of keyframes:
 
@@ -280,7 +401,7 @@ class TransformAnimation:
     * ``angle``      — list of ``(frame, degrees)``    counter-clockwise
     * ``pivot``      — list of ``(frame, (x, y))``     pivot for rotation/scale
 
-    A frame value is relative to the **start of the Fusion comp**, which
+    Frame values are relative to the start of the Fusion comp, which
     matches the start of the timeline clip. Frame 0 is the first visible
     frame of the clip.
 
@@ -309,35 +430,43 @@ class TransformAnimation:
 
 
 def apply_transform_animation(
-    transform_tool: Any, animation: TransformAnimation
+    comp: Any, transform_tool: Any, animation: TransformAnimation
 ) -> None:
-    """Push a :class:`TransformAnimation` onto a Transform tool."""
+    """Push a :class:`TransformAnimation` onto a Transform tool.
+
+    ``comp`` is required because animated inputs need a ``BezierSpline`` /
+    ``XYPath`` modifier added to the same composition.
+    """
     if animation.center:
-        set_point_keyframes(transform_tool, "Center", animation.center)
+        set_point_keyframes(comp, transform_tool, "Center", animation.center)
     if animation.pivot:
-        set_point_keyframes(transform_tool, "Pivot", animation.pivot)
+        set_point_keyframes(comp, transform_tool, "Pivot", animation.pivot)
     if animation.size:
-        set_scalar_keyframes(transform_tool, "Size", animation.size)
+        set_scalar_keyframes(comp, transform_tool, "Size", animation.size)
     if animation.angle:
-        set_scalar_keyframes(transform_tool, "Angle", animation.angle)
+        set_scalar_keyframes(comp, transform_tool, "Angle", animation.angle)
 
 
 def attach_transform_animation(
     timeline_item: Any,
     animation: TransformAnimation,
     *,
-    comp_name: str = DEFAULT_COMP_NAME,
     transform_name: str = DEFAULT_TRANSFORM_NAME,
 ) -> Any:
     """End-to-end helper: ensure a comp + Transform exist and apply *animation*.
 
-    Returns the Transform tool. All Fusion edits happen inside a single
-    Lock/Unlock pair.
+    All edits land in the clip's *active* comp (the first comp, which is
+    the one Resolve renders on the Edit-page timeline). After the
+    Lock/Unlock pair, the comp is marked modified so Resolve picks up the
+    change for playback.
+
+    Returns the Transform tool.
     """
-    comp = attach_or_get_comp(timeline_item, comp_name)
+    comp = get_active_comp(timeline_item)
     with locked(comp):
         xform = insert_transform_chain(comp, transform_name=transform_name)
-        apply_transform_animation(xform, animation)
+        apply_transform_animation(comp, xform, animation)
+    mark_modified(comp)
     return xform
 
 
@@ -348,20 +477,28 @@ def attach_transform_animation(
 def list_tools(comp: Any) -> List[str]:
     """Return the names of all tools in a comp (for diagnostics)."""
     tools = comp.GetToolList(False) or {}
-    # GetToolList returns a 1-indexed dict — we just want names.
     names: List[str] = []
     if isinstance(tools, dict):
         for key in sorted(tools.keys()):
             t = tools[key]
             try:
-                names.append(t.Name)
+                names.append(t.GetAttrs("TOOLS_Name"))
             except Exception:
-                names.append(str(key))
+                try:
+                    names.append(t.Name)
+                except Exception:
+                    names.append(str(key))
     return names
 
 
+def _safe_name(timeline_item: Any) -> str:
+    try:
+        return timeline_item.GetName()
+    except Exception:
+        return "?"
+
+
 __all__ = [
-    "DEFAULT_COMP_NAME",
     "DEFAULT_TRANSFORM_NAME",
     "PointKeyframe",
     "ScalarKeyframe",
@@ -372,10 +509,11 @@ __all__ = [
     "connect",
     "find_or_add_tool",
     "find_tool",
+    "get_active_comp",
     "insert_transform_chain",
     "list_tools",
     "locked",
-    "remove_comp",
+    "mark_modified",
     "set_constant",
     "set_point_keyframes",
     "set_scalar_keyframes",

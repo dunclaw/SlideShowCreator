@@ -80,28 +80,84 @@ V2 clip with a Fusion comp.
 ## Fusion scripting
 
 Available via `resolve.Fusion()` for the global Fusion app object and via
-per-clip `fusionComp` objects returned from `TimelineItem.AddFusionComp()` /
-`GetFusionCompByName(name)`. The standard Fusion Python scripting API
-applies:
+per-clip `fusionComp` objects. The standard Fusion Python scripting API
+applies in theory — but several documented behaviors are silently broken
+in the Resolve 20.3 build of `fusionscript.dll`. The helpers in
+`src/slideshow/fusion_comps.py` encode the working pattern.
 
-- `comp.Lock()` / `comp.Unlock()` — batch edits inside the bracket.
-- `comp.FindTool(name)` — fetch an existing tool (e.g. `"MediaIn1"`).
-- `comp.AddTool(toolType, x, y)` — add a new tool. Common types we use:
-  `"Transform"`, `"Merge"`, `"Background"`, `"Blur"`.
-- `dst.ConnectInput(input_name, src.Output)` — wire outputs to inputs.
-- `tool.SetInput(name, value, time)` — set a parameter. Calling with the
-  same `(name)` at multiple `time` values produces an animated input (Fusion
-  auto-creates a BezierSpline modifier behind the scenes). For `Point`-type
-  inputs (e.g. `Transform.Center`, `Transform.Pivot`) the value is a
-  `(x, y)` tuple in normalized coords (`(0.5, 0.5)` is frame center).
+### Canonical pattern (use this; everything else is broken)
 
-A Resolve-attached comp comes pre-wired with `MediaIn1` and `MediaOut1`;
-we just splice tools in between them.
+```python
+# Get a writable handle to the comp Resolve actually renders on the timeline
+names = clip.GetFusionCompNameList() or []
+if not names:
+    clip.AddFusionComp()
+    names = clip.GetFusionCompNameList() or []
+comp = clip.LoadFusionCompByName(names[0])   # USE the return value
 
-These conventions are implemented as thin helpers in
-`src/slideshow/fusion_comps.py` (`attach_or_get_comp`, `insert_transform_chain`,
-`set_scalar_keyframes`, `set_point_keyframes`, `TransformAnimation`,
-`attach_transform_animation`).
+# Edit inside a Lock/Unlock pair
+comp.Lock()
+try:
+    xf = comp.AddTool("Transform")
+    xf.SetAttrs({"TOOLS_Name": "MyXf"})
+    media_in  = comp.FindTool("MediaIn1")
+    media_out = comp.FindTool("MediaOut1")
+    xf.ConnectInput("Input", media_in.Output)
+    media_out.ConnectInput("Input", xf.Output)
+
+    # --- Scalar input animation (Angle, Size, Gain, Blend, Opacity ...) ---
+    # Use a BezierSpline modifier added directly to the comp, then connect.
+    spline = comp.AddTool("BezierSpline")
+    spline.SetKeyFrames({0: [0.0], 24: [90.0]})   # frame -> [value]
+    xf.ConnectInput("Angle", spline)              # Fusion auto-renames to "MyXfAngle"
+
+    # --- Point input animation (Center, Pivot) ---
+    # Plain ConnectInput of an XYPath does NOT work (XYPath.Output is a Path
+    # type, not Point). Use tool.AddModifier — it creates AND wires atomically.
+    xf.AddModifier("Center", "XYPath")
+    xypath = xf.Center.GetConnectedOutput().GetTool()
+    xypath.AddModifier("X", "BezierSpline")
+    xypath.AddModifier("Y", "BezierSpline")
+    x_spline = xypath.X.GetConnectedOutput().GetTool()
+    y_spline = xypath.Y.GetConnectedOutput().GetTool()
+    x_spline.SetKeyFrames({0: [-0.5], 24: [0.5]})  # off-screen left -> centered
+    y_spline.SetKeyFrames({0: [ 0.5], 24: [0.5]})  # Y stays at 0.5
+finally:
+    comp.Unlock()
+
+# Tell Resolve the comp changed so the Edit page actually re-renders it
+comp.SetAttrs({"COMPB_Modified": True})
+```
+
+### What's broken in Resolve 20.3 (confirmed by live testing 2026-05-24)
+
+| API                                                | Behavior                            | Workaround |
+|----------------------------------------------------|-------------------------------------|------------|
+| `clip.AddFusionComp()` return value                | Stub handle; edits don't persist    | Use `LoadFusionCompByName(name)` return value instead |
+| `clip.GetFusionCompByName(name)` return value      | Stub handle; edits don't persist    | Same — use `LoadFusionCompByName` |
+| `fusion.GetCurrentComp()`                          | Follows UI clip selection, not scripted target | Don't rely on it; use the handle from `LoadFusionCompByName` |
+| `clip.RenameFusionCompByName(old, new)`            | Returns `False`, no-op              | Don't rename comps — always edit the first one |
+| `tool.SetInput(name, value, time)` with time       | Ignores `time`; only sets a constant | Use a `BezierSpline` modifier + `SetKeyFrames` + `ConnectInput` |
+| `tool.Input[time] = value` (subscript syntax)      | `TypeError: 'NoneType' is not callable` | Same — use BezierSpline |
+| `fusion.Refresh()` / `fusion.UpdateDisplay()`      | `NoneType` not callable             | Just rely on `COMPB_Modified` flag |
+| `comp.Save()` (no args)                            | Pops a "save .comp file" dialog     | Don't call it — `COMPB_Modified` is what we want |
+| `clip.DeleteFusionCompByName(activeComp)`          | Can crash Resolve                   | Don't delete the active comp from script |
+| `comp.AddTool("XYPath")` + `xf.ConnectInput("Center", xypath)` | Connection appears to succeed but doesn't drive Center (XYPath.Output is type `Path`, not `Point`) | Use `xf.AddModifier("Center", "XYPath")` — wires correctly in one call |
+| `comp.AddTool("XYPath")` then `XYPath1X.SetKeyFrames({0:[v0], 24:[v1]})` | Creates 2 keyframes but values are reset to default 0.5/0.5 (child splines of a disconnected XYPath aren't writable scalars) | Same — use `AddModifier` so the children are bound and writable |
+| `xypath.SetKeyFrames({"X": {...}, "Y": {...}})` | `NoneType not callable` — XYPath itself has no `SetKeyFrames` | Address children via `xypath.X.GetConnectedOutput().GetTool().SetKeyFrames(...)` |
+| `path = comp.AddTool("Path"); path.SetKeyFrames({0:[(x,y)]})` | `NoneType not callable` | Path is a curve-based motion path — different beast; not useful for X/Y keyframes |
+
+### Key facts
+
+- A clip's **first comp** (`GetFusionCompNameList()[0]`) is the *active* one — i.e. the one Resolve uses when rendering the clip on the Edit-page timeline. Other comps on the clip are just alternate stored compositions; they show in the Fusion-page comp dropdown but don't affect playback unless you switch the UI to them.
+- After scripted edits, the comp will *not* show the "3 yellow dots" modified marker (and the Edit page won't re-render the clip) until you call `comp.SetAttrs({"COMPB_Modified": True})`. This appears to be the trigger Resolve uses to invalidate its render cache for that clip.
+- When you call `tool.ConnectInput(input_name, modifier)`, Fusion auto-renames the modifier to `<tool_name><input_name>` (e.g. connecting a BezierSpline to `SlideShowXf.Angle` renames it `SlideShowXfAngle`). Useful for finding modifiers later to avoid orphans on rebuild.
+- `tool.AddModifier(input_name, modifier_kind)` creates the modifier *and* connects it to the named input in one atomic step. It's the **only** reliable way to wire a Point input — plain `ConnectInput` works for scalar splines but silently no-ops for Point inputs because the Output type doesn't match.
+- After `tool.AddModifier(...)`, navigate to the new modifier with `tool.<input_name>.GetConnectedOutput().GetTool()`. The same idiom works recursively for `XYPath.X` / `XYPath.Y` once a BezierSpline has been added to each.
+- `PyRemoteObject` proxies fake `hasattr` for any name — every attribute lookup succeeds, but invoking unsupported ones raises `TypeError: 'NoneType' object is not callable`. Always guard with try/except instead of `hasattr` checks.
+- **Scalar inputs** (Size, Angle, Gain, Blend, Opacity) animate via a single `BezierSpline` modifier with `{frame: [value]}` keyframes.
+- **Point inputs** (Center, Pivot) animate via `AddModifier(input, "XYPath")` + per-axis `AddModifier("X" / "Y", "BezierSpline")` on the XYPath; each child spline takes the same `{frame: [value]}` format.
+- `comp.Execute(lua_string)` exists as a Lua escape hatch and is confirmed to run in the `LoadFusionCompByName` handle's context — useful if a future input type can't be driven from external Python. Inside Lua: subscript assignment `tool.Center[frame] = {x, y}` is the canonical Point-keyframe idiom. We don't currently need this for the proven scalar+Point patterns.
 
 ## Bridge gotchas
 

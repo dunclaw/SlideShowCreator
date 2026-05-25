@@ -2,12 +2,12 @@
 
 All Fusion / Resolve objects are mocked. These tests verify that we make the
 correct API calls — not that Fusion actually applies the animation (that's
-what scripts/demo_fusion_animation.py does live).
+what the live probe scripts under ``scripts/`` do).
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -37,84 +37,88 @@ def test_locked_unlocks_on_exception():
 
 
 # --------------------------------------------------------------------------- #
-# attach_or_get_comp / remove_comp
+# get_active_comp
 # --------------------------------------------------------------------------- #
 
-def test_attach_or_get_comp_creates_when_missing():
+def test_get_active_comp_uses_first_existing_comp_via_loadbyname():
     ti = MagicMock()
-    ti.GetFusionCompNameList.return_value = []
-    new_comp = MagicMock()
-    new_comp.GetAttrs.return_value = "Composition 1"
-    ti.AddFusionComp.return_value = new_comp
+    ti.GetFusionCompNameList.return_value = ["Composition 1", "Composition 2"]
+    loaded = MagicMock(name="loaded-comp")
+    ti.LoadFusionCompByName.return_value = loaded
 
-    result = fc.attach_or_get_comp(ti, "SlideShowCreator")
+    result = fc.get_active_comp(ti)
 
-    assert result is new_comp
-    ti.AddFusionComp.assert_called_once()
-    ti.RenameFusionCompByName.assert_called_once_with(
-        "Composition 1", "SlideShowCreator"
-    )
-
-
-def test_attach_or_get_comp_reuses_existing():
-    ti = MagicMock()
-    ti.GetFusionCompNameList.return_value = ["SlideShowCreator", "other"]
-    existing = MagicMock()
-    ti.GetFusionCompByName.return_value = existing
-
-    result = fc.attach_or_get_comp(ti, "SlideShowCreator")
-
-    assert result is existing
+    assert result is loaded
+    ti.LoadFusionCompByName.assert_called_once_with("Composition 1")
     ti.AddFusionComp.assert_not_called()
-    ti.GetFusionCompByName.assert_called_once_with("SlideShowCreator")
+    # We must NOT use GetFusionCompByName — it returns a stub handle.
+    ti.GetFusionCompByName.assert_not_called()
 
 
-def test_attach_or_get_comp_raises_when_add_returns_none():
+def test_get_active_comp_creates_comp_when_clip_has_none():
+    ti = MagicMock()
+    # First call: no comps; AddFusionComp then list grows.
+    ti.GetFusionCompNameList.side_effect = [[], ["Composition 1"]]
+    ti.AddFusionComp.return_value = "Composition 1"
+    loaded = MagicMock()
+    ti.LoadFusionCompByName.return_value = loaded
+
+    result = fc.get_active_comp(ti)
+
+    assert result is loaded
+    ti.AddFusionComp.assert_called_once()
+    ti.LoadFusionCompByName.assert_called_once_with("Composition 1")
+
+
+def test_get_active_comp_raises_when_addfusioncomp_fails():
     ti = MagicMock()
     ti.GetFusionCompNameList.return_value = []
     ti.AddFusionComp.return_value = None
     ti.GetName.return_value = "Clip 1"
 
     with pytest.raises(RuntimeError, match="AddFusionComp"):
-        fc.attach_or_get_comp(ti)
+        fc.get_active_comp(ti)
 
 
-def test_attach_or_get_comp_skips_rename_when_already_named():
+def test_get_active_comp_raises_when_load_returns_none():
     ti = MagicMock()
-    ti.GetFusionCompNameList.return_value = []
-    new_comp = MagicMock()
-    new_comp.GetAttrs.return_value = "SlideShowCreator"
-    ti.AddFusionComp.return_value = new_comp
+    ti.GetFusionCompNameList.return_value = ["Composition 1"]
+    ti.LoadFusionCompByName.return_value = None
+    ti.GetName.return_value = "Clip 1"
 
-    fc.attach_or_get_comp(ti, "SlideShowCreator")
-
-    ti.RenameFusionCompByName.assert_not_called()
+    with pytest.raises(RuntimeError, match="LoadFusionCompByName"):
+        fc.get_active_comp(ti)
 
 
-def test_remove_comp_returns_false_when_absent():
-    ti = MagicMock()
-    ti.GetFusionCompNameList.return_value = ["other"]
-    assert fc.remove_comp(ti, "SlideShowCreator") is False
-    ti.DeleteFusionCompByName.assert_not_called()
-
-
-def test_remove_comp_deletes_when_present():
-    ti = MagicMock()
-    ti.GetFusionCompNameList.return_value = ["SlideShowCreator"]
-    ti.DeleteFusionCompByName.return_value = True
-    assert fc.remove_comp(ti, "SlideShowCreator") is True
-    ti.DeleteFusionCompByName.assert_called_once_with("SlideShowCreator")
+def test_attach_or_get_comp_is_alias_of_get_active_comp():
+    assert fc.attach_or_get_comp is fc.get_active_comp
 
 
 # --------------------------------------------------------------------------- #
-# find_tool / find_or_add_tool
+# mark_modified
+# --------------------------------------------------------------------------- #
+
+def test_mark_modified_sets_compb_modified_true():
+    comp = MagicMock()
+    fc.mark_modified(comp)
+    comp.SetAttrs.assert_called_once_with({"COMPB_Modified": True})
+
+
+def test_mark_modified_swallows_exceptions():
+    comp = MagicMock()
+    comp.SetAttrs.side_effect = Exception("not supported")
+    # Should not raise even if the attr is rejected.
+    fc.mark_modified(comp)
+
+
+# --------------------------------------------------------------------------- #
+# find_tool / find_or_add_tool / connect
 # --------------------------------------------------------------------------- #
 
 def test_find_tool_proxies_to_find_tool():
     comp = MagicMock()
     tool = MagicMock()
     comp.FindTool.return_value = tool
-
     assert fc.find_tool(comp, "MediaIn1") is tool
     comp.FindTool.assert_called_once_with("MediaIn1")
 
@@ -123,9 +127,7 @@ def test_find_or_add_tool_returns_existing():
     comp = MagicMock()
     existing = MagicMock()
     comp.FindTool.return_value = existing
-
     result = fc.find_or_add_tool(comp, "Transform", "MyXf")
-
     assert result is existing
     comp.AddTool.assert_not_called()
 
@@ -149,8 +151,6 @@ def test_find_or_add_tool_tolerates_setattrs_failure():
     new_tool = MagicMock()
     new_tool.SetAttrs.side_effect = Exception("not supported in this build")
     comp.AddTool.return_value = new_tool
-
-    # Should not raise — the rename failure is informational, not fatal.
     result = fc.find_or_add_tool(comp, "Transform", "MyXf")
     assert result is new_tool
 
@@ -159,22 +159,15 @@ def test_find_or_add_tool_raises_when_addtool_returns_none():
     comp = MagicMock()
     comp.FindTool.return_value = None
     comp.AddTool.return_value = None
-
     with pytest.raises(RuntimeError, match="AddTool"):
         fc.find_or_add_tool(comp, "Transform", "MyXf")
 
-
-# --------------------------------------------------------------------------- #
-# connect
-# --------------------------------------------------------------------------- #
 
 def test_connect_wires_default_input():
     src = MagicMock()
     src.Output = "src-output-handle"
     dst = MagicMock()
-
     fc.connect(src, dst)
-
     dst.ConnectInput.assert_called_once_with("Input", "src-output-handle")
 
 
@@ -182,9 +175,7 @@ def test_connect_wires_named_input():
     src = MagicMock()
     src.Output = "out"
     dst = MagicMock()
-
     fc.connect(src, dst, "Background")
-
     dst.ConnectInput.assert_called_once_with("Background", "out")
 
 
@@ -192,57 +183,266 @@ def test_connect_falls_back_to_getoutput_when_no_attr():
     src = MagicMock(spec=["GetOutput"])
     src.GetOutput.return_value = "fallback-out"
     dst = MagicMock()
-
     fc.connect(src, dst)
-
     src.GetOutput.assert_called_once_with("Output")
     dst.ConnectInput.assert_called_once_with("Input", "fallback-out")
 
 
 def test_connect_raises_when_source_has_no_output():
-    src = MagicMock(spec=[])  # no Output attr, no GetOutput method
+    src = MagicMock(spec=[])
     dst = MagicMock()
-
     with pytest.raises(RuntimeError, match="no Output"):
         fc.connect(src, dst)
 
 
 # --------------------------------------------------------------------------- #
-# keyframe application
+# set_scalar_keyframes (BezierSpline based)
 # --------------------------------------------------------------------------- #
 
-def test_set_scalar_keyframes_sorts_by_time_and_sets_each():
-    tool = MagicMock()
-    fc.set_scalar_keyframes(
-        tool,
-        "Size",
-        [(30, 1.0), (0, 0.0), (15, 0.5)],
-    )
-    assert tool.SetInput.call_args_list == [
-        call("Size", 0.0, 0),
-        call("Size", 0.5, 15),
-        call("Size", 1.0, 30),
-    ]
+def _comp_with(addtool_returns):
+    """Build a mocked comp whose AddTool returns the provided sequence."""
+    comp = MagicMock()
+    comp.FindTool.return_value = None
+    if isinstance(addtool_returns, list):
+        comp.AddTool.side_effect = addtool_returns
+    else:
+        comp.AddTool.return_value = addtool_returns
+    return comp
 
 
 def test_set_scalar_keyframes_empty_does_nothing():
+    comp = MagicMock()
     tool = MagicMock()
-    fc.set_scalar_keyframes(tool, "Size", [])
+    result = fc.set_scalar_keyframes(comp, tool, "Size", [])
+    assert result is None
+    comp.AddTool.assert_not_called()
     tool.SetInput.assert_not_called()
 
 
-def test_set_point_keyframes_passes_tuple_values():
+def test_set_scalar_keyframes_single_keyframe_sets_constant():
+    comp = MagicMock()
     tool = MagicMock()
-    fc.set_point_keyframes(
-        tool,
-        "Center",
-        [(0, (0.0, 0.5)), (24, (0.5, 0.5))],
-    )
-    assert tool.SetInput.call_args_list == [
-        call("Center", (0.0, 0.5), 0),
-        call("Center", (0.5, 0.5), 24),
-    ]
+    result = fc.set_scalar_keyframes(comp, tool, "Size", [(0, 0.75)])
+    assert result is None
+    comp.AddTool.assert_not_called()
+    tool.SetInput.assert_called_once_with("Size", 0.75)
 
+
+def test_set_scalar_keyframes_two_or_more_builds_spline_and_connects():
+    spline = MagicMock()
+    comp = _comp_with(spline)
+    tool = MagicMock()
+    tool.GetAttrs.return_value = "SlideShowXf"
+
+    result = fc.set_scalar_keyframes(comp, tool, "Angle", [(0, 0.0), (24, 90.0)])
+
+    assert result is spline
+    comp.AddTool.assert_called_once_with("BezierSpline")
+    spline.SetKeyFrames.assert_called_once_with({0: [0.0], 24: [90.0]})
+    tool.ConnectInput.assert_called_once_with("Angle", spline)
+
+
+def test_set_scalar_keyframes_sorts_keyframes_before_setkeyframes():
+    spline = MagicMock()
+    comp = _comp_with(spline)
+    tool = MagicMock()
+    tool.GetAttrs.return_value = "X"
+
+    fc.set_scalar_keyframes(comp, tool, "Angle", [(30, 1.0), (0, 0.0), (15, 0.5)])
+
+    # SetKeyFrames should get a dict with keys 0, 15, 30
+    args, _kw = spline.SetKeyFrames.call_args
+    assert args[0] == {0: [0.0], 15: [0.5], 30: [1.0]}
+
+
+def test_set_scalar_keyframes_reuses_existing_named_spline():
+    existing_spline = MagicMock(name="existing")
+    comp = MagicMock()
+    tool = MagicMock()
+    tool.GetAttrs.return_value = "SlideShowXf"
+    # FindTool returns the existing spline for the expected name.
+    comp.FindTool.side_effect = lambda name: (
+        existing_spline if name == "SlideShowXfAngle" else None
+    )
+
+    result = fc.set_scalar_keyframes(
+        comp, tool, "Angle", [(0, 0.0), (24, 90.0)]
+    )
+
+    assert result is existing_spline
+    comp.AddTool.assert_not_called()  # reused, not added
+    existing_spline.SetKeyFrames.assert_called_once_with({0: [0.0], 24: [90.0]})
+    tool.ConnectInput.assert_called_once_with("Angle", existing_spline)
+
+
+def test_set_scalar_keyframes_raises_when_addtool_returns_none():
+    comp = _comp_with(None)
+    tool = MagicMock()
+    tool.GetAttrs.return_value = "X"
+    with pytest.raises(RuntimeError, match="BezierSpline"):
+        fc.set_scalar_keyframes(comp, tool, "Size", [(0, 0.0), (24, 1.0)])
+
+
+# --------------------------------------------------------------------------- #
+# set_point_keyframes (XYPath + child BezierSpline based, via AddModifier)
+# --------------------------------------------------------------------------- #
+
+
+class _FakeInput:
+    """Minimal stand-in for a Fusion Input object.
+
+    Real Fusion inputs expose ``GetConnectedOutput()`` which returns an
+    ``Output`` object (or ``None``); that Output has ``GetTool()`` returning
+    the tool currently feeding the input. We need a mutable mock so a test
+    can simulate the side-effect of an ``AddModifier`` call connecting a
+    new tool to the input.
+    """
+
+    def __init__(self, connected=None):
+        self.connected = connected
+
+    def GetConnectedOutput(self):
+        if self.connected is None:
+            return None
+        out = MagicMock(name="connected-output")
+        out.GetTool.return_value = self.connected
+        return out
+
+
+def _make_xypath_mock():
+    """Build a mock XYPath with X/Y inputs and an AddModifier that wires
+    child BezierSplines on demand. Returns (xypath, x_spline, y_spline)."""
+    xypath = MagicMock(name="xypath")
+    xypath.X = _FakeInput()
+    xypath.Y = _FakeInput()
+    x_spline = MagicMock(name="x_spline")
+    y_spline = MagicMock(name="y_spline")
+
+    def xypath_addmod(input_name, kind):
+        assert kind == "BezierSpline"
+        if input_name == "X":
+            xypath.X.connected = x_spline
+        elif input_name == "Y":
+            xypath.Y.connected = y_spline
+        return True
+
+    xypath.AddModifier.side_effect = xypath_addmod
+    return xypath, x_spline, y_spline
+
+
+def _make_tool_with_point_input(input_name, xypath_to_attach):
+    """Build a mock Transform-like tool with the named Point input ready for
+    AddModifier to attach the given xypath mock."""
+    tool = MagicMock(name="tool")
+    setattr(tool, input_name, _FakeInput())
+
+    def tool_addmod(name, kind):
+        assert kind == "XYPath"
+        if name == input_name:
+            getattr(tool, input_name).connected = xypath_to_attach
+        return True
+
+    tool.AddModifier.side_effect = tool_addmod
+    return tool
+
+
+def test_set_point_keyframes_empty_does_nothing():
+    comp = MagicMock()
+    tool = MagicMock()
+    result = fc.set_point_keyframes(comp, tool, "Center", [])
+    assert result is None
+    tool.AddModifier.assert_not_called()
+
+
+def test_set_point_keyframes_single_sets_constant_as_xy_list():
+    comp = MagicMock()
+    tool = MagicMock()
+    result = fc.set_point_keyframes(comp, tool, "Center", [(0, (0.5, 0.5))])
+    assert result is None
+    tool.AddModifier.assert_not_called()
+    tool.SetInput.assert_called_once_with("Center", [0.5, 0.5])
+
+
+def test_set_point_keyframes_two_keyframes_addmodifies_xypath_and_children():
+    xypath, x_spline, y_spline = _make_xypath_mock()
+    tool = _make_tool_with_point_input("Center", xypath)
+    comp = MagicMock()
+
+    result = fc.set_point_keyframes(
+        comp, tool, "Center", [(0, (-0.5, 0.5)), (24, (0.5, 0.5))]
+    )
+
+    assert result is xypath
+    tool.AddModifier.assert_called_once_with("Center", "XYPath")
+    child_mod_calls = [c.args for c in xypath.AddModifier.call_args_list]
+    assert ("X", "BezierSpline") in child_mod_calls
+    assert ("Y", "BezierSpline") in child_mod_calls
+    x_spline.SetKeyFrames.assert_called_once_with({0: [-0.5], 24: [0.5]})
+    y_spline.SetKeyFrames.assert_called_once_with({0: [0.5], 24: [0.5]})
+
+
+def test_set_point_keyframes_sorts_keyframes_before_setkeyframes():
+    xypath, x_spline, y_spline = _make_xypath_mock()
+    tool = _make_tool_with_point_input("Center", xypath)
+    comp = MagicMock()
+
+    fc.set_point_keyframes(
+        comp, tool, "Center",
+        [(24, (1.0, 1.0)), (0, (0.0, 0.0)), (12, (0.5, 0.5))],
+    )
+
+    x_args = x_spline.SetKeyFrames.call_args.args[0]
+    y_args = y_spline.SetKeyFrames.call_args.args[0]
+    assert x_args == {0: [0.0], 12: [0.5], 24: [1.0]}
+    assert y_args == {0: [0.0], 12: [0.5], 24: [1.0]}
+
+
+def test_set_point_keyframes_reuses_existing_xypath_modifier():
+    """If the input is already wired to an XYPath, no new modifier is added."""
+    xypath, x_spline, y_spline = _make_xypath_mock()
+    # Pre-wire both layers so _connected_tool finds them immediately.
+    xypath.X.connected = x_spline
+    xypath.Y.connected = y_spline
+    tool = MagicMock(name="tool")
+    tool.Center = _FakeInput(connected=xypath)
+    comp = MagicMock()
+
+    result = fc.set_point_keyframes(
+        comp, tool, "Center", [(0, (-0.5, 0.5)), (24, (0.5, 0.5))]
+    )
+
+    assert result is xypath
+    tool.AddModifier.assert_not_called()
+    xypath.AddModifier.assert_not_called()
+    x_spline.SetKeyFrames.assert_called_once_with({0: [-0.5], 24: [0.5]})
+    y_spline.SetKeyFrames.assert_called_once_with({0: [0.5], 24: [0.5]})
+
+
+def test_set_point_keyframes_raises_when_addmodifier_returns_false():
+    tool = MagicMock()
+    tool.Center = _FakeInput()  # never gets connected
+    tool.AddModifier.return_value = False
+    comp = MagicMock()
+    with pytest.raises(RuntimeError, match="AddModifier"):
+        fc.set_point_keyframes(
+            comp, tool, "Center", [(0, (-0.5, 0.5)), (24, (0.5, 0.5))]
+        )
+
+
+def test_set_point_keyframes_raises_when_xypath_not_wired_after_addmodifier():
+    tool = MagicMock()
+    tool.Center = _FakeInput()  # AddModifier returns True but input stays disconnected
+    tool.AddModifier.return_value = True
+    comp = MagicMock()
+    with pytest.raises(RuntimeError, match="XYPath"):
+        fc.set_point_keyframes(
+            comp, tool, "Center", [(0, (-0.5, 0.5)), (24, (0.5, 0.5))]
+        )
+
+
+# --------------------------------------------------------------------------- #
+# set_constant
+# --------------------------------------------------------------------------- #
 
 def test_set_constant_calls_setinput_without_time():
     tool = MagicMock()
@@ -254,59 +454,54 @@ def test_set_constant_calls_setinput_without_time():
 # insert_transform_chain
 # --------------------------------------------------------------------------- #
 
-def _comp_with_media_io():
+def _comp_with_media_io(slideshow_xf=None):
     comp = MagicMock()
     media_in = MagicMock(name="MediaIn1")
     media_in.Output = "media-in-out"
     media_out = MagicMock(name="MediaOut1")
     xform = MagicMock(name="Transform")
     xform.Output = "xf-out"
-
-    tools = {"MediaIn1": media_in, "MediaOut1": media_out}
-
-    def find(name):
-        return tools.get(name)
-
-    comp.FindTool.side_effect = find
+    tools = {
+        "MediaIn1": media_in,
+        "MediaOut1": media_out,
+        "SlideShowXf": slideshow_xf,
+    }
+    comp.FindTool.side_effect = lambda name: tools.get(name)
     return comp, media_in, media_out, xform
 
 
 def test_insert_transform_chain_creates_and_wires_transform():
-    comp, media_in, media_out, xform = _comp_with_media_io()
-    # FindTool returns None for SlideShowXf the first time, then xform after add.
-    seq = [None, None, None, xform]  # MediaIn, MediaOut, find_or_add lookup, then
-    # Set up a controlled side_effect that mixes our media-io map and the xform path.
-    tools = {"MediaIn1": media_in, "MediaOut1": media_out, "SlideShowXf": None}
-    comp.FindTool.side_effect = lambda name: tools.get(name)
+    comp, media_in, media_out, xform = _comp_with_media_io(slideshow_xf=None)
     comp.AddTool.return_value = xform
 
     result = fc.insert_transform_chain(comp)
 
     assert result is xform
     comp.AddTool.assert_called_once_with("Transform", 1, 0)
-    # Verify the wiring: MediaIn -> xform, xform -> MediaOut
     xform.ConnectInput.assert_called_once_with("Input", "media-in-out")
     media_out.ConnectInput.assert_called_once_with("Input", "xf-out")
 
 
 def test_insert_transform_chain_reuses_existing_transform():
-    comp, media_in, media_out, xform = _comp_with_media_io()
-    tools = {"MediaIn1": media_in, "MediaOut1": media_out, "SlideShowXf": xform}
-    comp.FindTool.side_effect = lambda name: tools.get(name)
+    comp, media_in, media_out, xform = _comp_with_media_io(slideshow_xf=None)
+    # Now make SlideShowXf already exist.
+    existing = MagicMock(name="existing-xf")
+    existing.Output = "existing-out"
+    comp.FindTool.side_effect = lambda name: {
+        "MediaIn1": media_in, "MediaOut1": media_out, "SlideShowXf": existing,
+    }.get(name)
 
     result = fc.insert_transform_chain(comp)
 
-    assert result is xform
+    assert result is existing
     comp.AddTool.assert_not_called()
-    # Still rewires (idempotency: safe to call repeatedly)
-    xform.ConnectInput.assert_called_once_with("Input", "media-in-out")
-    media_out.ConnectInput.assert_called_once_with("Input", "xf-out")
+    existing.ConnectInput.assert_called_once_with("Input", "media-in-out")
+    media_out.ConnectInput.assert_called_once_with("Input", "existing-out")
 
 
 def test_insert_transform_chain_raises_when_media_in_missing():
     comp = MagicMock()
     comp.FindTool.side_effect = lambda name: None
-
     with pytest.raises(RuntimeError, match="MediaIn1"):
         fc.insert_transform_chain(comp)
 
@@ -317,7 +512,6 @@ def test_insert_transform_chain_raises_when_media_out_missing():
     media_in.Output = "out"
     tools = {"MediaIn1": media_in, "MediaOut1": None}
     comp.FindTool.side_effect = lambda name: tools.get(name)
-
     with pytest.raises(RuntimeError, match="MediaOut1"):
         fc.insert_transform_chain(comp)
 
@@ -343,95 +537,157 @@ def test_transform_animation_normalizes_sequences_to_lists():
     assert anim.size == [(0, 0.0), (10, 1.0)]
 
 
-def test_apply_transform_animation_sets_all_provided_inputs():
-    tool = MagicMock()
+def test_apply_transform_animation_routes_to_correct_setters():
+    """Verify each field is dispatched to the right keyframe setter."""
+    comp = MagicMock()
+    # Two BezierSplines are added directly (one for Size, one for Angle).
+    # Two XYPaths are attached via tool.AddModifier, so they don't appear
+    # in comp.AddTool's call list — they appear in tool.AddModifier's.
+    fake_spline_size = MagicMock(name="size-spline")
+    fake_spline_angle = MagicMock(name="angle-spline")
+    comp.AddTool.side_effect = [fake_spline_size, fake_spline_angle]
+    comp.FindTool.return_value = None  # no existing modifiers
+
+    # Build a tool mock whose Center/Pivot inputs go through the same
+    # AddModifier → child-spline navigation dance that the real Fusion
+    # bridge supports.
+    xy_center, xs_c, ys_c = _make_xypath_mock()
+    xy_pivot, xs_p, ys_p = _make_xypath_mock()
+    tool = MagicMock(name="tool")
+    tool.Center = _FakeInput()
+    tool.Pivot = _FakeInput()
+    tool.GetAttrs.return_value = "X"
+
+    def tool_addmod(name, kind):
+        assert kind == "XYPath"
+        if name == "Center":
+            tool.Center.connected = xy_center
+        elif name == "Pivot":
+            tool.Pivot.connected = xy_pivot
+        return True
+
+    tool.AddModifier.side_effect = tool_addmod
+
     anim = fc.TransformAnimation(
         center=[(0, (0.0, 0.5)), (12, (0.5, 0.5))],
+        pivot=[(0, (0.5, 0.5)), (12, (0.6, 0.6))],
         size=[(0, 0.5), (12, 1.0)],
         angle=[(0, -10.0), (12, 0.0)],
-        pivot=[(0, (0.5, 0.5))],
     )
 
-    fc.apply_transform_animation(tool, anim)
+    fc.apply_transform_animation(comp, tool, anim)
 
-    # Center should be set with point tuples (two keyframes)
-    call_list = tool.SetInput.call_args_list
-    assert call("Center", (0.0, 0.5), 0) in call_list
-    assert call("Center", (0.5, 0.5), 12) in call_list
-    assert call("Size", 0.5, 0) in call_list
-    assert call("Size", 1.0, 12) in call_list
-    assert call("Angle", -10.0, 0) in call_list
-    assert call("Angle", 0.0, 12) in call_list
-    assert call("Pivot", (0.5, 0.5), 0) in call_list
+    # Only BezierSplines are added directly to the comp.
+    assert comp.AddTool.call_args_list[0].args == ("BezierSpline",)
+    assert comp.AddTool.call_args_list[1].args == ("BezierSpline",)
+    # XYPaths are attached to the tool via AddModifier.
+    tool_mods = [c.args for c in tool.AddModifier.call_args_list]
+    assert ("Center", "XYPath") in tool_mods
+    assert ("Pivot", "XYPath") in tool_mods
+    # Scalar splines connected via ConnectInput in declared order.
+    scalar_connects = [
+        c.args for c in tool.ConnectInput.call_args_list
+        if c.args[0] in ("Size", "Angle")
+    ]
+    assert scalar_connects == [("Size", fake_spline_size), ("Angle", fake_spline_angle)]
 
 
 def test_apply_transform_animation_skips_unset_fields():
+    comp = MagicMock()
+    spline = MagicMock()
+    comp.AddTool.return_value = spline
+    comp.FindTool.return_value = None
     tool = MagicMock()
-    anim = fc.TransformAnimation(size=[(0, 1.0)])
+    tool.GetAttrs.return_value = "X"
 
-    fc.apply_transform_animation(tool, anim)
+    anim = fc.TransformAnimation(size=[(0, 0.0), (24, 1.0)])
 
-    # Only Size touched; no Center / Angle / Pivot SetInput calls.
-    for c in tool.SetInput.call_args_list:
-        args, _kwargs = c
-        assert args[0] == "Size", "Unexpected input touched: {0}".format(args[0])
+    fc.apply_transform_animation(comp, tool, anim)
+
+    # Only one modifier (for Size) added.
+    comp.AddTool.assert_called_once_with("BezierSpline")
+    tool.ConnectInput.assert_called_once_with("Size", spline)
 
 
 # --------------------------------------------------------------------------- #
 # attach_transform_animation (end-to-end with mocks)
 # --------------------------------------------------------------------------- #
 
-def test_attach_transform_animation_wires_everything_inside_lock():
+def test_attach_transform_animation_locks_edits_and_marks_modified():
     ti = MagicMock()
-    ti.GetFusionCompNameList.return_value = []
+    ti.GetFusionCompNameList.return_value = ["Composition 1"]
     comp = MagicMock()
-    comp.GetAttrs.return_value = "SlideShowCreator"  # already correctly named
-    ti.AddFusionComp.return_value = comp
+    ti.LoadFusionCompByName.return_value = comp
 
     media_in = MagicMock(); media_in.Output = "mi-out"
     media_out = MagicMock()
     xform = MagicMock(); xform.Output = "xf-out"
+    xform.GetAttrs.return_value = "SlideShowXf"
     tools = {"MediaIn1": media_in, "MediaOut1": media_out, "SlideShowXf": None}
 
     def find(name):
+        if name == "SlideShowXfAngle":
+            return None
         return tools.get(name)
 
     comp.FindTool.side_effect = find
-    comp.AddTool.return_value = xform
+    spline = MagicMock()
+    # AddTool: first call adds Transform, second call adds the BezierSpline
+    comp.AddTool.side_effect = [xform, spline]
 
-    # Track lock/unlock order so we can verify edits happen inside the bracket.
     events = []
     comp.Lock.side_effect = lambda: events.append("lock")
     comp.Unlock.side_effect = lambda: events.append("unlock")
-    comp.AddTool.side_effect = lambda *a, **kw: (
-        events.append("addtool"), xform)[1]
-    xform.ConnectInput.side_effect = lambda *a, **kw: events.append("connect-xf")
-    media_out.ConnectInput.side_effect = lambda *a, **kw: events.append(
-        "connect-out"
-    )
-    xform.SetInput.side_effect = lambda *a, **kw: events.append("setinput")
+    orig_add = comp.AddTool.side_effect
+    comp.SetAttrs.side_effect = lambda *a, **kw: events.append("setattrs")
 
-    anim = fc.TransformAnimation(size=[(0, 0.0), (24, 1.0)])
+    anim = fc.TransformAnimation(angle=[(0, 0.0), (24, 90.0)])
     result = fc.attach_transform_animation(ti, anim)
 
     assert result is xform
+    # Comp was loaded via the canonical (working) call.
+    ti.LoadFusionCompByName.assert_called_once_with("Composition 1")
+    ti.GetFusionCompByName.assert_not_called()
+    # Edits bracketed by lock/unlock.
     assert events[0] == "lock"
-    assert events[-1] == "unlock"
-    assert "addtool" in events
-    assert "connect-xf" in events
-    assert "connect-out" in events
-    assert events.count("setinput") == 2
+    assert "unlock" in events
+    # SetAttrs (mark_modified) called AFTER Unlock.
+    assert events.index("unlock") < events.index("setattrs")
+    # And the modified flag was set to True.
+    comp.SetAttrs.assert_called_once_with({"COMPB_Modified": True})
+    # Spline keyframes are the 0/24 angle animation.
+    spline.SetKeyFrames.assert_called_once_with({0: [0.0], 24: [90.0]})
+
+
+def test_attach_transform_animation_no_animation_still_attaches_chain():
+    """Even with an empty TransformAnimation, the comp + Transform are wired."""
+    ti = MagicMock()
+    ti.GetFusionCompNameList.return_value = ["Composition 1"]
+    comp = MagicMock()
+    ti.LoadFusionCompByName.return_value = comp
+    media_in = MagicMock(); media_in.Output = "mi-out"
+    media_out = MagicMock()
+    xform = MagicMock(); xform.Output = "xf-out"
+    tools = {"MediaIn1": media_in, "MediaOut1": media_out, "SlideShowXf": None}
+    comp.FindTool.side_effect = lambda name: tools.get(name)
+    comp.AddTool.return_value = xform
+
+    result = fc.attach_transform_animation(ti, fc.TransformAnimation())
+
+    assert result is xform
+    xform.ConnectInput.assert_called_once_with("Input", "mi-out")
+    media_out.ConnectInput.assert_called_once_with("Input", "xf-out")
 
 
 # --------------------------------------------------------------------------- #
 # list_tools
 # --------------------------------------------------------------------------- #
 
-def test_list_tools_returns_sorted_names():
+def test_list_tools_returns_names_in_dict_key_order():
     comp = MagicMock()
-    t1 = MagicMock(); t1.Name = "MediaIn1"
-    t2 = MagicMock(); t2.Name = "MediaOut1"
-    t3 = MagicMock(); t3.Name = "SlideShowXf"
+    t1 = MagicMock(); t1.GetAttrs.return_value = "MediaIn1"
+    t2 = MagicMock(); t2.GetAttrs.return_value = "MediaOut1"
+    t3 = MagicMock(); t3.GetAttrs.return_value = "SlideShowXf"
     comp.GetToolList.return_value = {1: t1, 2: t3, 3: t2}
 
     names = fc.list_tools(comp)

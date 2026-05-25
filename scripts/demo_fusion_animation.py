@@ -48,17 +48,29 @@ def _pick_clip(timeline, track: int, index: int):
 
 
 def _slide_in_from_left(duration_frames: int) -> fc.TransformAnimation:
-    """Animate Center.x from -0.5 (off-screen left) to 0.5 (centered)."""
+    """Animate Center.x from -0.5 (off-screen left) to 0.5 (centered).
+
+    Uses an XYPath modifier with BezierSpline children for X and Y — the
+    canonical Fusion pattern for animating Point inputs. Proven working on
+    Resolve 20.3.
+    """
     return fc.TransformAnimation(
         center=[
             (0, (-0.5, 0.5)),
             (duration_frames, (0.5, 0.5)),
         ],
-        size=[
-            (0, 1.0),
-        ],
+    )
+
+
+def _rotate_in(duration_frames: int) -> fc.TransformAnimation:
+    """Rotate the image from 0 to 90 degrees over *duration_frames*.
+
+    Uses only a scalar (Angle) keyframe — proven working on Resolve 20.3.
+    """
+    return fc.TransformAnimation(
         angle=[
             (0, 0.0),
+            (duration_frames, 90.0),
         ],
     )
 
@@ -72,6 +84,14 @@ def main(argv: Optional[list] = None) -> int:
         type=int,
         default=24,
         help="Slide-in duration in frames (default 24 = 1s at 24fps).",
+    )
+    p.add_argument(
+        "--mode",
+        choices=("slide", "angle"),
+        default="angle",
+        help="Animation to apply: 'angle' (rotate 0->90, scalar BezierSpline) "
+             "or 'slide' (Center xy, XYPath modifier + child BezierSplines). "
+             "Both are verified on Resolve 20.3.",
     )
     p.add_argument(
         "--clear",
@@ -104,28 +124,40 @@ def main(argv: Optional[list] = None) -> int:
     ))
 
     if args.clear:
-        removed = fc.remove_comp(clip)
-        print("Cleared SlideShowCreator comp." if removed else
-              "No SlideShowCreator comp to clear.")
+        # remove_comp was removed from the public API (Delete of the active
+        # comp is unreliable in Resolve 20.3 and can crash the host). Just
+        # report the comps so the user can delete them via the UI.
+        names = clip.GetFusionCompNameList() or []
+        print("Existing comps on clip: {0}".format(names))
+        print("Delete them via the Fusion-comp dropdown / right-click menu.")
         return 0
 
-    anim = _slide_in_from_left(args.frames)
+    if args.mode == "slide":
+        anim = _slide_in_from_left(args.frames)
+        desc = "slide-in from left (Center x: -0.5 -> 0.5)"
+    else:
+        anim = _rotate_in(args.frames)
+        desc = "rotate 0 -> 90 degrees (Angle scalar)"
     xform = fc.attach_transform_animation(clip, anim)
+    print("Animation: {0}".format(desc))
     print("Attached comp; transform tool: {0!r}".format(
         getattr(xform, "Name", "?")
     ))
 
-    comp = fc.attach_or_get_comp(clip)
+    comp = fc.get_active_comp(clip)
     print("Tools in comp: {0}".format(fc.list_tools(comp)))
 
     print()
     print("Verification:")
-    print("  1. Switch to the Fusion page (or click the clip and press Shift+5).")
-    print("  2. You should see MediaIn1 -> SlideShowXf -> MediaOut1.")
-    print("  3. Click SlideShowXf and look at the Center input — it should be")
-    print("     animated (green keyframe markers in the inspector).")
+    print("  1. Switch to the Fusion page on this clip.")
+    print("  2. You should see MediaIn1 -> SlideShowXf -> MediaOut1, plus")
+    print("     a BezierSpline (Angle) or XYPath (Center) modifier.")
+    print("  3. The clip should show the '3 yellow dots' modified marker.")
     print("  4. On the Edit page, scrub the first {0} frames — the image".format(args.frames))
-    print("     should slide in from the left.")
+    if args.mode == "slide":
+        print("     should slide in from the left.")
+    else:
+        print("     should rotate from 0 to 90 degrees.")
     return 0
 
 
