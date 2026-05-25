@@ -9,10 +9,12 @@ import tempfile
 import pytest
 
 from slideshow.project_model import (
+    DEFAULT_MOTION_ZOOM_AMOUNT,
     DEFAULT_TRANSITION_DURATION_FRAMES,
     PROJECT_SCHEMA_VERSION,
     AudioSettings,
     MediaItem,
+    MotionChoice,
     SlideshowProject,
     TitleSpec,
     TransitionChoice,
@@ -48,7 +50,12 @@ class TestTransitionChoice:
     @pytest.mark.parametrize(
         "kind",
         [
-            "none", "auto", "dissolve", "fade",
+            "none", "auto",
+            "dissolve", "cross_fade",
+            "additive_dissolve", "non_additive_dissolve",
+            "blur_dissolve", "dip_to_color",
+            "fade", "fade_through_gray",
+            "blur_through_black", "pixelate", "smooth_cut",
             "slide_left", "slide_right", "slide_top", "slide_bottom",
             "push_left", "push_right", "push_top", "push_bottom",
             "zoom_in", "zoom_out", "flip", "drop",
@@ -56,6 +63,13 @@ class TestTransitionChoice:
     )
     def test_all_documented_kinds_accepted(self, kind):
         TransitionChoice(kind=kind)  # no raise
+
+    def test_dip_to_color_carries_color_param(self):
+        # The transition framework reads ``params["color"]``; the model
+        # itself just stores arbitrary params.
+        t = TransitionChoice(kind="dip_to_color", params={"color": "#ff8800"})
+        assert t.params["color"] == "#ff8800"
+        assert TransitionChoice.from_dict(t.to_dict()) == t
 
     def test_to_dict_includes_params_copy(self):
         params = {"easing": "ease_out", "bounce": 0.3}
@@ -121,6 +135,81 @@ class TestTitleSpec:
 
 
 # --------------------------------------------------------------------------- #
+# MotionChoice
+# --------------------------------------------------------------------------- #
+
+class TestMotionChoice:
+    def test_defaults(self):
+        m = MotionChoice()
+        assert m.kind == "none"
+        assert m.direction == "center"
+        assert m.zoom_amount == DEFAULT_MOTION_ZOOM_AMOUNT
+        assert m.rotation_degrees == 0.0
+        assert m.duration_seconds is None
+        assert m.params == {}
+        assert m.is_static()
+
+    def test_is_static_for_non_none_kinds(self):
+        assert not MotionChoice(kind="pan", direction="left").is_static()
+        assert not MotionChoice(kind="zoom_in").is_static()
+        assert not MotionChoice(kind="auto").is_static()
+
+    def test_rejects_unknown_kind(self):
+        with pytest.raises(ValueError, match="Unknown motion kind"):
+            MotionChoice(kind="warp")
+
+    def test_rejects_unknown_direction(self):
+        with pytest.raises(ValueError, match="Unknown motion direction"):
+            MotionChoice(kind="pan", direction="diagonal")
+
+    def test_rejects_negative_zoom(self):
+        with pytest.raises(ValueError, match="zoom_amount must be >= 0"):
+            MotionChoice(kind="zoom_in", zoom_amount=-0.1)
+
+    def test_rejects_non_positive_duration(self):
+        with pytest.raises(ValueError, match="duration_seconds must be > 0"):
+            MotionChoice(kind="zoom_in", duration_seconds=0)
+        with pytest.raises(ValueError, match="duration_seconds must be > 0"):
+            MotionChoice(kind="zoom_in", duration_seconds=-2.5)
+
+    @pytest.mark.parametrize("kind",
+                             ["none", "auto", "pan", "zoom_in", "zoom_out"])
+    def test_all_kinds_accepted(self, kind):
+        # ``pan`` needs a directional bias; everything else is happy with
+        # the default "center".
+        direction = "left" if kind == "pan" else "center"
+        MotionChoice(kind=kind, direction=direction)
+
+    @pytest.mark.parametrize("direction",
+                             ["center", "up", "down", "left", "right",
+                              "up_left", "up_right", "down_left", "down_right"])
+    def test_all_directions_accepted(self, direction):
+        MotionChoice(kind="zoom_in", direction=direction)
+
+    def test_round_trip_minimal(self):
+        m = MotionChoice()
+        assert MotionChoice.from_dict(m.to_dict()) == m
+
+    def test_round_trip_full(self):
+        m = MotionChoice(
+            kind="zoom_in",
+            direction="up_right",
+            zoom_amount=0.3,
+            rotation_degrees=-5.0,
+            duration_seconds=4.5,
+            params={"easing": "ease_in_out"},
+        )
+        assert MotionChoice.from_dict(m.to_dict()) == m
+
+    def test_from_dict_tolerates_missing_keys(self):
+        m = MotionChoice.from_dict({})
+        assert m.kind == "none"
+        assert m.direction == "center"
+        assert m.zoom_amount == DEFAULT_MOTION_ZOOM_AMOUNT
+        assert m.params == {}
+
+
+# --------------------------------------------------------------------------- #
 # AudioSettings
 # --------------------------------------------------------------------------- #
 
@@ -163,6 +252,7 @@ class TestMediaItem:
         assert m.duration_seconds is None
         assert m.title is None
         assert m.title_text is None
+        assert m.motion is None
         assert m.outgoing_transition is None
         assert m.locked_duration is False
 
@@ -189,14 +279,18 @@ class TestMediaItem:
     def test_full_construction(self):
         title = TitleSpec(text="Sunset", position="bottom")
         trans = TransitionChoice(kind="slide_left", duration_frames=18)
+        motion = MotionChoice(kind="zoom_in", direction="up_right",
+                              zoom_amount=0.25)
         m = MediaItem(
             path="a.jpg",
             duration_seconds=3.0,
             title=title,
+            motion=motion,
             outgoing_transition=trans,
             locked_duration=True,
         )
         assert m.title is title
+        assert m.motion is motion
         assert m.outgoing_transition is trans
         assert m.locked_duration is True
 
@@ -209,6 +303,8 @@ class TestMediaItem:
             path="a.jpg",
             duration_seconds=2.5,
             title=TitleSpec(text="X", position="top", show_for_seconds=1.0),
+            motion=MotionChoice(kind="pan", direction="left",
+                                zoom_amount=0.1, rotation_degrees=2.0),
             outgoing_transition=TransitionChoice(kind="fade", duration_frames=12),
             locked_duration=True,
         )
@@ -231,6 +327,7 @@ class TestSlideshowProjectDefaults:
         assert p.items == []
         assert p.default_item_duration_seconds == 4.0
         assert p.default_transition.kind == "dissolve"
+        assert p.default_motion.kind == "none"
         assert p.audio is None
         assert p.target_total_duration_seconds is None
         assert p.soundtrack_path is None
@@ -242,6 +339,12 @@ class TestSlideshowProjectDefaults:
         p1.default_transition.duration_frames = 99
         assert p2.default_transition.duration_frames == DEFAULT_TRANSITION_DURATION_FRAMES
 
+    def test_default_motion_is_per_instance(self):
+        p1 = SlideshowProject()
+        p2 = SlideshowProject()
+        p1.default_motion.zoom_amount = 0.9
+        assert p2.default_motion.zoom_amount == DEFAULT_MOTION_ZOOM_AMOUNT
+
 
 class TestSlideshowProjectFromPaths:
     def test_basic(self):
@@ -250,16 +353,21 @@ class TestSlideshowProjectFromPaths:
         assert p.name == "Slideshow"
         assert p.default_item_duration_seconds == 4.0
         assert p.default_transition.kind == "dissolve"
+        assert p.default_motion.kind == "none"
 
     def test_with_overrides(self):
         p = SlideshowProject.from_paths(
             ["a.jpg"], name="My Show", default_item_duration_seconds=3.0,
             default_transition=TransitionChoice(kind="fade", duration_frames=12),
+            default_motion=MotionChoice(kind="zoom_in", direction="center",
+                                        zoom_amount=0.2),
         )
         assert p.name == "My Show"
         assert p.default_item_duration_seconds == 3.0
         assert p.default_transition.kind == "fade"
         assert p.default_transition.duration_frames == 12
+        assert p.default_motion.kind == "zoom_in"
+        assert p.default_motion.zoom_amount == 0.2
 
 
 class TestSlideshowProjectEffectiveDuration:
@@ -297,6 +405,33 @@ class TestTransitionAfter:
             p.transition_after(5)
         with pytest.raises(IndexError):
             p.transition_after(-1)
+
+
+class TestMotionFor:
+    def test_uses_item_override_when_set(self):
+        custom = MotionChoice(kind="pan", direction="right")
+        p = SlideshowProject(items=[
+            MediaItem(path="a", motion=custom),
+            MediaItem(path="b"),
+        ])
+        assert p.motion_for(0) is custom
+
+    def test_falls_back_to_default_motion(self):
+        p = SlideshowProject(
+            default_motion=MotionChoice(kind="zoom_in", direction="center"),
+            items=[MediaItem(path="a"), MediaItem(path="b")],
+        )
+        m = p.motion_for(0)
+        assert m.kind == "zoom_in"
+        # The default isn't a per-item override.
+        assert p.items[0].motion is None
+
+    def test_out_of_range_raises(self):
+        p = SlideshowProject(items=[MediaItem(path="a")])
+        with pytest.raises(IndexError):
+            p.motion_for(5)
+        with pytest.raises(IndexError):
+            p.motion_for(-1)
 
 
 class TestTotalDuration:
@@ -366,6 +501,8 @@ class TestJsonRoundTrip:
             name="Hawaii 2024",
             default_item_duration_seconds=5.0,
             default_transition=TransitionChoice(kind="fade", duration_frames=18),
+            default_motion=MotionChoice(kind="zoom_in", direction="center",
+                                        zoom_amount=0.12),
             audio=AudioSettings(
                 soundtrack_path="C:/music/aloha.mp3",
                 beat_sync_enabled=True,
@@ -377,6 +514,8 @@ class TestJsonRoundTrip:
                 MediaItem(
                     path="C:/pics/1.jpg",
                     title=TitleSpec(text="Arrival", position="bottom"),
+                    motion=MotionChoice(kind="pan", direction="left",
+                                        zoom_amount=0.1),
                 ),
                 MediaItem(
                     path="C:/pics/2.jpg",
@@ -388,6 +527,8 @@ class TestJsonRoundTrip:
                 ),
                 MediaItem(
                     path="C:/pics/3.jpg",
+                    motion=MotionChoice(kind="zoom_out", direction="down_right",
+                                        rotation_degrees=-4.0),
                     locked_duration=True,
                 ),
             ],
@@ -451,5 +592,26 @@ class TestJsonRoundTrip:
         assert loaded.items == []
         assert loaded.default_item_duration_seconds == 4.0
         assert loaded.default_transition.kind == "dissolve"
+        assert loaded.default_motion.kind == "none"
         assert loaded.audio is None
         assert loaded.target_total_duration_seconds is None
+
+    def test_from_dict_accepts_pre_motion_payload(self):
+        # Projects saved before MotionChoice was added didn't have a
+        # ``default_motion`` field or per-item ``motion`` field; loading
+        # them must still produce a working project with sensible
+        # defaults (kind="none" → no motion applied at build time).
+        loaded = SlideshowProject.from_dict({
+            "schema_version": 1,
+            "name": "Old Show",
+            "default_item_duration_seconds": 4.0,
+            "default_transition": {"kind": "dissolve", "duration_frames": 24},
+            "items": [
+                {"path": "a.jpg", "title_text": "Hi"},
+                {"path": "b.jpg"},
+            ],
+        })
+        assert loaded.default_motion.kind == "none"
+        assert all(it.motion is None for it in loaded.items)
+        assert loaded.items[0].title is not None
+        assert loaded.items[0].title.text == "Hi"

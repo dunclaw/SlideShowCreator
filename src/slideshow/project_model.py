@@ -10,14 +10,23 @@ Top-level shape::
     ├── name
     ├── default_item_duration_seconds      # used by items without an override
     ├── default_transition: TransitionChoice
+    ├── default_motion: MotionChoice
     ├── audio: AudioSettings | None
     ├── target_total_duration_seconds: float | None  # bulk-duration target
     └── items: list[MediaItem]
         ├── path
         ├── duration_seconds: float | None     # per-item override
         ├── title: TitleSpec | None
+        ├── motion: MotionChoice | None        # per-item Ken-Burns-style anim
         └── outgoing_transition: TransitionChoice | None
                                               # transition from THIS item to next
+
+A media item carries **both** a transition (how it gives way to the next
+clip) and a motion (animation applied for ~the entire duration of the
+item — Movie-Maker-style pan / zoom). They're independent: an item can
+have a zoom-in motion AND a cross-fade outgoing transition. Motions are
+typically only meaningful for still images; the builder skips them on
+video clips.
 
 Transitions are attached to the *outgoing* edge of each item. Item N's
 ``outgoing_transition`` describes how N transitions into N+1. The last
@@ -42,11 +51,35 @@ from typing import Any, Dict, List, Optional, Sequence
 # Transitions
 # --------------------------------------------------------------------------- #
 
+#: All transition kinds we model. Roughly grouped:
+#:
+#: * Structural   — ``none`` (hard cut), ``auto`` (auto-mix picks).
+#: * Dissolves    — ``dissolve`` and Resolve's native dissolve variants
+#:   (``additive_dissolve``, ``non_additive_dissolve``, ``blur_dissolve``,
+#:   ``dip_to_color`` — colour via ``params["color"] = "#RRGGBB"``,
+#:   defaults to black). ``cross_fade`` is the Movie-Maker name for the
+#:   standard dissolve and is kept as a distinct kind so saved projects
+#:   show the user's chosen label.
+#: * Fades        — ``fade`` (through black), ``fade_through_gray``.
+#: * Effects      — ``blur_through_black``, ``pixelate``, ``smooth_cut``.
+#: * Geometry     — ``slide_*`` (new clip slides in over old),
+#:   ``push_*`` (both clips move together), ``zoom_in`` / ``zoom_out``
+#:   (zoom-blur transition — NOT to be confused with the per-clip motion
+#:   of the same name), ``flip``, ``drop``.
 TRANSITION_KINDS: frozenset = frozenset({
     "none",
     "auto",
     "dissolve",
+    "cross_fade",
+    "additive_dissolve",
+    "non_additive_dissolve",
+    "blur_dissolve",
+    "dip_to_color",
     "fade",
+    "fade_through_gray",
+    "blur_through_black",
+    "pixelate",
+    "smooth_cut",
     "slide_left", "slide_right", "slide_top", "slide_bottom",
     "push_left",  "push_right",  "push_top",  "push_bottom",
     "zoom_in",    "zoom_out",
@@ -169,6 +202,122 @@ class TitleSpec:
 
 
 # --------------------------------------------------------------------------- #
+# Motions (per-clip Ken-Burns-style animation)
+# --------------------------------------------------------------------------- #
+
+#: Motion families. Movie Maker offers ~30 named variants by combining
+#: a kind + direction + rotation; we model the same shape parametrically.
+#:
+#: * ``none``     — no motion (image stays static).
+#: * ``auto``     — auto-mix planner picks a kind/direction per clip.
+#: * ``pan``      — constant zoom, image pans in ``direction``.
+#: * ``zoom_in``  — image starts wide and zooms in toward ``direction``
+#:                  (``"center"`` = straight zoom, no pan).
+#: * ``zoom_out`` — image starts close and zooms out from ``direction``.
+MOTION_KINDS: frozenset = frozenset({
+    "none", "auto", "pan", "zoom_in", "zoom_out",
+})
+
+#: 8 cardinal directions + ``center``. ``center`` means "no directional
+#: bias" — for pan it collapses to no motion (use ``kind="none"`` instead),
+#: for zoom_in/zoom_out it means a straight axis-aligned zoom.
+MOTION_DIRECTIONS: frozenset = frozenset({
+    "center",
+    "up", "down", "left", "right",
+    "up_left", "up_right", "down_left", "down_right",
+})
+
+
+DEFAULT_MOTION_ZOOM_AMOUNT = 0.15  # 15% — gentle Ken Burns by default
+
+
+@dataclass
+class MotionChoice:
+    """Per-clip animation applied for ~the entire clip duration.
+
+    Modelled as ``(kind, direction)`` plus a couple of numeric tweaks so
+    the ~30 named variants in Movie Maker's gallery can all be reproduced
+    without exploding the type system:
+
+    * ``kind``: one of :data:`MOTION_KINDS`.
+    * ``direction``: one of :data:`MOTION_DIRECTIONS`. Ignored when
+      ``kind`` is ``"none"`` or ``"auto"``.
+    * ``zoom_amount``: how much to zoom over the clip's duration, as a
+      fraction (``0.15`` = 15%). Used by ``pan`` (slight zoom to mask
+      the pan's empty edges) and by ``zoom_in`` / ``zoom_out``.
+    * ``rotation_degrees``: optional tilt during the move; Movie Maker
+      has a few "rotated" zoom presets that use ~±5°.
+    * ``duration_seconds``: explicit duration override. ``None`` = run
+      for the full clip duration (the common case).
+    * ``params``: free-form dict for transition-engine extensions
+      (easing curve, focal point, …); unknown keys are ignored.
+    """
+
+    kind: str = "none"
+    direction: str = "center"
+    zoom_amount: float = DEFAULT_MOTION_ZOOM_AMOUNT
+    rotation_degrees: float = 0.0
+    duration_seconds: Optional[float] = None
+    params: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.kind not in MOTION_KINDS:
+            raise ValueError(
+                "Unknown motion kind: {0!r}. Must be one of {1}.".format(
+                    self.kind, sorted(MOTION_KINDS)
+                )
+            )
+        if self.direction not in MOTION_DIRECTIONS:
+            raise ValueError(
+                "Unknown motion direction: {0!r}. Must be one of {1}.".format(
+                    self.direction, sorted(MOTION_DIRECTIONS)
+                )
+            )
+        if self.zoom_amount < 0:
+            raise ValueError(
+                "MotionChoice.zoom_amount must be >= 0, got {0}".format(
+                    self.zoom_amount
+                )
+            )
+        if (
+            self.duration_seconds is not None
+            and self.duration_seconds <= 0
+        ):
+            raise ValueError(
+                "MotionChoice.duration_seconds must be > 0 or None, got {0}".format(
+                    self.duration_seconds
+                )
+            )
+
+    def is_static(self) -> bool:
+        """``True`` if this motion produces no animation."""
+        return self.kind == "none"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "direction": self.direction,
+            "zoom_amount": float(self.zoom_amount),
+            "rotation_degrees": float(self.rotation_degrees),
+            "duration_seconds": self.duration_seconds,
+            "params": dict(self.params),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MotionChoice":
+        return cls(
+            kind=str(data.get("kind", "none")),
+            direction=str(data.get("direction", "center")),
+            zoom_amount=float(
+                data.get("zoom_amount", DEFAULT_MOTION_ZOOM_AMOUNT)
+            ),
+            rotation_degrees=float(data.get("rotation_degrees", 0.0)),
+            duration_seconds=_opt_float(data.get("duration_seconds")),
+            params=dict(data.get("params", {}) or {}),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Audio
 # --------------------------------------------------------------------------- #
 
@@ -242,6 +391,10 @@ class MediaItem:
     * ``duration_seconds``: per-item override of the slideshow default.
       ``None`` or non-positive values fall back to the project default.
     * ``title``: optional :class:`TitleSpec` overlay.
+    * ``motion``: optional :class:`MotionChoice` per-clip animation
+      (Movie-Maker-style pan / zoom). ``None`` means "use the
+      slideshow's default_motion". Builder typically skips motion on
+      video clips even if one is set.
     * ``outgoing_transition``: how this item transitions into the next.
       ``None`` means "use the slideshow's default_transition".
     * ``locked_duration``: when ``True``, bulk-duration adjustment leaves
@@ -251,6 +404,7 @@ class MediaItem:
     path: str
     duration_seconds: Optional[float]
     title: Optional[TitleSpec]
+    motion: Optional["MotionChoice"]
     outgoing_transition: Optional["TransitionChoice"]
     locked_duration: bool
 
@@ -261,6 +415,7 @@ class MediaItem:
         path: str,
         duration_seconds: Optional[float] = None,
         title: Optional[TitleSpec] = None,
+        motion: Optional[MotionChoice] = None,
         outgoing_transition: Optional[TransitionChoice] = None,
         locked_duration: bool = False,
         title_text: Optional[str] = None,
@@ -279,6 +434,7 @@ class MediaItem:
         self.title = (
             TitleSpec(text=title_text) if title_text is not None else title
         )
+        self.motion = motion
         self.outgoing_transition = outgoing_transition
         self.locked_duration = bool(locked_duration)
 
@@ -291,6 +447,9 @@ class MediaItem:
             "path": self.path,
             "duration_seconds": self.duration_seconds,
             "title": self.title.to_dict() if self.title is not None else None,
+            "motion": (
+                self.motion.to_dict() if self.motion is not None else None
+            ),
             "outgoing_transition": (
                 self.outgoing_transition.to_dict()
                 if self.outgoing_transition is not None else None
@@ -304,6 +463,8 @@ class MediaItem:
         title = TitleSpec.from_dict(title_data) if title_data else None
         if title is None and data.get("title_text"):
             title = TitleSpec(text=str(data["title_text"]))
+        motion_data = data.get("motion")
+        motion = MotionChoice.from_dict(motion_data) if motion_data else None
         trans_data = data.get("outgoing_transition")
         outgoing = (
             TransitionChoice.from_dict(trans_data) if trans_data else None
@@ -312,6 +473,7 @@ class MediaItem:
             path=str(data.get("path", "")),
             duration_seconds=_opt_float(data.get("duration_seconds")),
             title=title,
+            motion=motion,
             outgoing_transition=outgoing,
             locked_duration=bool(data.get("locked_duration", False)),
         )
@@ -333,6 +495,9 @@ class SlideshowProject:
     default_item_duration_seconds: float = 4.0
     default_transition: TransitionChoice = field(
         default_factory=lambda: TransitionChoice(kind="dissolve")
+    )
+    default_motion: MotionChoice = field(
+        default_factory=lambda: MotionChoice(kind="none")
     )
     audio: Optional[AudioSettings] = None
     target_total_duration_seconds: Optional[float] = None
@@ -358,6 +523,7 @@ class SlideshowProject:
         name: str = "Slideshow",
         default_item_duration_seconds: float = 4.0,
         default_transition: Optional[TransitionChoice] = None,
+        default_motion: Optional[MotionChoice] = None,
     ) -> "SlideshowProject":
         return cls(
             name=name,
@@ -367,6 +533,11 @@ class SlideshowProject:
                 default_transition
                 if default_transition is not None
                 else TransitionChoice(kind="dissolve")
+            ),
+            default_motion=(
+                default_motion
+                if default_motion is not None
+                else MotionChoice(kind="none")
             ),
         )
 
@@ -395,6 +566,23 @@ class SlideshowProject:
         if item.outgoing_transition is not None:
             return item.outgoing_transition
         return self.default_transition
+
+    def motion_for(self, index: int) -> MotionChoice:
+        """Motion that should play on ``items[index]``.
+
+        Falls back to :attr:`default_motion` when the item has no
+        per-clip override.
+        """
+        if index < 0 or index >= len(self.items):
+            raise IndexError(
+                "motion_for index out of range: {0} (have {1} items)".format(
+                    index, len(self.items)
+                )
+            )
+        item = self.items[index]
+        if item.motion is not None:
+            return item.motion
+        return self.default_motion
 
     def total_default_duration_seconds(self) -> float:
         """Sum of all items' effective durations (ignoring transition overlap)."""
@@ -435,6 +623,7 @@ class SlideshowProject:
                 self.default_item_duration_seconds
             ),
             "default_transition": self.default_transition.to_dict(),
+            "default_motion": self.default_motion.to_dict(),
             "audio": self.audio.to_dict() if self.audio is not None else None,
             "target_total_duration_seconds": self.target_total_duration_seconds,
             "items": [it.to_dict() for it in self.items],
@@ -455,6 +644,11 @@ class SlideshowProject:
             TransitionChoice.from_dict(default_trans_data)
             if default_trans_data else TransitionChoice(kind="dissolve")
         )
+        default_motion_data = data.get("default_motion")
+        default_motion = (
+            MotionChoice.from_dict(default_motion_data)
+            if default_motion_data else MotionChoice(kind="none")
+        )
         audio_data = data.get("audio")
         audio = AudioSettings.from_dict(audio_data) if audio_data else None
         if audio is None and data.get("soundtrack_path"):
@@ -467,6 +661,7 @@ class SlideshowProject:
                 data.get("default_item_duration_seconds", 4.0)
             ),
             default_transition=default_trans,
+            default_motion=default_motion,
             audio=audio,
             target_total_duration_seconds=_opt_float(
                 data.get("target_total_duration_seconds")
@@ -512,8 +707,12 @@ def _opt_str(value: Any) -> Optional[str]:
 
 __all__ = [
     "AudioSettings",
+    "DEFAULT_MOTION_ZOOM_AMOUNT",
     "DEFAULT_TRANSITION_DURATION_FRAMES",
+    "MOTION_DIRECTIONS",
+    "MOTION_KINDS",
     "MediaItem",
+    "MotionChoice",
     "PROJECT_SCHEMA_VERSION",
     "SNAP_TARGETS",
     "SlideshowProject",
