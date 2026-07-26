@@ -11,7 +11,26 @@ A DaVinci Resolve plug-in (Python script) for quickly building polished slidesho
 
 ## Status
 
-Project bootstrap. See `docs/PLAN.md` (or the session plan) for the implementation roadmap.
+Working end-to-end: an ordered list of media becomes a Resolve timeline with
+animated transitions between every slide.
+
+- `slideshow.project_model` — the slideshow as data (24 transition kinds,
+  motions, titles, audio settings, JSON persistence).
+- `slideshow.layout` — pure placement maths: alternating V1/V2 tracks,
+  record frames, clamped overlaps.
+- `slideshow.transitions` — plans each transition, then merges the two
+  plans that meet on a clip and builds its Fusion node graph.
+- `slideshow.timeline_builder` — the Resolve plumbing that joins them.
+
+Try it against a running Resolve:
+
+```
+py -3.14 scripts\build_demo_timeline.py <folder-of-images> --transition slide_left
+py -3.14 scripts\build_demo_timeline.py --list-transitions
+```
+
+Still to come: auto-mix, per-clip motion (Ken Burns), bulk duration fitting,
+titles, soundtrack analysis / beat sync, and the in-Resolve UI.
 
 ## Target environment
 

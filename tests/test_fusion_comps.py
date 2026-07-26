@@ -699,3 +699,152 @@ def test_list_tools_handles_empty():
     comp = MagicMock()
     comp.GetToolList.return_value = None
     assert fc.list_tools(comp) == []
+
+
+# --------------------------------------------------------------------------- #
+# insert_tool_chain + effect tool helpers
+# --------------------------------------------------------------------------- #
+
+class _FakeTool:
+    """Mock tool that records its wiring so a chain can be asserted on."""
+
+    def __init__(self, name):
+        self.name = name
+        self.Output = "{0}-out".format(name)
+        self.inputs = {}
+
+    def ConnectInput(self, input_name, source):
+        self.inputs[input_name] = source
+
+    def SetInput(self, input_name, value):
+        self.inputs[input_name] = value
+
+    def SetAttrs(self, attrs):
+        self.name = attrs.get("TOOLS_Name", self.name)
+
+    def GetAttrs(self, key):
+        return self.name
+
+
+class _FakeComp:
+    """Comp that hands out :class:`_FakeTool`s and remembers what was added."""
+
+    def __init__(self, existing=("MediaIn1", "MediaOut1")):
+        self.tools = {name: _FakeTool(name) for name in existing}
+        self.added = []
+
+    def FindTool(self, name):
+        return self.tools.get(name)
+
+    def AddTool(self, tool_type, x=0, y=0):
+        tool = _FakeTool(tool_type)
+        self.added.append((tool_type, x, y))
+        # Fusion names the tool when SetAttrs runs; register under both so a
+        # later FindTool by our chosen name succeeds.
+        self.tools[tool_type] = tool
+        original_setattrs = tool.SetAttrs
+
+        def register(attrs):
+            original_setattrs(attrs)
+            self.tools[tool.name] = tool
+
+        tool.SetAttrs = register
+        return tool
+
+
+def test_insert_tool_chain_wires_tools_in_order():
+    comp = _FakeComp()
+
+    tools = fc.insert_tool_chain(
+        comp,
+        [("Blur", "B"), ("Pixelate", "P"), ("Transform", "X")],
+    )
+
+    assert [t.name for t in tools] == ["B", "P", "X"]
+    assert tools[0].inputs["Input"] == "MediaIn1-out"
+    assert tools[1].inputs["Input"] == "Blur-out"
+    assert tools[2].inputs["Input"] == "Pixelate-out"
+    assert comp.tools["MediaOut1"].inputs["Input"] == "Transform-out"
+    assert comp.added == [("Blur", 1, 0), ("Pixelate", 2, 0), ("Transform", 3, 0)]
+
+
+def test_insert_tool_chain_with_no_specs_wires_media_in_to_media_out():
+    comp = _FakeComp()
+    assert fc.insert_tool_chain(comp, []) == []
+    assert comp.tools["MediaOut1"].inputs["Input"] == "MediaIn1-out"
+    assert comp.added == []
+
+
+def test_insert_tool_chain_reuses_existing_tools():
+    comp = _FakeComp(existing=("MediaIn1", "MediaOut1", "B"))
+    tools = fc.insert_tool_chain(comp, [("Blur", "B")])
+    assert tools[0] is comp.tools["B"]
+    assert comp.added == []
+    assert comp.tools["MediaOut1"].inputs["Input"] == "B-out"
+
+
+def test_insert_tool_chain_requires_media_io():
+    with pytest.raises(RuntimeError, match="MediaIn1"):
+        fc.insert_tool_chain(_FakeComp(existing=()), [])
+    with pytest.raises(RuntimeError, match="MediaOut1"):
+        fc.insert_tool_chain(_FakeComp(existing=("MediaIn1",)), [])
+
+
+def test_insert_transform_chain_still_returns_the_transform():
+    comp = _FakeComp()
+    xform = fc.insert_transform_chain(comp)
+    assert xform.name == fc.DEFAULT_TRANSFORM_NAME
+    assert xform.inputs["Input"] == "MediaIn1-out"
+    assert comp.tools["MediaOut1"].inputs["Input"] == "Transform-out"
+
+
+def test_add_background_sets_each_colour_channel():
+    comp = _FakeComp()
+    bg = fc.add_background(comp, (0.25, 0.5, 0.75))
+    assert bg.name == fc.DEFAULT_BACKGROUND_NAME
+    assert bg.inputs == {
+        "TopLeftRed": 0.25,
+        "TopLeftGreen": 0.5,
+        "TopLeftBlue": 0.75,
+        "TopLeftAlpha": 1.0,
+    }
+
+
+def test_add_blur_and_pixelate_use_stable_names():
+    comp = _FakeComp()
+    blur = fc.add_blur(comp)
+    pixelate = fc.add_pixelate(comp)
+    assert blur.name == fc.DEFAULT_BLUR_NAME
+    assert pixelate.name == fc.DEFAULT_PIXELATE_NAME
+    # Second call reuses rather than duplicating.
+    assert fc.add_blur(comp) is blur
+    assert comp.added == [("Blur", 0, 0), ("Pixelate", 0, 0)]
+
+
+def test_add_merge_wires_background_and_foreground():
+    comp = _FakeComp()
+    bg = fc.add_background(comp, (0.0, 0.0, 0.0))
+    fg = fc.add_blur(comp)
+
+    merge = fc.add_merge(comp, background=bg, foreground=fg, apply_mode="add")
+
+    assert merge.inputs["Background"] == "Background-out"
+    assert merge.inputs["Foreground"] == "Blur-out"
+    assert merge.inputs["ApplyMode"] == "Add"
+
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("normal", "Normal"),
+        ("add", "Add"),
+        ("non_add", "Maximum"),
+        ("nonsense", "Normal"),
+    ],
+)
+def test_set_merge_apply_mode(mode, expected):
+    merge = _FakeTool("Merge1")
+    fc.set_merge_apply_mode(merge, mode)
+    assert merge.inputs["ApplyMode"] == expected
+
+

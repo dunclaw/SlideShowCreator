@@ -77,6 +77,81 @@ framework) work: place every slide on V1 sequentially, then drop the incoming
 half of each transition on V2 at the precise overlap frame, and animate that
 V2 clip with a Fusion comp.
 
+### The alternating V1/V2 layout (implemented in `slideshow.layout`)
+
+Rather than "slides on V1, transitions on V2", the builder alternates: slide
+0 on V1, slide 1 on V2, slide 2 on V1, … Adjacent pairs then always live on
+different tracks and can overlap by the transition duration.
+
+```
+V2          ┌────────────┐            ┌────────────┐
+V1  ┌───────┼──┐      ┌──┼────────────┼──┐
+    │ slide 0  │      │ slide 2       │  │
+    └───────┼──┘      └──┼────────────┼──┘
+            │ slide 1    │            │ slide 3
+            └────────────┘            └────────────┘
+```
+
+Two consequences worth remembering:
+
+- Each clip is the **incoming** side of the transition before it *and* the
+  **outgoing** side of the transition after it. Both sets of keyframes have
+  to land in that clip's single Fusion comp, which is why
+  `transitions.applier.merge_clip_plans` exists — applying the two plans
+  separately would clobber the first one's Transform keyframes.
+- Overlaps must be clamped so a clip's two transitions never meet in the
+  middle. `slideshow.layout` shrinks them proportionally until every clip
+  keeps at least one frame to itself.
+
+### `AppendToTimeline` targets the *current* timeline
+
+`MediaPool.AppendToTimeline` has no timeline argument — it appends to
+whatever `Project.GetCurrentTimeline()` returns. After
+`CreateEmptyTimeline(name)` you **must** call
+`Project.SetCurrentTimeline(timeline)` before appending, otherwise the clips
+land on whichever timeline the user happened to have open.
+
+Tracks must also exist before you place onto them: `trackIndex: 2` on a
+timeline with a single video track is not self-creating. Call
+`Timeline.AddTrack("video")` until `GetTrackCount("video")` is high enough.
+
+### Fusion tools used by the transition applier
+
+The graph the applier builds per clip, inserting only what the merged plan
+needs:
+
+```
+MediaIn1 ─► [Blur] ─► [Pixelate] ─► Transform ─┬─► MediaOut1
+                                               │
+                    Background ─► Merge ◄──────┘
+                                    └─► MediaOut1   (background variant)
+```
+
+| Effect | Tool | Animated input |
+| --- | --- | --- |
+| blur | `Blur` | `XBlurSize` (LockXY ties Y to it) |
+| pixelate | `Pixelate` | `XPixelSize` |
+| opacity | `Transform` | `Blend` |
+| fade to colour | `Merge` over a `Background` | `Merge.Blend` |
+
+Fading the **Merge** rather than the Transform is what makes a dip-to-colour
+transition reveal the colour instead of fading to transparency.
+
+⚠️ The two input names above are taken from Fusion's documented tool
+reference and have **not yet been confirmed against a live Resolve build** —
+run `scripts/probe_composite.py` and correct this table.
+
+### Open question: additive / non-additive dissolves
+
+`additive_dissolve` and `non_additive_dissolve` need the incoming clip to
+composite onto the outgoing one with an Add / Maximum blend. A per-clip
+Fusion comp **cannot see the clip beneath it on the timeline**, so a Fusion
+`Merge` can't express this — the applier falls back to
+`TimelineItem.SetProperty("CompositeMode", …)` at the Edit-page level
+(`"Add"` / `"Lighten"`). Those property values are unverified; the probe
+script enumerates which ones Resolve accepts.
+
+
 ## Fusion scripting
 
 Available via `resolve.Fusion()` for the global Fusion app object and via

@@ -1,0 +1,508 @@
+"""Unit tests for :mod:`slideshow.transitions.applier`.
+
+Two halves:
+
+* ``merge_clip_plans`` — pure keyframe arithmetic, no mocks needed.
+* ``build_comp_graph`` / ``apply_comp_spec`` — assert the Fusion API calls
+  we make, using the same fake-comp approach as ``test_fusion_comps.py``.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from unittest.mock import MagicMock
+
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+SRC = os.path.join(ROOT, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+
+from slideshow import fusion_comps as fc
+from slideshow.layout import PlacedClip
+from slideshow.transitions import plan_transition, registered_kinds
+from slideshow.transitions.applier import (
+    CompSpec,
+    apply_comp_spec,
+    apply_composite_mode,
+    build_comp_graph,
+    comp_spec_for_clip,
+    merge_clip_plans,
+)
+from slideshow.transitions.base import ClipPlan, TransitionPlan
+from slideshow.fusion_comps import TransformAnimation
+from slideshow.project_model import TransitionChoice
+
+
+# --------------------------------------------------------------------------- #
+# merge_clip_plans
+# --------------------------------------------------------------------------- #
+
+def test_merge_of_nothing_is_empty():
+    spec = merge_clip_plans(length_frames=96)
+    assert spec.is_empty()
+    assert spec.length_frames == 96
+    assert spec.transform is None
+    assert spec.blend is None
+
+
+def test_lead_in_keyframes_start_at_clip_frame_zero():
+    lead_in = ClipPlan(blend=[(0, 0.0), (12, 1.0)])
+    spec = merge_clip_plans(length_frames=96, lead_in=lead_in)
+    assert spec.blend == [(0, 0.0), (12, 1.0)]
+    assert not spec.is_empty()
+
+
+def test_lead_out_keyframes_are_shifted_to_the_end_of_the_clip():
+    lead_out = ClipPlan(blend=[(0, 1.0), (12, 0.0)])
+    spec = merge_clip_plans(
+        length_frames=96, lead_out=lead_out, lead_out_frames=12
+    )
+    assert spec.blend == [(84, 1.0), (96, 0.0)]
+
+
+def test_both_halves_merge_into_one_channel():
+    lead_in = ClipPlan(blend=[(0, 0.0), (12, 1.0)])
+    lead_out = ClipPlan(blend=[(0, 1.0), (12, 0.0)])
+    spec = merge_clip_plans(
+        length_frames=96, lead_in=lead_in, lead_out=lead_out, lead_out_frames=12
+    )
+    assert spec.blend == [(0, 0.0), (12, 1.0), (84, 1.0), (96, 0.0)]
+
+
+def test_hold_keyframe_inserted_when_the_two_halves_disagree():
+    # Lead-in leaves Size at 1.0; lead-out wants to start from 2.0.
+    lead_in = ClipPlan(transform=TransformAnimation(size=[(0, 0.0), (10, 1.0)]))
+    lead_out = ClipPlan(transform=TransformAnimation(size=[(0, 2.0), (10, 3.0)]))
+    spec = merge_clip_plans(
+        length_frames=50, lead_in=lead_in, lead_out=lead_out, lead_out_frames=10
+    )
+    assert spec.transform.size == [(0, 0.0), (10, 1.0), (39, 1.0), (40, 2.0), (50, 3.0)]
+
+
+def test_no_hold_keyframe_when_the_halves_already_agree():
+    lead_in = ClipPlan(transform=TransformAnimation(size=[(0, 0.0), (10, 1.0)]))
+    lead_out = ClipPlan(transform=TransformAnimation(size=[(0, 1.0), (10, 2.0)]))
+    spec = merge_clip_plans(
+        length_frames=50, lead_in=lead_in, lead_out=lead_out, lead_out_frames=10
+    )
+    assert spec.transform.size == [(0, 0.0), (10, 1.0), (40, 1.0), (50, 2.0)]
+
+
+def test_colliding_frames_resolve_in_favour_of_the_lead_out():
+    lead_in = ClipPlan(blend=[(0, 0.0), (10, 0.5)])
+    lead_out = ClipPlan(blend=[(0, 1.0), (5, 0.0)])
+    spec = merge_clip_plans(
+        length_frames=10, lead_in=lead_in, lead_out=lead_out, lead_out_frames=10
+    )
+    # lead_out offset is 0, so frame 0 collides — the lead-out value wins.
+    assert spec.blend[0] == (0, 1.0)
+
+
+def test_point_channels_merge_and_shift():
+    lead_in = ClipPlan(
+        transform=TransformAnimation(center=[(0, (-0.5, 0.5)), (10, (0.5, 0.5))])
+    )
+    lead_out = ClipPlan(
+        transform=TransformAnimation(center=[(0, (0.5, 0.5)), (10, (1.5, 0.5))])
+    )
+    spec = merge_clip_plans(
+        length_frames=100, lead_in=lead_in, lead_out=lead_out, lead_out_frames=10
+    )
+    assert spec.transform.center == [
+        (0, (-0.5, 0.5)), (10, (0.5, 0.5)), (90, (0.5, 0.5)), (100, (1.5, 0.5))
+    ]
+
+
+def test_all_transform_channels_survive_the_merge():
+    lead_in = ClipPlan(
+        transform=TransformAnimation(
+            center=[(0, (0.0, 0.0)), (5, (0.5, 0.5))],
+            size=[(0, 0.0), (5, 1.0)],
+            angle=[(0, 90.0), (5, 0.0)],
+            pivot=[(0, (0.5, 0.5)), (5, (0.5, 0.5))],
+        )
+    )
+    spec = merge_clip_plans(length_frames=40, lead_in=lead_in)
+    assert spec.transform.center and spec.transform.size
+    assert spec.transform.angle and spec.transform.pivot
+
+
+def test_blur_and_pixelate_channels_merge_independently():
+    lead_in = ClipPlan(blur_size=[(0, 10.0), (6, 0.0)])
+    lead_out = ClipPlan(pixelate_size=[(0, 0.0), (6, 20.0)])
+    spec = merge_clip_plans(
+        length_frames=60, lead_in=lead_in, lead_out=lead_out, lead_out_frames=6
+    )
+    assert spec.blur_size == [(0, 10.0), (6, 0.0)]
+    assert spec.pixelate_size == [(54, 0.0), (60, 20.0)]
+
+
+def test_background_prefers_the_lead_in_colour():
+    lead_in = ClipPlan(background_color=(0.0, 0.0, 0.0))
+    lead_out = ClipPlan(background_color=(1.0, 1.0, 1.0))
+    spec = merge_clip_plans(length_frames=10, lead_in=lead_in, lead_out=lead_out)
+    assert spec.background_color == (0.0, 0.0, 0.0)
+
+
+def test_background_falls_back_to_the_lead_out_colour():
+    lead_out = ClipPlan(background_color=(0.5, 0.5, 0.5))
+    spec = merge_clip_plans(length_frames=10, lead_out=lead_out)
+    assert spec.background_color == (0.5, 0.5, 0.5)
+
+
+def test_composite_mode_comes_from_the_incoming_half_only():
+    lead_in = ClipPlan(composite_mode="add")
+    lead_out = ClipPlan(composite_mode="non_add")
+    assert merge_clip_plans(
+        length_frames=10, lead_in=lead_in, lead_out=lead_out
+    ).composite_mode == "add"
+    assert merge_clip_plans(
+        length_frames=10, lead_out=lead_out
+    ).composite_mode == "normal"
+
+
+def test_negative_lengths_are_rejected():
+    with pytest.raises(ValueError, match="length_frames"):
+        merge_clip_plans(length_frames=-1)
+    with pytest.raises(ValueError, match="lead_out_frames"):
+        merge_clip_plans(length_frames=10, lead_out_frames=-1)
+
+
+def test_lead_out_longer_than_the_clip_clamps_to_frame_zero():
+    lead_out = ClipPlan(blend=[(0, 1.0), (20, 0.0)])
+    spec = merge_clip_plans(
+        length_frames=10, lead_out=lead_out, lead_out_frames=20
+    )
+    assert spec.blend == [(0, 1.0), (20, 0.0)]
+
+
+# --------------------------------------------------------------------------- #
+# comp_spec_for_clip
+# --------------------------------------------------------------------------- #
+
+def test_comp_spec_for_clip_picks_the_right_half_of_each_plan():
+    incoming_marker = ClipPlan(blend=[(0, 0.0), (10, 1.0)])
+    outgoing_marker = ClipPlan(blend=[(0, 1.0), (10, 0.0)])
+    lead_in_plan = TransitionPlan(
+        kind="dissolve", duration_frames=10,
+        incoming=incoming_marker, outgoing=ClipPlan(blur_size=[(0, 9.0)]),
+    )
+    lead_out_plan = TransitionPlan(
+        kind="dissolve", duration_frames=10,
+        incoming=ClipPlan(blur_size=[(0, 9.0)]), outgoing=outgoing_marker,
+    )
+    clip = PlacedClip(
+        index=1, track_index=2, record_frame=0, length_frames=50,
+        lead_in_frames=10, lead_out_frames=10,
+    )
+
+    spec = comp_spec_for_clip(
+        clip, lead_in_plan=lead_in_plan, lead_out_plan=lead_out_plan
+    )
+
+    # Only the incoming/outgoing halves were used — no blur leaked in.
+    assert spec.blur_size is None
+    assert spec.blend == [(0, 0.0), (10, 1.0), (40, 1.0), (50, 0.0)]
+    assert spec.length_frames == 50
+
+
+def test_comp_spec_for_a_real_slide_transition():
+    choice = TransitionChoice(kind="slide_left", duration_frames=12)
+    plan = plan_transition(choice)
+    clip = PlacedClip(
+        index=1, track_index=2, record_frame=0, length_frames=96,
+        lead_in_frames=12,
+    )
+    spec = comp_spec_for_clip(clip, lead_in_plan=plan)
+    assert spec.transform.center == [(0, (1.5, 0.5)), (12, (0.5, 0.5))]
+
+
+# --------------------------------------------------------------------------- #
+# Graph construction
+# --------------------------------------------------------------------------- #
+
+class _FakeInputHandle:
+    """Stands in for a Fusion Input that has a modifier connected."""
+
+    def __init__(self, tool):
+        self.tool = tool
+
+    def GetConnectedOutput(self):
+        out = MagicMock(name="connected-output")
+        out.GetTool.return_value = self.tool
+        return out
+
+
+class _FakeTool:
+    def __init__(self, name, comp=None):
+        self.name = name
+        self.comp = comp
+        self.Output = "{0}-out".format(name)
+        self.inputs = {}
+        self.connections = {}
+        self.keyframes = None
+
+    def ConnectInput(self, input_name, source):
+        self.connections[input_name] = source
+        # Fusion renames a modifier to "<tool><input>" when it is connected;
+        # our helpers rely on that to find it again instead of duplicating.
+        if isinstance(source, _FakeTool) and source.name == "BezierSpline":
+            source.name = "{0}{1}".format(self.name, input_name)
+            if self.comp is not None:
+                self.comp.tools[source.name] = source
+
+    def AddModifier(self, input_name, kind):
+        modifier = _FakeTool(kind, comp=self.comp)
+        setattr(self, input_name, _FakeInputHandle(modifier))
+        return True
+
+    def SetKeyFrames(self, keyframes):
+        self.keyframes = keyframes
+
+    def SetInput(self, input_name, value):
+        self.inputs[input_name] = value
+
+    def SetAttrs(self, attrs):
+        self.name = attrs.get("TOOLS_Name", self.name)
+
+    def GetAttrs(self, key):
+        return self.name
+
+
+class _FakeComp:
+    def __init__(self):
+        self.tools = {n: _FakeTool(n, comp=self) for n in ("MediaIn1", "MediaOut1")}
+        self.added = []
+        self.locked = 0
+        self.attrs = {}
+
+    def FindTool(self, name):
+        return self.tools.get(name)
+
+    def AddTool(self, tool_type, x=0, y=0):
+        tool = _FakeTool(tool_type, comp=self)
+        self.added.append(tool_type)
+        self.tools[tool_type] = tool
+        base_setattrs = tool.SetAttrs
+
+        def register(attrs):
+            base_setattrs(attrs)
+            self.tools[tool.name] = tool
+
+        tool.SetAttrs = register
+        return tool
+
+    def Lock(self):
+        self.locked += 1
+
+    def Unlock(self):
+        self.locked -= 1
+
+    def SetAttrs(self, attrs):
+        self.attrs.update(attrs)
+
+
+def _timeline_item_for(comp):
+    ti = MagicMock()
+    ti.GetFusionCompNameList.return_value = ["Composition 1"]
+    ti.LoadFusionCompByName.return_value = comp
+    return ti
+
+
+def test_graph_is_just_a_transform_for_a_plain_move():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        transform=TransformAnimation(center=[(0, (0.0, 0.5)), (10, (0.5, 0.5))]),
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    assert set(built) == {"transform"}
+    assert comp.added == ["Transform"]  # the XYPath arrives via AddModifier
+    assert built["transform"].connections["Input"] == "MediaIn1-out"
+    assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
+
+
+def test_blur_and_pixelate_are_inserted_upstream_of_the_transform():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        blur_size=[(0, 10.0), (10, 0.0)],
+        pixelate_size=[(0, 20.0), (10, 0.0)],
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    assert set(built) >= {"blur", "pixelate", "transform"}
+    assert built["blur"].connections["Input"] == "MediaIn1-out"
+    assert built["pixelate"].connections["Input"] == "Blur-out"
+    assert built["transform"].connections["Input"] == "Pixelate-out"
+    assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
+
+
+def test_blur_only_skips_the_pixelate_node():
+    comp = _FakeComp()
+    spec = CompSpec(length_frames=50, blur_size=[(0, 10.0), (10, 0.0)])
+    built = build_comp_graph(comp, spec)
+    assert "pixelate" not in built
+    assert built["transform"].connections["Input"] == "Blur-out"
+
+
+def test_background_adds_a_merge_before_media_out():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        background_color=(0.0, 0.0, 0.0),
+        blend=[(0, 0.0), (10, 1.0)],
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    assert built["background"].inputs["TopLeftRed"] == 0.0
+    assert built["merge"].connections["Background"] == "Background-out"
+    assert built["merge"].connections["Foreground"] == "Transform-out"
+    assert comp.tools["MediaOut1"].connections["Input"] == "Merge-out"
+
+
+def test_blend_goes_on_the_merge_when_a_background_exists():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        background_color=(0.0, 0.0, 0.0),
+        blend=[(0, 0.0), (10, 1.0)],
+    )
+    built = build_comp_graph(comp, spec)
+    # Two keyframes → a BezierSpline is connected to Merge.Blend.
+    assert "Blend" in built["merge"].connections
+    assert "Blend" not in built["transform"].connections
+
+
+def test_blend_goes_on_the_transform_without_a_background():
+    comp = _FakeComp()
+    spec = CompSpec(length_frames=50, blend=[(0, 0.0), (10, 1.0)])
+    built = build_comp_graph(comp, spec)
+    assert "Blend" in built["transform"].connections
+    assert "merge" not in built
+
+
+def test_single_blend_keyframe_sets_a_constant():
+    comp = _FakeComp()
+    spec = CompSpec(length_frames=50, blend=[(0, 0.5)])
+    built = build_comp_graph(comp, spec)
+    assert built["transform"].inputs["Blend"] == 0.5
+
+
+def test_rebuilding_the_same_graph_does_not_duplicate_tools():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        blur_size=[(0, 10.0), (10, 0.0)],
+        background_color=(0.0, 0.0, 0.0),
+    )
+    first = build_comp_graph(comp, spec)
+    added_after_first = list(comp.added)
+    second = build_comp_graph(comp, spec)
+
+    assert comp.added == added_after_first
+    assert second["blur"] is first["blur"]
+    assert second["merge"] is first["merge"]
+
+
+def test_blur_keyframes_land_on_the_x_size_input():
+    comp = _FakeComp()
+    spec = CompSpec(length_frames=50, blur_size=[(0, 10.0), (10, 0.0)])
+    built = build_comp_graph(comp, spec)
+    assert fc.BLUR_SIZE_INPUT in built["blur"].connections
+
+
+# --------------------------------------------------------------------------- #
+# apply_comp_spec
+# --------------------------------------------------------------------------- #
+
+def test_apply_comp_spec_skips_empty_specs_entirely():
+    ti = MagicMock()
+    assert apply_comp_spec(ti, CompSpec(length_frames=50)) is None
+    ti.GetFusionCompNameList.assert_not_called()
+    ti.AddFusionComp.assert_not_called()
+
+
+def test_apply_comp_spec_locks_builds_and_marks_modified():
+    comp = _FakeComp()
+    ti = _timeline_item_for(comp)
+    spec = CompSpec(length_frames=50, blend=[(0, 0.0), (10, 1.0)])
+
+    result = apply_comp_spec(ti, spec)
+
+    assert result is comp
+    assert comp.locked == 0  # balanced Lock/Unlock
+    assert comp.attrs == {"COMPB_Modified": True}
+    assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
+
+
+def test_apply_comp_spec_sets_timeline_composite_mode():
+    comp = _FakeComp()
+    ti = _timeline_item_for(comp)
+    spec = CompSpec(
+        length_frames=50, blend=[(0, 0.0), (10, 1.0)], composite_mode="add"
+    )
+
+    apply_comp_spec(ti, spec)
+
+    ti.SetProperty.assert_called_once_with("CompositeMode", "Add")
+
+
+def test_composite_mode_normal_is_a_no_op():
+    ti = MagicMock()
+    assert apply_composite_mode(ti, "normal") is True
+    ti.SetProperty.assert_not_called()
+
+
+def test_composite_mode_unknown_returns_false():
+    ti = MagicMock()
+    assert apply_composite_mode(ti, "nonsense") is False
+    ti.SetProperty.assert_not_called()
+
+
+def test_composite_mode_tolerates_resolve_rejecting_the_property():
+    ti = MagicMock()
+    ti.SetProperty.side_effect = Exception("unsupported")
+    assert apply_composite_mode(ti, "add") is False
+
+
+def test_composite_mode_only_spec_still_builds_nothing_in_the_comp():
+    # composite_mode alone makes the spec non-empty, but the graph is a
+    # bare pass-through Transform — that's fine and must not crash.
+    comp = _FakeComp()
+    ti = _timeline_item_for(comp)
+    apply_comp_spec(ti, CompSpec(length_frames=10, composite_mode="non_add"))
+    ti.SetProperty.assert_called_once_with("CompositeMode", "Lighten")
+    assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end over every registered transition kind
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("kind", sorted(registered_kinds()))
+def test_every_kind_can_be_planned_merged_and_applied(kind):
+    plan = plan_transition(TransitionChoice(kind=kind, duration_frames=12))
+    clip = PlacedClip(
+        index=1, track_index=2, record_frame=0, length_frames=96,
+        lead_in_frames=plan.duration_frames, lead_out_frames=plan.duration_frames,
+    )
+    spec = comp_spec_for_clip(clip, lead_in_plan=plan, lead_out_plan=plan)
+
+    comp = _FakeComp()
+    ti = _timeline_item_for(comp)
+    apply_comp_spec(ti, spec)
+
+    if not spec.is_empty():
+        assert comp.attrs == {"COMPB_Modified": True}
+        assert comp.tools["MediaOut1"].connections["Input"] in (
+            "Transform-out", "Merge-out"
+        )

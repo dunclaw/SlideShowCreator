@@ -49,6 +49,22 @@ PointKeyframe = Tuple[Union[int, float], Tuple[float, float]]
 
 
 DEFAULT_TRANSFORM_NAME = "SlideShowXf"
+DEFAULT_BLUR_NAME = "SlideShowBlur"
+DEFAULT_PIXELATE_NAME = "SlideShowPixelate"
+DEFAULT_BACKGROUND_NAME = "SlideShowBg"
+DEFAULT_MERGE_NAME = "SlideShowMerge"
+
+#: Fusion input names for the scalar "amount" of each effect tool. Both
+#: tools lock X to Y by default, so driving the X input animates both axes.
+BLUR_SIZE_INPUT = "XBlurSize"
+PIXELATE_SIZE_INPUT = "XPixelSize"
+
+#: ``Merge.ApplyMode`` values matching ``ClipPlan.composite_mode``.
+MERGE_APPLY_MODES = {
+    "normal": "Normal",
+    "add": "Add",
+    "non_add": "Maximum",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -367,24 +383,134 @@ def insert_transform_chain(
         MediaIn1.Output ─> Transform.Input
         Transform.Output ─> MediaOut1.Input
     """
-    media_in = comp.FindTool(media_in_name)
-    media_out = comp.FindTool(media_out_name)
-    if media_in is None:
+    return insert_tool_chain(
+        comp,
+        [("Transform", transform_name)],
+        media_in_name=media_in_name,
+        media_out_name=media_out_name,
+        first_position=position,
+    )[0]
+
+
+def _require_tool(comp: Any, name: str) -> Any:
+    tool = comp.FindTool(name)
+    if tool is None:
         raise RuntimeError(
-            "Composition has no {0!r} tool — is this a Resolve clip comp?".format(
-                media_in_name
-            )
+            "Composition has no {0!r} tool — is this a Resolve clip comp?".format(name)
         )
-    if media_out is None:
-        raise RuntimeError(
-            "Composition has no {0!r} tool — is this a Resolve clip comp?".format(
-                media_out_name
-            )
+    return tool
+
+
+def insert_tool_chain(
+    comp: Any,
+    specs: Sequence[Tuple[str, str]],
+    *,
+    media_in_name: str = "MediaIn1",
+    media_out_name: str = "MediaOut1",
+    first_position: Tuple[int, int] = (1, 0),
+) -> List[Any]:
+    """Wire an ordered list of tools between MediaIn1 and MediaOut1.
+
+    *specs* is a sequence of ``(tool_type, tool_name)`` pairs, upstream
+    first. The resulting graph is always::
+
+        MediaIn1 ─> specs[0] ─> specs[1] ─> … ─> MediaOut1
+
+    Existing tools with the same names are reused (and re-wired), so calling
+    this twice never duplicates nodes — important because the builder may be
+    re-run over a timeline whose clips already carry our comps.
+
+    Passing an empty *specs* wires MediaIn1 straight to MediaOut1.
+
+    Returns the tools in the same order as *specs*.
+    """
+    media_in = _require_tool(comp, media_in_name)
+    media_out = _require_tool(comp, media_out_name)
+
+    x, y = first_position
+    tools: List[Any] = []
+    upstream = media_in
+    for offset, (tool_type, tool_name) in enumerate(specs):
+        tool = find_or_add_tool(
+            comp, tool_type, tool_name, position=(x + offset, y)
         )
-    xform = find_or_add_tool(comp, "Transform", transform_name, position=position)
-    connect(media_in, xform, "Input")
-    connect(xform, media_out, "Input")
-    return xform
+        connect(upstream, tool, "Input")
+        tools.append(tool)
+        upstream = tool
+
+    connect(upstream, media_out, "Input")
+    return tools
+
+
+def add_blur(
+    comp: Any,
+    *,
+    name: str = DEFAULT_BLUR_NAME,
+    position: Tuple[int, int] = (0, 0),
+) -> Any:
+    """Find or create a Blur tool (unwired — use :func:`insert_tool_chain`)."""
+    return find_or_add_tool(comp, "Blur", name, position=position)
+
+
+def add_pixelate(
+    comp: Any,
+    *,
+    name: str = DEFAULT_PIXELATE_NAME,
+    position: Tuple[int, int] = (0, 0),
+) -> Any:
+    """Find or create a Pixelate tool (unwired)."""
+    return find_or_add_tool(comp, "Pixelate", name, position=position)
+
+
+def add_background(
+    comp: Any,
+    color: Tuple[float, float, float],
+    *,
+    name: str = DEFAULT_BACKGROUND_NAME,
+    alpha: float = 1.0,
+    position: Tuple[int, int] = (0, 1),
+) -> Any:
+    """Find or create a solid-colour Background tool set to *color*.
+
+    Fusion's Background tool exposes its colour as four separate scalar
+    inputs (``TopLeftRed`` … ``TopLeftAlpha``) rather than one Point/RGBA
+    input, so each channel is set individually.
+    """
+    r, g, b = color
+    tool = find_or_add_tool(comp, "Background", name, position=position)
+    tool.SetInput("TopLeftRed", float(r))
+    tool.SetInput("TopLeftGreen", float(g))
+    tool.SetInput("TopLeftBlue", float(b))
+    tool.SetInput("TopLeftAlpha", float(alpha))
+    return tool
+
+
+def add_merge(
+    comp: Any,
+    *,
+    background: Any,
+    foreground: Any,
+    name: str = DEFAULT_MERGE_NAME,
+    apply_mode: str = "normal",
+    position: Tuple[int, int] = (1, 1),
+) -> Any:
+    """Find or create a Merge compositing *foreground* over *background*."""
+    merge = find_or_add_tool(comp, "Merge", name, position=position)
+    connect(background, merge, "Background")
+    connect(foreground, merge, "Foreground")
+    set_merge_apply_mode(merge, apply_mode)
+    return merge
+
+
+def set_merge_apply_mode(merge: Any, mode: str) -> None:
+    """Set a Merge's ``ApplyMode`` from a :data:`MERGE_APPLY_MODES` key.
+
+    Unknown modes fall back to ``Normal`` rather than raising: a composite
+    mode we can't honour should degrade to a plain alpha composite, not
+    abort the whole build.
+    """
+    merge.SetInput("ApplyMode", MERGE_APPLY_MODES.get(mode, "Normal"))
+
 
 
 # --------------------------------------------------------------------------- #
@@ -499,10 +625,21 @@ def _safe_name(timeline_item: Any) -> str:
 
 
 __all__ = [
+    "BLUR_SIZE_INPUT",
+    "DEFAULT_BACKGROUND_NAME",
+    "DEFAULT_BLUR_NAME",
+    "DEFAULT_MERGE_NAME",
+    "DEFAULT_PIXELATE_NAME",
     "DEFAULT_TRANSFORM_NAME",
+    "MERGE_APPLY_MODES",
+    "PIXELATE_SIZE_INPUT",
     "PointKeyframe",
     "ScalarKeyframe",
     "TransformAnimation",
+    "add_background",
+    "add_blur",
+    "add_merge",
+    "add_pixelate",
     "apply_transform_animation",
     "attach_or_get_comp",
     "attach_transform_animation",
@@ -510,11 +647,13 @@ __all__ = [
     "find_or_add_tool",
     "find_tool",
     "get_active_comp",
+    "insert_tool_chain",
     "insert_transform_chain",
     "list_tools",
     "locked",
     "mark_modified",
     "set_constant",
+    "set_merge_apply_mode",
     "set_point_keyframes",
     "set_scalar_keyframes",
 ]
