@@ -77,31 +77,51 @@ framework) work: place every slide on V1 sequentially, then drop the incoming
 half of each transition on V2 at the precise overlap frame, and animate that
 V2 clip with a Fusion comp.
 
-### The alternating V1/V2 layout (implemented in `slideshow.layout`)
+### The split-track layout (implemented in `slideshow.layout`)
 
-Rather than "slides on V1, transitions on V2", the builder alternates: slide
-0 on V1, slide 1 on V2, slide 2 on V1, … Adjacent pairs then always live on
-different tracks and can overlap by the transition duration.
+Every slide except the first is cut into **two timeline clips**:
+
+- a **head** on **V2**, exactly as long as the incoming transition, sitting
+  over the tail of the previous slide;
+- a **body** on **V1**, holding the rest, starting at the frame the previous
+  slide ends.
+
+Slide 0 (and any slide with no incoming transition) is a single whole clip on
+V1.
 
 ```
-V2          ┌────────────┐            ┌────────────┐
-V1  ┌───────┼──┐      ┌──┼────────────┼──┐
-    │ slide 0  │      │ slide 2       │  │
-    └───────┼──┘      └──┼────────────┼──┘
-            │ slide 1    │            │ slide 3
-            └────────────┘            └────────────┘
+V2          ┌────┐          ┌────┐          ┌────┐
+V1  ┌───────┴────┼──────────┴────┼──────────┴────┼────────┐
+    │  slide 0   │   slide 1     │   slide 2     │ slide 3│
+    └────────────┴───────────────┴───────────────┴────────┘
 ```
+
+Why this shape rather than alternating slides V1/V2/V1/…:
+
+- **The incoming slide is always on top.** Almost every transition animates
+  the incoming side, so under an alternating layout half the slides animated
+  *underneath* an opaque clip and rendered as hard cuts.
+- **V1 is contiguous end to end**, so there is never a gap or a hole to see
+  through.
+- **The head/body cut is invisible.** It lands on the frame where the
+  transition finishes — the image is static and fully opaque there.
+- With no transitions at all, every slide is a single V1 clip and the result
+  is identical to the old flat layout.
 
 Two consequences worth remembering:
 
-- Each clip is the **incoming** side of the transition before it *and* the
-  **outgoing** side of the transition after it. Both sets of keyframes have
-  to land in that clip's single Fusion comp, which is why
-  `transitions.applier.merge_clip_plans` exists — applying the two plans
-  separately would clobber the first one's Transform keyframes.
-- Overlaps must be clamped so a clip's two transitions never meet in the
-  middle. `slideshow.layout` shrinks them proportionally until every clip
-  keeps at least one frame to itself.
+- A head carries only a lead-**in** and a body only a lead-**out**, so no
+  segment ever needs two plans merged. `transitions.applier.merge_clip_plans`
+  still handles the two-sided case, because a layout that doesn't split (or a
+  future one that stacks differently) can still produce it.
+- Overlaps must be clamped so a slide's two transitions never meet in the
+  middle. `slideshow.layout` shrinks them proportionally until every slide
+  keeps at least one frame to itself — which also guarantees a body is never
+  shorter than its outgoing overlap.
+
+`TimelineLayout.clips` therefore holds *segments*, not slides: use
+`segments_for_index(i)` / `clip_for_index(i)`, and `BuildResult.items_for_index(i)`
+/ `item_for_index(i)`, to get back to `project.items`.
 
 ### Importing stills: one path per `ImportMedia` call
 
@@ -276,11 +296,11 @@ This is why the applier always routes through a Merge when a plan carries
 
 ### Transitions are stacking-order sensitive
 
-The alternating V1/V2 layout means the incoming clip is on the **upper**
-track for only every *other* transition. A transition that animates the
-incoming clip — which is nearly all of them — is completely invisible when
-that clip is underneath an opaque one: it renders as a hard cut. Confirmed
-visually; the symptom is a slideshow where every second transition works.
+A transition that animates the incoming clip — which is nearly all of them —
+is completely invisible when that clip sits underneath an opaque one: it
+renders as a hard cut. The original alternating V1/V2 layout put the incoming
+clip on the upper track for only every *other* transition, and the symptom
+was a slideshow where every second transition worked.
 
 The clip on the higher track has to own the animation. `plan_transition()`
 takes `incoming_on_top` and calls `Transition.mirror()` when it's False, so
@@ -288,6 +308,15 @@ the outgoing clip animates *away* instead. The default mirror is a
 time-reversal with the two halves swapped; `_SlideBase` and `Drop` override
 it so the named direction survives, and `_PushBase` mirrors to itself
 because its two clips are always edge-to-edge and never overlap.
+
+The split-track layout above removes the problem at source — the incoming
+head is *always* on V2 — so in practice nothing is mirrored any more.
+Mirroring is kept because it also fixes the *second* half of the bug:
+mirroring only makes a transition visible, it doesn't make the lower slide
+animate, so under the old layout half the photos still never moved.
+`TimelineBuilder._apply_transitions` derives `incoming_on_top` from the real
+track indices via `_incoming_on_top()` rather than assuming, which keeps the
+layout and transition packages independent.
 
 ### Open question: additive / non-additive dissolves
 

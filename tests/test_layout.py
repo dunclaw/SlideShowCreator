@@ -16,6 +16,9 @@ if SRC not in sys.path:
 from slideshow.layout import (
     LOWER_TRACK,
     MIN_VISIBLE_FRAMES,
+    SEGMENT_BODY,
+    SEGMENT_HEAD,
+    SEGMENT_WHOLE,
     UPPER_TRACK,
     PlacedClip,
     TimelineLayout,
@@ -31,6 +34,31 @@ def _project(count=3, *, duration=4.0, transition="dissolve", frames=24):
         items=[MediaItem(path="s{0}.jpg".format(i)) for i in range(count)],
         default_item_duration_seconds=duration,
         default_transition=TransitionChoice(kind=transition, duration_frames=frames),
+    )
+
+
+def _slide_lengths(layout):
+    """Total frames each *slide* occupies, summing its segments."""
+    return [
+        sum(c.length_frames for c in layout.segments_for_index(i))
+        for i in range(layout.slide_count)
+    ]
+
+
+def _slide_starts(layout):
+    """Timeline frame each *slide* begins on."""
+    return [
+        layout.segments_for_index(i)[0].record_frame
+        for i in range(layout.slide_count)
+    ]
+
+
+def _slide_leads(layout, index):
+    """``(lead_in, lead_out)`` for a slide, wherever its segments put them."""
+    segments = layout.segments_for_index(index)
+    return (
+        max(c.lead_in_frames for c in segments),
+        max(c.lead_out_frames for c in segments),
     )
 
 
@@ -82,24 +110,55 @@ def test_single_clip_has_no_overlaps():
 
 def test_clips_overlap_by_transition_duration():
     layout = plan_layout(_project(3, duration=4.0, frames=24))
-    lengths = [c.length_frames for c in layout.clips]
-    assert lengths == [96, 96, 96]
-    assert [c.record_frame for c in layout.clips] == [0, 72, 144]
+    assert _slide_lengths(layout) == [96, 96, 96]
+    assert _slide_starts(layout) == [0, 72, 144]
     # 3 * 96 - 2 * 24
     assert layout.total_frames == 240
 
 
-def test_tracks_alternate_when_overlapping():
-    layout = plan_layout(_project(4))
-    assert [c.track_index for c in layout.clips] == [
-        LOWER_TRACK, UPPER_TRACK, LOWER_TRACK, UPPER_TRACK
+def test_overlapping_slides_split_into_head_and_body():
+    layout = plan_layout(_project(3, duration=4.0, frames=24))
+    assert [c.segment for c in layout.clips] == [
+        SEGMENT_WHOLE,
+        SEGMENT_HEAD, SEGMENT_BODY,
+        SEGMENT_HEAD, SEGMENT_BODY,
     ]
+    assert [c.length_frames for c in layout.clips] == [96, 24, 72, 24, 72]
+    assert [c.record_frame for c in layout.clips] == [0, 72, 96, 144, 168]
+
+
+def test_heads_go_on_the_upper_track_and_bodies_stay_on_v1():
+    layout = plan_layout(_project(4))
+    for clip in layout.clips:
+        expected = UPPER_TRACK if clip.segment == SEGMENT_HEAD else LOWER_TRACK
+        assert clip.track_index == expected, clip
     assert layout.track_count == 2
+
+
+def test_lower_track_is_contiguous():
+    layout = plan_layout(_project(5, frames=18))
+    lower = [c for c in layout.clips if c.track_index == LOWER_TRACK]
+    for previous, following in zip(lower, lower[1:]):
+        assert following.record_frame == previous.record_end_frame
+    assert lower[0].record_frame == 0
+    assert lower[-1].record_end_frame == layout.total_frames
+
+
+def test_heads_cover_exactly_the_overlap_window():
+    layout = plan_layout(_project(4, frames=18))
+    for index in range(1, layout.slide_count):
+        head = layout.segments_for_index(index)[0]
+        outgoing = layout.segments_for_index(index - 1)[-1]
+        assert head.segment == SEGMENT_HEAD
+        assert head.length_frames == 18
+        assert head.record_frame == outgoing.record_end_frame - 18
+        assert head.record_end_frame == outgoing.record_end_frame
 
 
 def test_all_cuts_stay_on_one_track():
     layout = plan_layout(_project(4, transition="none", frames=0))
     assert [c.track_index for c in layout.clips] == [LOWER_TRACK] * 4
+    assert [c.segment for c in layout.clips] == [SEGMENT_WHOLE] * 4
     assert layout.track_count == 1
     assert [c.record_frame for c in layout.clips] == [0, 96, 192, 288]
     assert layout.total_frames == 384
@@ -107,12 +166,14 @@ def test_all_cuts_stay_on_one_track():
 
 def test_lead_in_and_lead_out_mirror_neighbours():
     layout = plan_layout(_project(3, frames=24))
-    first, middle, last = layout.clips
-    assert (first.lead_in_frames, first.lead_out_frames) == (0, 24)
-    assert (middle.lead_in_frames, middle.lead_out_frames) == (24, 24)
-    assert (last.lead_in_frames, last.lead_out_frames) == (24, 0)
-    assert middle.lead_out_start_frame == 96 - 24
-    assert middle.visible_frames == 96 - 48
+    assert _slide_leads(layout, 0) == (0, 24)
+    assert _slide_leads(layout, 1) == (24, 24)
+    assert _slide_leads(layout, 2) == (24, 0)
+    # No single segment ever carries both sides.
+    for clip in layout.clips:
+        assert not (clip.lead_in_frames and clip.lead_out_frames)
+    body = layout.segments_for_index(1)[-1]
+    assert body.lead_out_start_frame == 72 - 24
 
 
 def test_record_end_frame_and_total_seconds():
@@ -155,10 +216,10 @@ def test_per_item_durations_and_transitions_are_honoured():
         default_transition=TransitionChoice(kind="dissolve", duration_frames=12),
     )
     layout = plan_layout(proj, fps=24.0)
-    assert [c.length_frames for c in layout.clips] == [48, 72, 24]
+    assert _slide_lengths(layout) == [48, 72, 24]
     assert [t.kind for t in layout.transitions] == ["fade", "dissolve"]
     assert [t.duration_frames for t in layout.transitions] == [6, 12]
-    assert [c.record_frame for c in layout.clips] == [0, 42, 102]
+    assert _slide_starts(layout) == [0, 42, 102]
 
 
 def test_last_items_outgoing_transition_is_ignored():
@@ -205,12 +266,11 @@ def test_two_overlaps_cannot_exceed_the_clip_between_them():
         default_transition=TransitionChoice(kind="dissolve", duration_frames=18),
     )
     layout = plan_layout(proj, fps=24.0)
-    middle = layout.clips[1]
-    assert middle.lead_in_frames + middle.lead_out_frames <= 20 - MIN_VISIBLE_FRAMES
-    assert middle.visible_frames >= MIN_VISIBLE_FRAMES
+    lead_in, lead_out = _slide_leads(layout, 1)
+    assert lead_in + lead_out <= 20 - MIN_VISIBLE_FRAMES
     # Symmetric request stays symmetric after clamping (±1 for an odd budget).
-    assert abs(middle.lead_in_frames - middle.lead_out_frames) <= 1
-    assert middle.lead_in_frames + middle.lead_out_frames == 20 - MIN_VISIBLE_FRAMES
+    assert abs(lead_in - lead_out) <= 1
+    assert lead_in + lead_out == 20 - MIN_VISIBLE_FRAMES
 
 
 def test_every_clip_keeps_visible_frames_under_pressure():
@@ -222,13 +282,17 @@ def test_every_clip_keeps_visible_frames_under_pressure():
         default_transition=TransitionChoice(kind="dissolve", duration_frames=40),
     )
     layout = plan_layout(proj, fps=24.0)
+    lengths = _slide_lengths(layout)
+    for index, length in enumerate(lengths):
+        lead_in, lead_out = _slide_leads(layout, index)
+        assert lead_in >= 0 and lead_out >= 0
+        assert length - lead_in - lead_out >= MIN_VISIBLE_FRAMES, index
+    # Every segment must be at least one frame long, or Resolve rejects it.
     for clip in layout.clips:
-        assert clip.visible_frames >= MIN_VISIBLE_FRAMES, clip
-        assert clip.lead_in_frames >= 0 and clip.lead_out_frames >= 0
-    # Record frames must be strictly increasing and non-overlapping per track.
+        assert clip.length_frames >= 1, clip
+    # Record frames must be non-decreasing in placement order.
     frames = [c.record_frame for c in layout.clips]
     assert frames == sorted(frames)
-    assert len(set(frames)) == len(frames)
 
 
 def test_clamped_transition_keeps_kind_and_params():
@@ -261,14 +325,14 @@ def test_unclamped_transition_object_is_reused():
 def test_source_frames_cap_clip_length():
     proj = _project(2, duration=4.0, frames=12)
     layout = plan_layout(proj, fps=24.0, source_frames=[30, None])
-    assert [c.length_frames for c in layout.clips] == [30, 96]
+    assert _slide_lengths(layout) == [30, 96]
     assert layout.clips[0].source_end_frame == 29
 
 
 def test_source_frames_zero_or_none_means_unbounded():
     proj = _project(2, duration=4.0, frames=0, transition="none")
     layout = plan_layout(proj, fps=24.0, source_frames=[0, None])
-    assert [c.length_frames for c in layout.clips] == [96, 96]
+    assert _slide_lengths(layout) == [96, 96]
 
 
 def test_source_frames_length_mismatch_raises():

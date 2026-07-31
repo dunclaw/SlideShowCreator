@@ -6,25 +6,42 @@ arithmetic that makes transitions possible is fully unit-testable.
 Layout model
 ------------
 
-Slides alternate between video tracks V1 and V2::
+Every slide is split into up to two timeline clips, cut at the frame the
+*previous* slide ends::
 
-    V2          ┌────────────┐            ┌────────────┐
-    V1  ┌───────┼──┐      ┌──┼────────────┼──┐
-        │ slide 0  │      │ slide 2       │  │
-        └───────┼──┘      └──┼────────────┼──┘
-                │ slide 1    │            │ slide 3
-                └────────────┘            └────────────┘
-        ^^^^^^^^^^                        ^^^^^^^^^^
-        overlap = transition duration
+            slide 0        slide 1        slide 2        slide 3
+    V2                     ┌────┐         ┌────┐         ┌────┐
+    V1  ┌──────────────────┼────┴─────────┼────┴─────────┼────┴───────┐
+        └──────────────────┴──────────────┴──────────────┴────────────┘
+                           ^^^^^^         ^^^^^^
+                           overlap = transition duration
 
-Alternating means each adjacent pair overlaps on *different* tracks, which
-is what lets a transition exist at all: during the overlap both clips are
-on screen and the upper one is animated by its Fusion comp.
+* The **head** sits on V2 and covers exactly the incoming overlap — the
+  window in which the transition animates.
+* The **body** sits on V1 and covers the rest of the slide.
+* Slide 0 has no incoming transition, so it is a single V1 clip.
 
-A consequence is that every clip is the **incoming** side of the transition
-before it and the **outgoing** side of the transition after it. See
-:mod:`slideshow.transitions.applier` for how the two plans get merged into
-that clip's single Fusion comp.
+Two properties fall out of cutting at the previous slide's end frame, and
+both matter:
+
+1. **V1 is contiguous** — bodies butt up end-to-end with no gaps and no
+   collisions, because a slide's body starts exactly where its predecessor
+   finishes.
+2. **The incoming clip is always on top.** Alternating V1/V2 could not
+   manage that — the incoming slide landed underneath for every other
+   transition, where animating it is invisible and renders as a hard cut.
+   Here every slide animates in over the settled one below it.
+
+The outgoing half of a transition (``push``, ``flip``, ``blur_dissolve``…)
+animates the *previous* slide, which during the overlap is the tail of that
+slide's V1 body — so two-sided transitions still work.
+
+The split frame is one where the slide is static and fully opaque (its
+incoming animation has just finished), so the cut is invisible.
+
+A consequence of the split is that ``TimelineLayout.clips`` holds
+*segments*, not slides: two entries can share the same ``index``. Use
+:meth:`TimelineLayout.segments_for_index` to get both.
 
 Durations
 ---------
@@ -56,9 +73,17 @@ DEFAULT_FPS = 24.0
 #: into, otherwise the two overlaps would meet (or cross) in the middle.
 MIN_VISIBLE_FRAMES = 1
 
-#: 1-based video track indices used by the alternating layout.
+#: 1-based video track indices. Settled slides live on V1; the animating
+#: head of each slide lives on V2 above it.
 LOWER_TRACK = 1
 UPPER_TRACK = 2
+
+#: ``PlacedClip.segment`` values. A slide with no incoming transition is a
+#: single ``WHOLE`` clip; otherwise it is split into a ``HEAD`` (on V2,
+#: covering the overlap it animates through) and a ``BODY`` (on V1).
+SEGMENT_WHOLE = "whole"
+SEGMENT_HEAD = "head"
+SEGMENT_BODY = "body"
 
 
 def seconds_to_frames(seconds: float, fps: float) -> int:
@@ -72,26 +97,30 @@ def seconds_to_frames(seconds: float, fps: float) -> int:
 
 @dataclass
 class PlacedClip:
-    """One slide's position on the timeline.
+    """One timeline clip: a whole slide, or one half of a split slide.
 
-    * ``index``              — index into ``SlideshowProject.items``.
+    * ``index``              — index into ``SlideshowProject.items``. Two
+      segments of the same slide share it.
+    * ``segment``            — :data:`SEGMENT_WHOLE`, :data:`SEGMENT_HEAD`
+      or :data:`SEGMENT_BODY`.
     * ``track_index``        — 1-based video track (V1 = 1).
     * ``record_frame``       — timeline frame the clip starts on.
     * ``length_frames``      — how many frames the clip occupies.
     * ``source_start_frame`` / ``source_end_frame`` — inclusive source range
       handed to ``AppendToTimeline``.
-    * ``lead_in_frames``     — frames shared with the *previous* clip; the
+    * ``lead_in_frames``     — frames shared with the *previous* slide; the
       transition into this clip animates over ``[0, lead_in_frames]`` in
-      clip-local coordinates.
-    * ``lead_out_frames``    — frames shared with the *next* clip; that
+      clip-local coordinates. Only ever set on a HEAD.
+    * ``lead_out_frames``    — frames shared with the *next* slide; that
       transition animates over ``[length_frames - lead_out_frames,
-      length_frames]``.
+      length_frames]``. Only ever set on a BODY or WHOLE.
     """
 
     index: int
     track_index: int
     record_frame: int
     length_frames: int
+    segment: str = SEGMENT_WHOLE
     source_start_frame: int = 0
     source_end_frame: int = 0
     lead_in_frames: int = 0
@@ -109,7 +138,12 @@ class PlacedClip:
 
     @property
     def visible_frames(self) -> int:
-        """Frames during which this clip is the only one on screen."""
+        """Frames during which this *segment* is the only thing on screen.
+
+        Zero for a HEAD, which is entirely overlap by construction. For a
+        whole-slide figure, sum the segments and use the slide's lead-in and
+        lead-out.
+        """
         return self.length_frames - self.lead_in_frames - self.lead_out_frames
 
     def to_clip_info(self, media_pool_item: object, record_offset: int = 0) -> dict:
@@ -140,8 +174,10 @@ class PlacedClip:
 class TimelineLayout:
     """The full placement plan for a project.
 
-    ``transitions[i]`` is the (clamped) transition from ``clips[i]`` into
-    ``clips[i + 1]``, so it always has ``len(clips) - 1`` entries.
+    ``clips`` holds timeline *segments* in placement order, so a split slide
+    contributes two entries sharing one ``index``. ``transitions[i]`` is the
+    (clamped) transition from slide ``i`` into slide ``i + 1``, so it always
+    has ``slide_count - 1`` entries.
     """
 
     fps: float = DEFAULT_FPS
@@ -156,6 +192,11 @@ class TimelineLayout:
         return max(c.track_index for c in self.clips)
 
     @property
+    def slide_count(self) -> int:
+        """Number of source slides, as opposed to timeline segments."""
+        return len(self.transitions) + 1 if self.clips else 0
+
+    @property
     def total_frames(self) -> int:
         """Length of the finished timeline in frames."""
         if not self.clips:
@@ -166,12 +207,20 @@ class TimelineLayout:
     def total_seconds(self) -> float:
         return self.total_frames / self.fps if self.fps else 0.0
 
+    def segments_for_index(self, index: int) -> List[PlacedClip]:
+        """Every segment belonging to ``items[index]``, in placement order."""
+        found = [clip for clip in self.clips if clip.index == index]
+        if not found:
+            raise KeyError("No placed clip for item index {0}".format(index))
+        return found
+
     def clip_for_index(self, index: int) -> PlacedClip:
-        """Return the :class:`PlacedClip` for ``items[index]``."""
-        for clip in self.clips:
-            if clip.index == index:
-                return clip
-        raise KeyError("No placed clip for item index {0}".format(index))
+        """The first segment for ``items[index]``.
+
+        That is the HEAD when the slide is split — the piece that carries
+        the transition into it.
+        """
+        return self.segments_for_index(index)[0]
 
 
 def _requested_overlaps(project: SlideshowProject) -> List[TransitionChoice]:
@@ -280,29 +329,56 @@ def plan_layout(
         for choice, d in zip(choices, overlaps)
     ]
 
-    alternating = any(d > 0 for d in overlaps)
-
     clips: List[PlacedClip] = []
     record_frame = 0
     for i, length in enumerate(lengths):
         lead_in = overlaps[i - 1] if i > 0 else 0
         lead_out = overlaps[i] if i < len(overlaps) else 0
-        clips.append(
-            PlacedClip(
-                index=i,
-                track_index=(
-                    (UPPER_TRACK if i % 2 else LOWER_TRACK)
-                    if alternating
-                    else LOWER_TRACK
-                ),
-                record_frame=record_frame,
-                length_frames=length,
-                source_start_frame=0,
-                source_end_frame=length - 1,
-                lead_in_frames=lead_in,
-                lead_out_frames=lead_out,
+
+        if lead_in > 0:
+            # Head: the overlap window, on V2, animating in over the
+            # previous slide's body which is still running underneath.
+            clips.append(
+                PlacedClip(
+                    index=i,
+                    segment=SEGMENT_HEAD,
+                    track_index=UPPER_TRACK,
+                    record_frame=record_frame,
+                    length_frames=lead_in,
+                    source_start_frame=0,
+                    source_end_frame=lead_in - 1,
+                    lead_in_frames=lead_in,
+                )
             )
-        )
+            # Body: everything after the transition has landed, on V1. It
+            # starts exactly where the previous slide ends, which keeps V1
+            # contiguous and makes the cut fall on a static, opaque frame.
+            body_length = length - lead_in
+            clips.append(
+                PlacedClip(
+                    index=i,
+                    segment=SEGMENT_BODY,
+                    track_index=LOWER_TRACK,
+                    record_frame=record_frame + lead_in,
+                    length_frames=body_length,
+                    source_start_frame=0,
+                    source_end_frame=body_length - 1,
+                    lead_out_frames=lead_out,
+                )
+            )
+        else:
+            clips.append(
+                PlacedClip(
+                    index=i,
+                    segment=SEGMENT_WHOLE,
+                    track_index=LOWER_TRACK,
+                    record_frame=record_frame,
+                    length_frames=length,
+                    source_start_frame=0,
+                    source_end_frame=length - 1,
+                    lead_out_frames=lead_out,
+                )
+            )
         record_frame += length - lead_out
 
     return TimelineLayout(fps=fps, clips=clips, transitions=transitions)
@@ -312,6 +388,9 @@ __all__ = [
     "DEFAULT_FPS",
     "LOWER_TRACK",
     "MIN_VISIBLE_FRAMES",
+    "SEGMENT_BODY",
+    "SEGMENT_HEAD",
+    "SEGMENT_WHOLE",
     "PlacedClip",
     "TimelineLayout",
     "UPPER_TRACK",

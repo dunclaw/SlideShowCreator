@@ -329,7 +329,7 @@ def _overlap_project(count=3, *, kind="dissolve", frames=24):
     )
 
 
-def test_overlapping_build_places_clips_on_alternating_tracks():
+def test_overlapping_build_splits_slides_across_two_tracks():
     ctx, project, mp, _new, timeline = _wire_mock_context()
     _serve_one_at_a_time(mp, _mock_media(
         ["s0.jpg", "s1.jpg", "s2.jpg"]
@@ -339,13 +339,17 @@ def test_overlapping_build_places_clips_on_alternating_tracks():
 
     project.SetCurrentTimeline.assert_called_once_with(timeline)
     infos = [call.args[0][0] for call in mp.AppendToTimeline.call_args_list]
-    assert [i["trackIndex"] for i in infos] == [1, 2, 1]
-    assert [i["recordFrame"] for i in infos] == [0, 72, 144]
-    # Length rides on the pool item's mark in/out, not the clipInfo.
+    # Slide 0 is whole on V1; slides 1 and 2 split into a V2 head (the
+    # overlap window) and a V1 body that keeps the lower track contiguous.
+    assert [i["trackIndex"] for i in infos] == [1, 2, 1, 2, 1]
+    assert [i["recordFrame"] for i in infos] == [0, 72, 96, 144, 168]
+    # Length rides on the pool item's mark in/out, not the clipInfo. Each
+    # split slide is marked twice — once per segment — hence the last mark
+    # on slides 1 and 2 is the body length.
     marks = [c.SetMarkInOut.call_args[0] for c in mp._served]
-    assert marks == [(0, 95, "video")] * 3
+    assert marks == [(0, 95, "video"), (0, 71, "video"), (0, 71, "video")]
     assert result.layout.total_frames == 240
-    assert len(result.timeline_items) == 3
+    assert len(result.timeline_items) == 5
 
 
 def test_overlapping_build_offsets_record_frames_by_timeline_start():
@@ -362,7 +366,9 @@ def test_overlapping_build_offsets_record_frames_by_timeline_start():
     tb.TimelineBuilder(_overlap_project(), context=ctx).build()
 
     infos = [call.args[0][0] for call in mp.AppendToTimeline.call_args_list]
-    assert [i["recordFrame"] for i in infos] == [86400, 86472, 86544]
+    assert [i["recordFrame"] for i in infos] == [
+        86400, 86472, 86496, 86544, 86568
+    ]
 
 
 def test_overlapping_build_tolerates_unreadable_start_frame():
@@ -373,7 +379,7 @@ def test_overlapping_build_tolerates_unreadable_start_frame():
     tb.TimelineBuilder(_overlap_project(), context=ctx).build()
 
     infos = [call.args[0][0] for call in mp.AppendToTimeline.call_args_list]
-    assert [i["recordFrame"] for i in infos] == [0, 72, 144]
+    assert [i["recordFrame"] for i in infos] == [0, 72, 96, 144, 168]
 
 
 def test_overlapping_build_adds_the_second_video_track():
@@ -408,19 +414,33 @@ def test_transitions_are_applied_to_every_touched_clip():
 
     assert len(result.transition_plans) == 2
     assert all(p is not None for p in result.transition_plans)
-    # Three slides alternate V1/V2/V1, so both transitions are owned by the
-    # middle clip: it fades in over slide 0, then fades out to reveal slide
-    # 2 on the track below. Slides 0 and 2 stay opaque and need no comp.
-    assert result.comps_applied == 1
-    result.timeline_items[0].LoadFusionCompByName.assert_not_called()
-    result.timeline_items[1].LoadFusionCompByName.assert_called()
-    result.timeline_items[2].LoadFusionCompByName.assert_not_called()
+    # The split layout always puts the incoming slide on top, so no plan is
+    # ever mirrored and a dissolve only ever animates the incoming side.
+    # That is exactly one comp per transition, on each slide's V2 head.
+    assert result.comps_applied == 2
+    for plan in result.transition_plans:
+        assert plan.outgoing.is_empty()
+        assert plan.incoming.blend == [(0, 0.0), (24, 1.0)]
 
-    middle = result.transition_plans[0]
-    assert middle.incoming.blend == [(0, 0.0), (24, 1.0)]
-    mirrored = result.transition_plans[1]
-    assert mirrored.incoming.is_empty()
-    assert mirrored.outgoing.blend == [(0, 1.0), (24, 0.0)]
+    segments = [(c.index, c.segment) for c in result.layout.clips]
+    for position, (index, segment) in enumerate(segments):
+        item = result.timeline_items[position]
+        if segment == tb.SEGMENT_HEAD:
+            item.LoadFusionCompByName.assert_called()
+        else:
+            item.LoadFusionCompByName.assert_not_called()
+
+
+def test_item_for_index_returns_the_head_and_items_for_index_both_halves():
+    ctx, project, mp, _new, _tl = _wire_mock_context()
+    _serve_one_at_a_time(mp, _mock_media(["s0.jpg", "s1.jpg", "s2.jpg"]))
+
+    result = tb.TimelineBuilder(_overlap_project(), context=ctx).build()
+
+    assert len(result.items_for_index(0)) == 1
+    assert len(result.items_for_index(1)) == 2
+    assert result.item_for_index(1) is result.timeline_items[1]
+    assert result.items_for_index(1)[1] is result.timeline_items[2]
 
 
 def test_apply_transitions_can_be_disabled():

@@ -22,7 +22,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence
 
-from .layout import TimelineLayout, plan_layout, seconds_to_frames
+from .layout import (
+    SEGMENT_BODY,
+    SEGMENT_HEAD,
+    SEGMENT_WHOLE,
+    TimelineLayout,
+    plan_layout,
+    seconds_to_frames,
+)
+
 from .project_model import MediaItem, SlideshowProject, TransitionChoice
 from .resolve_bridge import ResolveContext
 from .transitions import (
@@ -264,13 +272,32 @@ def _concrete_choice(choice: TransitionChoice) -> TransitionChoice:
     )
 
 
+def _incoming_on_top(layout: TimelineLayout, transition_index: int) -> bool:
+    """Is the incoming slide on a higher track than the outgoing one?
+
+    The split layout always says yes — that is the whole point of it — but
+    the applier derives it from the real placement rather than assuming, so
+    the two modules stay independent and any future layout that stacks
+    differently still gets correctly mirrored plans.
+    """
+    try:
+        outgoing = layout.segments_for_index(transition_index)[-1]
+        incoming = layout.segments_for_index(transition_index + 1)[0]
+    except (KeyError, IndexError):
+        return True
+    return incoming.track_index >= outgoing.track_index
+
+
 @dataclass
 class BuildResult:
     """What a build produced, so callers can inspect or extend it.
 
-    ``timeline_items`` and ``media_items`` are index-aligned with
-    ``project.items``; ``transition_plans[i]`` is the plan between item
-    ``i`` and ``i + 1`` (``None`` for a hard cut).
+    ``timeline_items`` is aligned with ``layout.clips``, which holds timeline
+    *segments* — a split slide contributes two. Use :meth:`item_for_index` /
+    :meth:`items_for_index` to get back to ``project.items``.
+    ``media_items`` is index-aligned with ``project.items``, and
+    ``transition_plans[i]`` is the plan between item ``i`` and ``i + 1``
+    (``None`` for a hard cut).
     """
 
     timeline: Any = None
@@ -280,9 +307,26 @@ class BuildResult:
     transition_plans: List[Optional[TransitionPlan]] = field(default_factory=list)
     comps_applied: int = 0
 
+    def items_for_index(self, index: int) -> List[Any]:
+        """Every Resolve ``TimelineItem`` for ``project.items[index]``."""
+        if self.layout is None:
+            return [self.timeline_items[index]]
+        return [
+            self.timeline_items[position]
+            for position, placed in enumerate(self.layout.clips)
+            if placed.index == index
+        ]
+
     def item_for_index(self, index: int) -> Any:
-        """Return the Resolve ``TimelineItem`` for ``project.items[index]``."""
-        return self.timeline_items[index]
+        """The first Resolve ``TimelineItem`` for ``project.items[index]``.
+
+        For a split slide that is the head — the piece carrying the
+        transition into it.
+        """
+        found = self.items_for_index(index)
+        if not found:
+            raise KeyError("No timeline item for item index {0}".format(index))
+        return found[0]
 
 
 class TimelineBuilder:
@@ -406,27 +450,25 @@ class TimelineBuilder:
             if choice.is_cut():
                 plans.append(None)
                 continue
-            # Slides alternate V1/V2, so the incoming clip is only on top
-            # for every other transition. When it isn't, the plan has to be
-            # mirrored or the animation happens under an opaque clip and
-            # renders as a hard cut.
-            incoming_on_top = True
-            if index + 1 < len(clips):
-                incoming_on_top = (
-                    clips[index + 1].track_index >= clips[index].track_index
-                )
             plans.append(
                 plan_transition(
                     _concrete_choice(choice),
                     fps=fps,
-                    incoming_on_top=incoming_on_top,
+                    incoming_on_top=_incoming_on_top(layout, index),
                 )
             )
         result.transition_plans = plans
 
         for position, placed in enumerate(clips):
-            lead_in_plan = plans[position - 1] if position > 0 else None
-            lead_out_plan = plans[position] if position < len(plans) else None
+            # A head carries the transition into its slide; a body (or an
+            # unsplit slide) carries the transition out of it. Nothing ever
+            # carries both, but merge_clip_plans handles that anyway.
+            lead_in_plan = None
+            if placed.lead_in_frames > 0 and placed.index > 0:
+                lead_in_plan = plans[placed.index - 1]
+            lead_out_plan = None
+            if placed.lead_out_frames > 0 and placed.index < len(plans):
+                lead_out_plan = plans[placed.index]
             if lead_in_plan is None and lead_out_plan is None:
                 continue
             spec = comp_spec_for_clip(
@@ -462,6 +504,9 @@ def build_slideshow(project: SlideshowProject, **kwargs: Any) -> BuildResult:
 __all__ = [
     "AUTO_FALLBACK_KIND",
     "DEFAULT_TIMELINE_FPS",
+    "SEGMENT_BODY",
+    "SEGMENT_HEAD",
+    "SEGMENT_WHOLE",
     "BuildResult",
     "TimelineBuilder",
     "build_slideshow",
