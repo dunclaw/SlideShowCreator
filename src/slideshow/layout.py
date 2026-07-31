@@ -112,14 +112,26 @@ class PlacedClip:
         """Frames during which this clip is the only one on screen."""
         return self.length_frames - self.lead_in_frames - self.lead_out_frames
 
-    def to_clip_info(self, media_pool_item: object) -> dict:
-        """Build the ``clipInfo`` dict ``MediaPool.AppendToTimeline`` wants."""
+    def to_clip_info(self, media_pool_item: object, record_offset: int = 0) -> dict:
+        """Build the ``clipInfo`` dict ``MediaPool.AppendToTimeline`` wants.
+
+        ``record_offset`` is the timeline's own start frame. ``recordFrame`` is
+        an **absolute** timeline frame, and Resolve timelines start at
+        01:00:00:00 (frame 86400 at 24 fps) rather than 0, so layout frames
+        must be shifted by it. Without that, clips are placed an hour before
+        the start of the timeline: they exist, and the track header even counts
+        them, but nothing is visible and playback does nothing.
+
+        Deliberately omits ``startFrame``/``endFrame``. Resolve ignores both
+        for stills (whose source is a single frame) and substitutes its
+        "standard still duration" preference instead, so length has to be
+        expressed as a mark in/out on the *MediaPoolItem* — see
+        :func:`slideshow.timeline_builder.mark_source_range`.
+        """
         return {
             "mediaPoolItem": media_pool_item,
-            "startFrame": self.source_start_frame,
-            "endFrame": self.source_end_frame,
             "trackIndex": self.track_index,
-            "recordFrame": self.record_frame,
+            "recordFrame": self.record_frame + record_offset,
             "mediaType": 1,
         }
 

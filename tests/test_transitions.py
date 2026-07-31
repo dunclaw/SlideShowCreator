@@ -22,6 +22,7 @@ from slideshow.transitions import (
     get_transition,
     plan_transition,
     registered_kinds,
+    reverse_keyframes,
 )
 from slideshow.transitions.dissolves import (
     DEFAULT_BLUR_DISSOLVE_PEAK_SIZE,
@@ -236,7 +237,8 @@ class TestDipToColor:
             TransitionChoice(kind="dip_to_color", duration_frames=24)
         )
         assert plan.incoming.background_color == (0.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (0.0, 0.0, 0.0)
+        # The whole dip rides on the upper (incoming) clip now.
+        assert plan.outgoing.is_empty()
 
     def test_dip_to_color_respects_param(self):
         plan = plan_transition(
@@ -247,18 +249,36 @@ class TestDipToColor:
             )
         )
         assert plan.incoming.background_color == (1.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (1.0, 0.0, 0.0)
+        assert plan.outgoing.is_empty()
 
     def test_dip_to_color_blend_envelope(self):
-        # Outgoing visible at start, gone by midpoint.
-        # Incoming starts at zero at midpoint, full by end.
+        # Overall opacity ramps up over the first half (fading the colour
+        # in over the clip below); the image only emerges from the colour
+        # over the second half.
         plan = plan_transition(
             TransitionChoice(kind="dip_to_color", duration_frames=24)
         )
-        assert plan.outgoing.blend[0] == (0, 1.0)
-        assert plan.outgoing.blend[-1] == (12, 0.0)
-        assert plan.incoming.blend[0] == (12, 0.0)
-        assert plan.incoming.blend[-1] == (24, 1.0)
+        assert plan.incoming.blend == [(0, 0.0), (12, 1.0)]
+        assert plan.incoming.color_blend == [(0, 0.0), (12, 0.0), (24, 1.0)]
+
+    def test_dip_to_color_mirrored_reveals_the_clip_below(self):
+        # When the incoming clip is on the lower track the outgoing clip has
+        # to do the work: opaque image, then opaque colour, then gone.
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_color", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert plan.incoming.is_empty()
+        assert plan.outgoing.background_color == (0.0, 0.0, 0.0)
+        assert plan.outgoing.blend == [(12, 1.0), (24, 0.0)]
+        assert plan.outgoing.color_blend == [(0, 1.0), (12, 0.0), (24, 0.0)]
+
+    def test_dip_to_color_too_short_to_dip_degrades_to_a_crossfade(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_color", duration_frames=1)
+        )
+        assert plan.incoming.background_color is None
+        assert plan.incoming.blend == [(0, 0.0), (1, 1.0)]
 
 
 class TestFades:
@@ -266,7 +286,7 @@ class TestFades:
         plan = plan_transition(TransitionChoice(kind="fade", duration_frames=24))
         assert plan.kind == "fade"
         assert plan.incoming.background_color == (0.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (0.0, 0.0, 0.0)
+        assert plan.outgoing.is_empty()
 
     def test_fade_through_gray_dips_through_grey(self):
         plan = plan_transition(
@@ -274,7 +294,7 @@ class TestFades:
         )
         assert plan.kind == "fade_through_gray"
         assert plan.incoming.background_color == (0.5, 0.5, 0.5)
-        assert plan.outgoing.background_color == (0.5, 0.5, 0.5)
+        assert plan.outgoing.is_empty()
 
     def test_blur_through_black_has_blur_envelope(self):
         plan = plan_transition(
@@ -282,7 +302,9 @@ class TestFades:
         )
         assert plan.kind == "blur_through_black"
         assert plan.incoming.background_color == (0.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (0.0, 0.0, 0.0)
+        # The outgoing clip carries no dip — only its own blur, which is
+        # what sells the first half while it is still visible underneath.
+        assert plan.outgoing.background_color is None
         # Outgoing blurs into black: 0 → peak at midpoint.
         assert plan.outgoing.blur_size[0] == (0, 0.0)
         peak = plan.outgoing.blur_size[-1][1]
@@ -549,6 +571,117 @@ class TestDrop:
 
 
 # --------------------------------------------------------------------------- #
+# Mirroring — adapting a plan when the incoming clip is on the lower track
+# --------------------------------------------------------------------------- #
+
+class TestMirroring:
+    def test_reverse_keyframes_flips_time_not_values(self):
+        assert reverse_keyframes([(0, 0.0), (10, 1.0)], 10) == [(0, 1.0), (10, 0.0)]
+        assert reverse_keyframes([(0, "a"), (4, "b"), (10, "c")], 10) == [
+            (0, "c"),
+            (6, "b"),
+            (10, "a"),
+        ]
+
+    def test_reverse_keyframes_of_nothing_is_none(self):
+        assert reverse_keyframes(None, 10) is None
+        assert reverse_keyframes([], 10) is None
+
+    @pytest.mark.parametrize("kind", sorted(registered_kinds()))
+    def test_every_kind_can_be_mirrored(self, kind):
+        choice = TransitionChoice(kind=kind, duration_frames=24)
+        mirrored = plan_transition(choice, incoming_on_top=False)
+        assert mirrored.kind == kind
+        upright = plan_transition(choice, incoming_on_top=True)
+        assert mirrored.duration_frames == upright.duration_frames
+
+    @pytest.mark.parametrize("kind", sorted(registered_kinds()))
+    def test_mirrored_plans_animate_the_upper_clip(self, kind):
+        """The outgoing clip is the visible one, so it must do the work.
+
+        Anything that only animates the incoming (lower) clip would be
+        hidden under the opaque outgoing clip and render as a hard cut.
+        """
+        choice = TransitionChoice(kind=kind, duration_frames=24)
+        upright = plan_transition(choice, incoming_on_top=True)
+        if upright.is_cut:
+            pytest.skip("{0} is a cut".format(kind))
+        mirrored = plan_transition(choice, incoming_on_top=False)
+        assert not mirrored.outgoing.is_empty()
+
+    def test_dissolve_mirrors_to_a_fade_out(self):
+        mirrored = plan_transition(
+            TransitionChoice(kind="dissolve", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert mirrored.incoming.is_empty()
+        assert mirrored.outgoing.blend == [(0, 1.0), (24, 0.0)]
+
+    def test_additive_dissolve_moves_its_composite_mode_to_the_top_clip(self):
+        mirrored = plan_transition(
+            TransitionChoice(kind="additive_dissolve", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert mirrored.outgoing.composite_mode == "add"
+
+    def test_slide_left_mirrors_by_exiting_left(self):
+        # Not the time-reverse, which would travel rightward and make the
+        # named direction meaningless on every other transition.
+        mirrored = plan_transition(
+            TransitionChoice(kind="slide_left", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert mirrored.incoming.is_empty()
+        assert mirrored.outgoing.transform.center == [
+            (0, (0.5, 0.5)),
+            (24, (-0.5, 0.5)),
+        ]
+
+    @pytest.mark.parametrize(
+        "kind,exit_point",
+        [
+            ("slide_left", (-0.5, 0.5)),
+            ("slide_right", (1.5, 0.5)),
+            ("slide_top", (0.5, 1.5)),
+            ("slide_bottom", (0.5, -0.5)),
+        ],
+    )
+    def test_every_slide_keeps_its_direction_when_mirrored(self, kind, exit_point):
+        mirrored = plan_transition(
+            TransitionChoice(kind=kind, duration_frames=24), incoming_on_top=False
+        )
+        assert mirrored.outgoing.transform.center[-1] == (24, exit_point)
+
+    @pytest.mark.parametrize(
+        "kind", ["push_left", "push_right", "push_top", "push_bottom"]
+    )
+    def test_pushes_are_unaffected_by_stacking_order(self, kind):
+        choice = TransitionChoice(kind=kind, duration_frames=24)
+        mirrored = plan_transition(choice, incoming_on_top=False)
+        upright = plan_transition(choice, incoming_on_top=True)
+        assert mirrored.incoming.transform.center == upright.incoming.transform.center
+        assert mirrored.outgoing.transform.center == upright.outgoing.transform.center
+
+    def test_drop_still_falls_downwards_when_mirrored(self):
+        mirrored = plan_transition(
+            TransitionChoice(kind="drop", duration_frames=24), incoming_on_top=False
+        )
+        assert mirrored.incoming.is_empty()
+        center = mirrored.outgoing.transform.center
+        assert center[0] == (0, (0.5, 0.5))
+        assert center[-1] == (24, (0.5, -0.5))
+        frames = [k[0] for k in center]
+        assert frames == sorted(frames)
+        assert len(set(frames)) == len(frames)
+
+    def test_a_cut_mirrors_to_itself(self):
+        choice = TransitionChoice(kind="none", duration_frames=24)
+        assert plan_transition(choice, incoming_on_top=False) == plan_transition(
+            choice, incoming_on_top=True
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Round-trip via TransitionChoice with params
 # --------------------------------------------------------------------------- #
 
@@ -562,7 +695,7 @@ class TestRoundTrip:
         plan = plan_transition(choice)
         assert plan.duration_frames == 30
         assert plan.incoming.background_color == (1.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (1.0, 0.0, 0.0)
+        assert plan.outgoing.is_empty()
 
     def test_plan_does_not_mutate_choice_params(self):
         choice = TransitionChoice(

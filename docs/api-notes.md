@@ -103,6 +103,73 @@ Two consequences worth remembering:
   middle. `slideshow.layout` shrinks them proportionally until every clip
   keeps at least one frame to itself.
 
+### Importing stills: one path per `ImportMedia` call
+
+`MediaPool.ImportMedia()` auto-detects image sequences. Given several
+consecutively numbered files in a **single** call it silently collapses them
+into one clip:
+
+```python
+mp.ImportMedia(["…/DSCF0043.JPG", "…/DSCF0044.JPG", "…/DSCF0045.JPG"])
+# -> [<MediaPoolItem "DSCF[0043-0045].JPG">]      one clip, not three
+```
+
+For a slideshow that is catastrophic — consecutively numbered stills are the
+normal case. Import **one path per call** and Resolve has nothing to form a
+sequence from:
+
+```python
+for path in paths:
+    mp.ImportMedia([path])       # -> exactly one MediaPoolItem each
+```
+
+The `{"FilePath":…, "StartIndex":…, "EndIndex":…}` dict form does *not* help:
+it returns `[]` for stills.
+
+`ImportMedia` also returns `[]` for a file already in the pool, so a
+re-import is not a no-op that returns the existing clip — walk the pool and
+match on `File Path` first.
+
+### Still duration: `SetMarkInOut`, not `startFrame` / `endFrame`
+
+`AppendToTimeline`'s `startFrame` / `endFrame` keys are honoured for video but
+**silently ignored for stills**. A still's source is a single frame, so any
+range is out of bounds and Resolve substitutes the "standard still duration"
+user preference (120 frames at 24 fps) instead:
+
+```python
+mp.AppendToTimeline([{ "mediaPoolItem": still, "startFrame": 0,
+                       "endFrame": 71, "recordFrame": 0, "trackIndex": 1 }])
+# -> a 120-frame clip, not 72
+```
+
+That is not a cosmetic problem: over-long clips collide with the next
+`recordFrame`, and Resolve pushes the collided clip along the track, which
+silently destroys an overlapping layout.
+
+`MediaPoolItem.SetMarkInOut(in, out, "video")` *is* honoured. Mark the range,
+omit `startFrame`/`endFrame`, and lengths come out exact:
+
+```python
+still.SetMarkInOut(0, frames - 1, "video")
+mp.AppendToTimeline([{ "mediaPoolItem": still, "recordFrame": 0,
+                       "trackIndex": 1, "mediaType": 1 }])
+```
+
+Marks persist on the pool item, so clear them with `ClearMarkInOut()` when the
+build finishes. Note the `Start`/`End` clip properties of a still are parsed
+from its **filename** (`DSCF0085.JPG` → `85`) and are not a usable source
+range.
+
+With this in place `recordFrame` and `trackIndex` are honoured exactly —
+verified on Resolve Studio 20.3.3 with a three-slide, 24-frame-overlap build:
+
+```
+V1  DSCF0085   0..72     72 frames
+V2  DSCF0086   48..120   overlaps by 24
+V1  DSCF0089   96..168   overlaps by 24
+```
+
 ### `AppendToTimeline` targets the *current* timeline
 
 `MediaPool.AppendToTimeline` has no timeline argument — it appends to
@@ -130,26 +197,107 @@ MediaIn1 ─► [Blur] ─► [Pixelate] ─► Transform ─┬─► MediaOut1
 | Effect | Tool | Animated input |
 | --- | --- | --- |
 | blur | `Blur` | `XBlurSize` (LockXY ties Y to it) |
-| pixelate | `Pixelate` | `XPixelSize` |
-| opacity | `Transform` | `Blend` |
-| fade to colour | `Merge` over a `Background` | `Merge.Blend` |
+| pixelate | `ofx.com.blackmagicdesign.resolvefx.MosaicBlur` | `PixelFrequency` |
+| opacity / fade | `Merge` over a `Background` | `Merge.Blend` |
 
-Fading the **Merge** rather than the Transform is what makes a dip-to-colour
-transition reveal the colour instead of fading to transparency.
+See "`Blend` is not opacity" below for why fades go on the Merge and never on
+the Transform.
 
-⚠️ The two input names above are taken from Fusion's documented tool
-reference and have **not yet been confirmed against a live Resolve build** —
-run `scripts/probe_composite.py` and correct this table.
+Two traps in that table, both confirmed on Resolve Studio 20.3.3:
+
+- **There is no native Fusion pixelate tool.** `comp.AddTool("Pixelate")`,
+  `"Pixelize"` and `"Mosaic"` all return `None`. The effect exists only as the
+  ResolveFX OFX plugin above, addressed by its full reverse-DNS ID.
+- **OFX plugins name their image input `Source`, not `Input`.** Connecting to
+  `Input` leaves the tool silently unwired. `fusion_comps.primary_image_input()`
+  keeps that mapping in one place.
+
+`PixelFrequency` is also **inverted** relative to the obvious mental model: it
+counts cells across the frame, so *larger is finer*, and its default is 100.
+Transition plans describe pixelation as a block size (1.0 = untouched, larger
+= chunkier), so `fusion_comps.pixel_size_to_frequency()` converts between the
+two. Writing a block size straight into `PixelFrequency` inverts the effect,
+and a frequency of 1 flattens the whole frame to a single colour.
+
+### `TimelineItem` `CompositeMode` is an integer enum
+
+`SetProperty("CompositeMode", …)` takes an **int**, not a string. Every string
+value is rejected — and rejection is quiet, returning `False` rather than
+raising:
+
+```python
+item.SetProperty("CompositeMode", "Add")   # -> False, no change
+item.SetProperty("CompositeMode", 1)       # -> True
+```
+
+Resolve accepts any int in `0..31` without validating it against the actual
+list of modes, so the mapping cannot be discovered by probing — it has to be
+read off the Inspector. The ordering is Photoshop-style, **not** alphabetical.
+Confirmed indices: `0` Normal, `1` Add, `10` Lighten, `13` Exclusion,
+`22` Vivid Light.
+
+### `Blend` is not opacity
+
+Every Fusion tool has a `Blend` input, and it is tempting to treat it as
+opacity. It isn't: it crossfades the tool's **input** against the tool's
+**output**. On an identity `Transform` — exactly what a plain dissolve
+produces — input and output are the same image, so animating `Transform.Blend`
+has *no visible effect whatsoever*. The clips simply cut.
+
+Opacity comes from a `Merge`, whose `Blend` controls foreground opacity
+against its background:
+
+```
+MediaIn1 ─► Transform ──────────► Merge.Foreground ─► MediaOut1
+                                    ▲
+                     Background ────┘  Merge.Background
+```
+
+- **Cross dissolve** — `Background` with `TopLeftAlpha = 0`. Blend 0 → 1 makes
+  the clip's own alpha ramp up, so the clip *underneath on the timeline*
+  shows through.
+- **Dip to colour** — needs **two** merges. One `Merge` alone can either
+  reveal transparency or reveal a colour, never both, and a dip has to do
+  both in sequence: transparent (previous slide visible) → opaque colour →
+  the new image. So the applier stacks them:
+
+  ```
+  MediaIn1 ─► Transform ─► DipMerge.Foreground ─► Merge.Foreground ─► MediaOut1
+              Background(colour, alpha 1) ─┘            │
+              Background(alpha 0) ─────────────────────┘
+  ```
+
+  `DipMerge.Blend` is the image's opacity over the colour; `Merge.Blend` is
+  the overall opacity over the clip below. Held at 0 / ramped 0→1 over the
+  first half and vice versa over the second, that produces a real dip.
+
+This is why the applier always routes through a Merge when a plan carries
+`blend` keyframes, and never writes `Blend` onto the Transform.
+
+### Transitions are stacking-order sensitive
+
+The alternating V1/V2 layout means the incoming clip is on the **upper**
+track for only every *other* transition. A transition that animates the
+incoming clip — which is nearly all of them — is completely invisible when
+that clip is underneath an opaque one: it renders as a hard cut. Confirmed
+visually; the symptom is a slideshow where every second transition works.
+
+The clip on the higher track has to own the animation. `plan_transition()`
+takes `incoming_on_top` and calls `Transition.mirror()` when it's False, so
+the outgoing clip animates *away* instead. The default mirror is a
+time-reversal with the two halves swapped; `_SlideBase` and `Drop` override
+it so the named direction survives, and `_PushBase` mirrors to itself
+because its two clips are always edge-to-edge and never overlap.
 
 ### Open question: additive / non-additive dissolves
 
 `additive_dissolve` and `non_additive_dissolve` need the incoming clip to
-composite onto the outgoing one with an Add / Maximum blend. A per-clip
+composite onto the outgoing one with an Add / Lighten blend. A per-clip
 Fusion comp **cannot see the clip beneath it on the timeline**, so a Fusion
 `Merge` can't express this — the applier falls back to
-`TimelineItem.SetProperty("CompositeMode", …)` at the Edit-page level
-(`"Add"` / `"Lighten"`). Those property values are unverified; the probe
-script enumerates which ones Resolve accepts.
+`TimelineItem.SetProperty("CompositeMode", <int>)` at the Edit-page level.
+See the integer-enum note above: `0` is Normal, and the indices for Add and
+Lighten must be confirmed from the Inspector.
 
 
 ## Fusion scripting

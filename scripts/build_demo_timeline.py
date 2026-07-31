@@ -57,6 +57,12 @@ def main(argv=None) -> int:
         help="Build the legacy single-track timeline with hard cuts",
     )
     p.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Use only the first N images (0 = all)",
+    )
+    p.add_argument(
         "--list-transitions",
         action="store_true",
         help="Print every available transition kind and exit",
@@ -75,6 +81,8 @@ def main(argv=None) -> int:
         return 2
 
     paths = _gather(args.folder)
+    if args.limit > 0:
+        paths = paths[: args.limit]
     if not paths:
         print("No images found in {0}".format(args.folder), file=sys.stderr)
         return 2

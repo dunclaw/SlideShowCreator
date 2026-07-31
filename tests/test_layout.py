@@ -292,14 +292,19 @@ def test_to_clip_info_shape():
     )
     sentinel = object()
     info = clip.to_clip_info(sentinel)
+    # No startFrame/endFrame: stills ignore them, so length is expressed as a
+    # mark in/out on the MediaPoolItem instead.
     assert info == {
         "mediaPoolItem": sentinel,
-        "startFrame": 0,
-        "endFrame": 95,
         "trackIndex": 2,
         "recordFrame": 72,
         "mediaType": 1,
     }
+
+
+def test_to_clip_info_applies_the_timeline_start_offset():
+    clip = PlacedClip(index=0, track_index=1, record_frame=72, length_frames=96)
+    assert clip.to_clip_info(object(), record_offset=86400)["recordFrame"] == 86472
 
 
 def test_empty_layout_properties():

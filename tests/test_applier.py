@@ -25,6 +25,7 @@ from slideshow import fusion_comps as fc
 from slideshow.layout import PlacedClip
 from slideshow.transitions import plan_transition, registered_kinds
 from slideshow.transitions.applier import (
+    TIMELINE_COMPOSITE_MODES,
     CompSpec,
     apply_comp_spec,
     apply_composite_mode,
@@ -33,7 +34,7 @@ from slideshow.transitions.applier import (
     merge_clip_plans,
 )
 from slideshow.transitions.base import ClipPlan, TransitionPlan
-from slideshow.fusion_comps import TransformAnimation
+from slideshow.fusion_comps import PIXELATE_TOOL, TransformAnimation
 from slideshow.project_model import TransitionChoice
 
 
@@ -154,15 +155,21 @@ def test_background_falls_back_to_the_lead_out_colour():
     assert spec.background_color == (0.5, 0.5, 0.5)
 
 
-def test_composite_mode_comes_from_the_incoming_half_only():
+def test_composite_mode_prefers_the_incoming_half():
     lead_in = ClipPlan(composite_mode="add")
     lead_out = ClipPlan(composite_mode="non_add")
     assert merge_clip_plans(
         length_frames=10, lead_in=lead_in, lead_out=lead_out
     ).composite_mode == "add"
+
+
+def test_composite_mode_falls_back_to_the_outgoing_half():
+    # A mirrored plan puts the composite mode on the lead-out, because that
+    # is the half sitting on the upper track.
+    lead_out = ClipPlan(composite_mode="non_add")
     assert merge_clip_plans(
         length_frames=10, lead_out=lead_out
-    ).composite_mode == "normal"
+    ).composite_mode == "non_add"
 
 
 def test_negative_lengths_are_rejected():
@@ -340,8 +347,9 @@ def test_blur_and_pixelate_are_inserted_upstream_of_the_transform():
 
     assert set(built) >= {"blur", "pixelate", "transform"}
     assert built["blur"].connections["Input"] == "MediaIn1-out"
-    assert built["pixelate"].connections["Input"] == "Blur-out"
-    assert built["transform"].connections["Input"] == "Pixelate-out"
+    # The pixelate tool is a ResolveFX OFX plugin, whose image input is Source.
+    assert built["pixelate"].connections["Source"] == "Blur-out"
+    assert built["transform"].connections["Input"] == "{0}-out".format(PIXELATE_TOOL)
     assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
 
 
@@ -353,7 +361,7 @@ def test_blur_only_skips_the_pixelate_node():
     assert built["transform"].connections["Input"] == "Blur-out"
 
 
-def test_background_adds_a_merge_before_media_out():
+def test_background_colour_inserts_a_dip_merge_under_the_opacity_merge():
     comp = _FakeComp()
     spec = CompSpec(
         length_frames=50,
@@ -363,9 +371,14 @@ def test_background_adds_a_merge_before_media_out():
 
     built = build_comp_graph(comp, spec)
 
-    assert built["background"].inputs["TopLeftRed"] == 0.0
-    assert built["merge"].connections["Background"] == "Background-out"
-    assert built["merge"].connections["Foreground"] == "Transform-out"
+    # Inner pair: the clip's image over an opaque colour.
+    assert built["color_background"].inputs["TopLeftRed"] == 0.0
+    assert built["color_background"].inputs["TopLeftAlpha"] == 1.0
+    assert built["color_merge"].connections["Foreground"] == "Transform-out"
+    # Outer pair: all of that over transparency, so it can reveal the clip
+    # on the track below.
+    assert built["background"].inputs["TopLeftAlpha"] == 0.0
+    assert built["merge"].connections["Foreground"] == "Merge-out"
     assert comp.tools["MediaOut1"].connections["Input"] == "Merge-out"
 
 
@@ -382,19 +395,67 @@ def test_blend_goes_on_the_merge_when_a_background_exists():
     assert "Blend" not in built["transform"].connections
 
 
-def test_blend_goes_on_the_transform_without_a_background():
+def test_blend_uses_a_merge_over_a_transparent_background():
+    """Transform.Blend crossfades a tool against its own output, so on an
+    identity transform it does nothing at all. Opacity must come from a Merge."""
     comp = _FakeComp()
     spec = CompSpec(length_frames=50, blend=[(0, 0.0), (10, 1.0)])
     built = build_comp_graph(comp, spec)
-    assert "Blend" in built["transform"].connections
+
+    assert "merge" in built
+    assert "Blend" not in built["transform"].connections
+    assert "Blend" in built["merge"].connections
+    # Transparent background, so the clip underneath shows through.
+    assert built["background"].inputs["TopLeftAlpha"] == 0.0
+    assert comp.tools["MediaOut1"].connections["Input"] == "Merge-out"
+
+
+def test_dip_colour_lands_on_the_inner_background():
+    """A dip-to-colour needs a solid background to be revealed."""
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        blend=[(0, 0.0), (10, 1.0)],
+        color_blend=[(0, 0.0), (5, 0.0), (10, 1.0)],
+        background_color=(1.0, 0.0, 0.0),
+    )
+    built = build_comp_graph(comp, spec)
+
+    assert built["color_background"].inputs["TopLeftAlpha"] == 1.0
+    assert built["color_background"].inputs["TopLeftRed"] == 1.0
+    # The two blends drive different merges and must not be confused.
+    assert "Blend" in built["color_merge"].connections
+    assert "Blend" in built["merge"].connections
+
+
+def test_background_colour_without_blend_still_wires_to_media_out():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        background_color=(0.0, 0.0, 0.0),
+        color_blend=[(0, 1.0), (10, 0.0)],
+    )
+    built = build_comp_graph(comp, spec)
     assert "merge" not in built
+    assert comp.tools["MediaOut1"].connections["Input"] == "Merge-out"
+    assert built["color_merge"].connections["Foreground"] == "Transform-out"
 
 
 def test_single_blend_keyframe_sets_a_constant():
     comp = _FakeComp()
     spec = CompSpec(length_frames=50, blend=[(0, 0.5)])
     built = build_comp_graph(comp, spec)
-    assert built["transform"].inputs["Blend"] == 0.5
+    assert built["merge"].inputs["Blend"] == 0.5
+
+
+def test_no_blend_and_no_background_leaves_the_transform_wired_to_output():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50, transform=TransformAnimation(size=[(0, 0.5), (10, 1.0)])
+    )
+    built = build_comp_graph(comp, spec)
+    assert "merge" not in built
+    assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
 
 
 def test_rebuilding_the_same_graph_does_not_duplicate_tools():
@@ -402,6 +463,7 @@ def test_rebuilding_the_same_graph_does_not_duplicate_tools():
     spec = CompSpec(
         length_frames=50,
         blur_size=[(0, 10.0), (10, 0.0)],
+        blend=[(0, 0.0), (10, 1.0)],
         background_color=(0.0, 0.0, 0.0),
     )
     first = build_comp_graph(comp, spec)
@@ -411,6 +473,7 @@ def test_rebuilding_the_same_graph_does_not_duplicate_tools():
     assert comp.added == added_after_first
     assert second["blur"] is first["blur"]
     assert second["merge"] is first["merge"]
+    assert second["color_merge"] is first["color_merge"]
 
 
 def test_blur_keyframes_land_on_the_x_size_input():
@@ -441,7 +504,7 @@ def test_apply_comp_spec_locks_builds_and_marks_modified():
     assert result is comp
     assert comp.locked == 0  # balanced Lock/Unlock
     assert comp.attrs == {"COMPB_Modified": True}
-    assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
+    assert comp.tools["MediaOut1"].connections["Input"] == "Merge-out"
 
 
 def test_apply_comp_spec_sets_timeline_composite_mode():
@@ -453,7 +516,13 @@ def test_apply_comp_spec_sets_timeline_composite_mode():
 
     apply_comp_spec(ti, spec)
 
-    ti.SetProperty.assert_called_once_with("CompositeMode", "Add")
+    ti.SetProperty.assert_called_once_with("CompositeMode", 1)  # Add
+
+
+def test_composite_modes_are_integers():
+    """SetProperty rejects strings and reports it only by returning False."""
+    for value in TIMELINE_COMPOSITE_MODES.values():
+        assert isinstance(value, int)
 
 
 def test_composite_mode_normal_is_a_no_op():
@@ -480,7 +549,7 @@ def test_composite_mode_only_spec_still_builds_nothing_in_the_comp():
     comp = _FakeComp()
     ti = _timeline_item_for(comp)
     apply_comp_spec(ti, CompSpec(length_frames=10, composite_mode="non_add"))
-    ti.SetProperty.assert_called_once_with("CompositeMode", "Lighten")
+    ti.SetProperty.assert_called_once_with("CompositeMode", 10)  # Lighten
     assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
 
 

@@ -17,11 +17,14 @@ turned into a node graph.
 
 The graph built from a CompSpec is::
 
-    MediaIn1 ─► [Blur] ─► [Pixelate] ─► Transform ─┬─► MediaOut1
-                                                   │
-                        Background ─► Merge ◄──────┘   (only when the spec
-                                        └─► MediaOut1   has a background)
+    MediaIn1 ─► [Blur] ─► [Pixelate] ─► Transform ─┐
+                                                   ├─► [DipMerge] ─┐
+              Background(colour, opaque) ──────────┘               │
+                                                                   ├─► MediaOut1
+              Background(alpha 0) ─────────────────► [Merge] ──────┘
 
+Both merges are optional. ``DipMerge`` only appears when the spec has a
+``background_color`` (dip-to-colour); ``Merge`` only when it has ``blend``.
 Tools are only inserted when the spec needs them, and every tool has a
 stable name so re-running the builder over the same timeline rewires rather
 than duplicates.
@@ -34,12 +37,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..fusion_comps import (
     BLUR_SIZE_INPUT,
+    BLUR_TOOL,
     DEFAULT_BACKGROUND_NAME,
     DEFAULT_BLUR_NAME,
+    DEFAULT_COLOR_BACKGROUND_NAME,
+    DEFAULT_COLOR_MERGE_NAME,
     DEFAULT_MERGE_NAME,
     DEFAULT_PIXELATE_NAME,
     DEFAULT_TRANSFORM_NAME,
     PIXELATE_SIZE_INPUT,
+    PIXELATE_TOOL,
     PointKeyframe,
     ScalarKeyframe,
     TransformAnimation,
@@ -52,6 +59,7 @@ from ..fusion_comps import (
     insert_tool_chain,
     locked,
     mark_modified,
+    pixel_size_to_frequency,
     set_scalar_keyframes,
 )
 from .base import ClipPlan, RgbColor, TransitionPlan
@@ -61,11 +69,15 @@ from .base import ClipPlan, RgbColor, TransitionPlan
 #: model. A per-clip Fusion comp cannot see the clip underneath it, so
 #: additive / non-additive compositing between two *timeline* clips has to be
 #: set at the Edit-page level instead of with a Fusion Merge.
-#: See ``scripts/probe_composite.py`` — treat these as best-effort.
-TIMELINE_COMPOSITE_MODES: Dict[str, str] = {
-    "normal": "Normal",
-    "add": "Add",
-    "non_add": "Lighten",
+#:
+#: These are **integers**, not strings — ``SetProperty`` rejects strings and
+#: says so only by returning ``False``. Resolve accepts any int in 0..31
+#: without validating it, so the indices below were read off the Inspector on
+#: Resolve Studio 20.3.3 rather than probed.
+TIMELINE_COMPOSITE_MODES: Dict[str, int] = {
+    "normal": 0,
+    "add": 1,
+    "non_add": 10,  # "Lighten" — max(fg, bg), the closest to non-additive
 }
 
 
@@ -161,6 +173,7 @@ class CompSpec:
     blur_size: Optional[List[ScalarKeyframe]] = None
     pixelate_size: Optional[List[ScalarKeyframe]] = None
     background_color: Optional[RgbColor] = None
+    color_blend: Optional[List[ScalarKeyframe]] = None
     composite_mode: str = "normal"
 
     def is_empty(self) -> bool:
@@ -170,6 +183,7 @@ class CompSpec:
             and not self.blend
             and not self.blur_size
             and not self.pixelate_size
+            and not self.color_blend
             and self.background_color is None
             and self.composite_mode == "normal"
         )
@@ -219,9 +233,14 @@ def merge_clip_plans(
     elif lead_out is not None and lead_out.background_color is not None:
         background = lead_out.background_color
 
-    # composite_mode is only meaningful on the incoming side (the outgoing
-    # clip is the base layer), so the lead-out's value is ignored.
-    composite = lead_in.composite_mode if lead_in is not None else "normal"
+    # composite_mode belongs to whichever half is on the upper track. A
+    # mirrored plan moves it onto the lead-out, so honour both, preferring
+    # the lead-in when they disagree.
+    composite = "normal"
+    if lead_in is not None and lead_in.composite_mode != "normal":
+        composite = lead_in.composite_mode
+    elif lead_out is not None and lead_out.composite_mode != "normal":
+        composite = lead_out.composite_mode
 
     return CompSpec(
         length_frames=length_frames,
@@ -234,6 +253,7 @@ def merge_clip_plans(
         blur_size=scalar("blur_size"),
         pixelate_size=scalar("pixelate_size"),
         background_color=background,
+        color_blend=scalar("color_blend"),
         composite_mode=composite,
     )
 
@@ -271,9 +291,9 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
     """
     chain: List[Tuple[str, str]] = []
     if spec.blur_size:
-        chain.append(("Blur", DEFAULT_BLUR_NAME))
+        chain.append((BLUR_TOOL, DEFAULT_BLUR_NAME))
     if spec.pixelate_size:
-        chain.append(("Pixelate", DEFAULT_PIXELATE_NAME))
+        chain.append((PIXELATE_TOOL, DEFAULT_PIXELATE_NAME))
     chain.append(("Transform", DEFAULT_TRANSFORM_NAME))
 
     tools = insert_tool_chain(comp, chain)
@@ -291,34 +311,74 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
     if spec.blur_size:
         set_scalar_keyframes(comp, built["blur"], BLUR_SIZE_INPUT, spec.blur_size)
     if spec.pixelate_size:
+        # Plans speak in block size; the OFX tool wants cells-across.
         set_scalar_keyframes(
-            comp, built["pixelate"], PIXELATE_SIZE_INPUT, spec.pixelate_size
+            comp,
+            built["pixelate"],
+            PIXELATE_SIZE_INPUT,
+            [(frame, pixel_size_to_frequency(value)) for frame, value in spec.pixelate_size],
         )
 
-    blend_target = transform
+    # Opacity must come from a Merge, never from Transform.Blend.
+    #
+    # Fusion's ``Blend`` is a *universal* control that crossfades a tool's
+    # input against its own output. On an identity Transform — which is what a
+    # plain dissolve produces — input and output are the same image, so
+    # animating Blend does precisely nothing. A Merge's Blend, by contrast,
+    # controls foreground opacity against its background, which is a real fade.
+    #
+    # Dip-to-colour needs two of them stacked. The inner pair blends the
+    # clip's own image against an opaque colour (so it can *become* the
+    # colour); the outer pair blends that result against transparency (so it
+    # can get out of the way of the clip on the track below). One merge could
+    # only do one of those two things.
+    head = transform
     if spec.background_color is not None:
+        color_background = add_background(
+            comp,
+            spec.background_color,
+            name=DEFAULT_COLOR_BACKGROUND_NAME,
+            alpha=1.0,
+            position=(0, 2),
+        )
+        color_merge = add_merge(
+            comp,
+            background=color_background,
+            foreground=head,
+            name=DEFAULT_COLOR_MERGE_NAME,
+            apply_mode="normal",
+            position=(1, 2),
+        )
+        built["color_background"] = color_background
+        built["color_merge"] = color_merge
+        head = color_merge
+        if spec.color_blend:
+            set_scalar_keyframes(comp, color_merge, "Blend", spec.color_blend)
+
+    if spec.blend:
         background = add_background(
-            comp, spec.background_color, name=DEFAULT_BACKGROUND_NAME
+            comp,
+            (0.0, 0.0, 0.0),
+            name=DEFAULT_BACKGROUND_NAME,
+            alpha=0.0,
         )
         merge = add_merge(
             comp,
             background=background,
-            foreground=transform,
+            foreground=head,
             name=DEFAULT_MERGE_NAME,
             apply_mode="normal",
         )
+        built["background"] = background
+        built["merge"] = merge
+        head = merge
+        set_scalar_keyframes(comp, merge, "Blend", spec.blend)
+
+    if head is not transform:
         media_out = find_tool(comp, "MediaOut1")
         if media_out is None:
             raise RuntimeError("Composition has no 'MediaOut1' tool.")
-        connect(merge, media_out, "Input")
-        built["background"] = background
-        built["merge"] = merge
-        # Fading the Merge rather than the Transform is what reveals the
-        # background colour instead of fading to transparency.
-        blend_target = merge
-
-    if spec.blend:
-        set_scalar_keyframes(comp, blend_target, "Blend", spec.blend)
+        connect(head, media_out, "Input")
 
     return built
 

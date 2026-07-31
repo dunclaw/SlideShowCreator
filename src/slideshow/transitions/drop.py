@@ -65,5 +65,34 @@ class Drop(Transition):
             incoming=incoming,
         )
 
+    def mirror(self, plan: TransitionPlan) -> TransitionPlan:
+        """Drop the *outgoing* clip out of the bottom of frame instead.
+
+        Time-reversing the incoming path would fling the outgoing clip
+        back up through the top, which reads as a "rise", not a drop. We
+        mirror the bounce vertically about centre frame so the clip
+        wobbles once and then falls away downwards, uncovering the
+        incoming clip on the track below.
+        """
+        duration = plan.duration_frames
+        if duration <= 0:
+            return plan
+        f_wobble = max(1, int(round(duration * 0.15)))
+        f_settle = max(f_wobble + 1, int(round(duration * 0.30)))
+        center_keys = [
+            (0, (0.5, 0.5)),
+            (f_wobble, (0.5, 0.55)),
+            (f_settle, (0.5, 0.45)),
+            (max(f_settle + 1, duration), (0.5, -0.5)),
+        ]
+        return TransitionPlan(
+            kind=plan.kind,
+            duration_frames=duration,
+            incoming=ClipPlan(),
+            outgoing=ClipPlan(
+                transform=TransformAnimation(center=center_keys),
+            ),
+        )
+
 
 __all__ = ["Drop"]

@@ -38,6 +38,9 @@ from .base import (
     plan_transition,
     register,
     registered_kinds,
+    reverse_clip_plan,
+    reverse_keyframes,
+    reverse_transform,
 )
 
 # Eagerly import every implementation module so their @register decorators
@@ -77,4 +80,7 @@ __all__ = [
     "plan_transition",
     "register",
     "registered_kinds",
+    "reverse_clip_plan",
+    "reverse_keyframes",
+    "reverse_transform",
 ]

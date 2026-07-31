@@ -22,9 +22,8 @@ visible underneath. They differ in how the two clips blend together:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from ..fusion_comps import ScalarKeyframe
 from .base import ClipPlan, RgbColor, Transition, TransitionPlan, register
 
 
@@ -44,6 +43,19 @@ def _empty_plan(kind: str) -> TransitionPlan:
 def _fade_in_keys(duration_frames: int) -> list:
     """Standard 0→1 ramp over the full overlap."""
     return [(0, 0.0), (duration_frames, 1.0)]
+
+
+def dip_midpoint(duration_frames: int) -> int:
+    """Frame at which a dip-through-colour transition is pure colour.
+
+    Clamped to ``[1, duration_frames - 1]`` when the overlap is long
+    enough, so the two halves never collapse onto the same frame and
+    produce duplicate keyframes. For a 1-frame overlap there is no room
+    for a midpoint and the caller gets frame 0.
+    """
+    if duration_frames < 2:
+        return 0
+    return max(1, min(duration_frames - 1, duration_frames // 2))
 
 
 def _parse_color(value: Any) -> RgbColor:
@@ -190,12 +202,19 @@ class BlurDissolve(Transition):
 
 @register("dip_to_color")
 class DipToColor(Transition):
-    """Both clips fade to a solid colour at the midpoint.
+    """The transition dips through a solid colour at the midpoint.
 
-    First half: outgoing fades to ``color`` (its blend ramps ``1 → 0``
-    over a colour Background). Second half: incoming fades from
-    ``color`` to fully visible. The colour fully covers the frame at
-    the exact midpoint.
+    All of the work happens on the clip that ends up on the **upper**
+    track, because only that clip can both cover the one below (with the
+    colour) and then get out of its way. Two blends drive it:
+
+    * ``color_blend`` — the clip's image over the solid colour. Held at
+      ``0`` (pure colour) for the first half, then ramping to ``1``.
+    * ``blend``       — the whole thing's opacity over the clip below.
+      Ramps ``0 → 1`` across the first half, then holds.
+
+    Together: transparent at frame 0 (the outgoing clip shows through),
+    opaque colour at the midpoint, the incoming image by the end.
 
     ``params["color"]`` accepts an RGB triple in ``[0, 1]`` or a
     ``"#rrggbb"`` hex string. Defaults to black.
@@ -212,23 +231,24 @@ class DipToColor(Transition):
             return _empty_plan(self.KIND)
         params = params or {}
         color = _parse_color(params.get("color"))
-        mid = duration_frames // 2
+        mid = dip_midpoint(duration_frames)
+        if mid <= 0:
+            # Too short to dip through anything; degrade to a cross-fade.
+            return TransitionPlan(
+                kind=self.KIND,
+                duration_frames=duration_frames,
+                incoming=ClipPlan(blend=_fade_in_keys(duration_frames)),
+            )
 
-        # Outgoing: visible at frame 0, fully replaced by colour at midpoint.
-        outgoing = ClipPlan(
-            background_color=color,
-            blend=[(0, 1.0), (mid, 0.0)],
-        )
-        # Incoming: starts as pure colour at the midpoint, fades up after.
         incoming = ClipPlan(
             background_color=color,
-            blend=[(mid, 0.0), (duration_frames, 1.0)],
+            blend=[(0, 0.0), (mid, 1.0)],
+            color_blend=[(0, 0.0), (mid, 0.0), (duration_frames, 1.0)],
         )
         return TransitionPlan(
             kind=self.KIND,
             duration_frames=duration_frames,
             incoming=incoming,
-            outgoing=outgoing,
         )
 
 

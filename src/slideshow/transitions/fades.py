@@ -22,6 +22,7 @@ from .dissolves import (
     DEFAULT_BLUR_DISSOLVE_PEAK_SIZE,
     DipToColor,
     _empty_plan,
+    dip_midpoint,
 )
 
 
@@ -99,7 +100,7 @@ class BlurThroughBlack(Transition):
             return _empty_plan(self.KIND)
         params = params or {}
         peak = float(params.get("peak_size", DEFAULT_BLUR_DISSOLVE_PEAK_SIZE))
-        mid = duration_frames // 2
+        mid = dip_midpoint(duration_frames)
 
         base = DipToColor().plan(
             duration_frames,
@@ -107,15 +108,17 @@ class BlurThroughBlack(Transition):
             fps=fps,
         )
 
-        outgoing = ClipPlan(
-            background_color=base.outgoing.background_color,
-            blend=base.outgoing.blend,
-            blur_size=[(0, 0.0), (mid, peak)],
-        )
+        # The dip itself rides entirely on the incoming (upper) clip; the
+        # outgoing clip is still visible through the first half, so its
+        # blur is what sells the "blur into black" half of the move.
         incoming = ClipPlan(
             background_color=base.incoming.background_color,
             blend=base.incoming.blend,
+            color_blend=base.incoming.color_blend,
             blur_size=[(mid, peak), (duration_frames, 0.0)],
+        )
+        outgoing = ClipPlan(
+            blur_size=[(0, 0.0), (mid, peak)],
         )
         return TransitionPlan(
             kind=self.KIND,

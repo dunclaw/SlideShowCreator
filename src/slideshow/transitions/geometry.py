@@ -90,6 +90,34 @@ class _SlideBase(Transition):
             incoming=incoming,
         )
 
+    def mirror(self, plan: TransitionPlan) -> TransitionPlan:
+        """Slide the *outgoing* clip away instead, in the same direction.
+
+        The default time-reversal would send the outgoing clip back out
+        the side the incoming clip was supposed to enter from, so
+        ``slide_left`` would travel rightward on every other transition.
+        Continuing off the far edge instead — a point reflection of the
+        entry anchor through centre frame — keeps the named direction.
+        """
+        duration = plan.duration_frames
+        if duration <= 0:
+            return plan
+        start_pt, end_pt = _SLIDE_ENDPOINTS[self.DIRECTION]
+        exit_pt = (
+            2.0 * end_pt[0] - start_pt[0],
+            2.0 * end_pt[1] - start_pt[1],
+        )
+        return TransitionPlan(
+            kind=plan.kind,
+            duration_frames=duration,
+            incoming=ClipPlan(),
+            outgoing=ClipPlan(
+                transform=TransformAnimation(
+                    center=[(0, end_pt), (duration, exit_pt)],
+                ),
+            ),
+        )
+
 
 @register("slide_left")
 class SlideLeft(_SlideBase):
@@ -152,6 +180,15 @@ class _PushBase(Transition):
             incoming=incoming,
             outgoing=outgoing,
         )
+
+    def mirror(self, plan: TransitionPlan) -> TransitionPlan:
+        """Pushes are stacking-order agnostic, so mirror to themselves.
+
+        The two clips travel together and stay exactly edge-to-edge —
+        they never overlap on screen — so it makes no difference which
+        one is on the upper track.
+        """
+        return plan
 
 
 @register("push_left")

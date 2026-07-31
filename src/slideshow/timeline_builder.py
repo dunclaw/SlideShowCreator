@@ -77,6 +77,41 @@ def _normalize_for_resolve(path: str) -> str:
     return os.path.abspath(path).replace("\\", "/")
 
 
+def _clip_path_key(item: Any) -> Optional[str]:
+    """Normalised ``File Path`` of a ``MediaPoolItem``, for identity matching."""
+    try:
+        path = item.GetClipProperty("File Path")
+    except Exception:
+        return None
+    if not path:
+        return None
+    return str(path).replace("\\", "/").lower()
+
+
+def _index_existing_clips(media_pool: Any) -> dict:
+    """Map normalised file path -> ``MediaPoolItem`` for everything already in the pool.
+
+    ``ImportMedia`` returns an empty list for a file that is already in the
+    media pool, so re-running a build over the same folder would otherwise
+    fail. Walking the pool once lets us reuse those clips instead.
+    """
+    found = {}
+
+    def walk(folder: Any) -> None:
+        for clip in folder.GetClipList() or []:
+            key = _clip_path_key(clip)
+            if key and key not in found:
+                found[key] = clip
+        for sub in folder.GetSubFolderList() or []:
+            walk(sub)
+
+    try:
+        walk(media_pool.GetRootFolder())
+    except Exception:
+        return {}
+    return found
+
+
 def _import_media(media_pool: Any, paths: Sequence[str]) -> List[Any]:
     """Import a list of absolute file paths into the *current* media-pool folder.
 
@@ -85,32 +120,36 @@ def _import_media(media_pool: Any, paths: Sequence[str]) -> List[Any]:
     under Resolve's configured Media Storage roots and pops "file does not
     exist" dialogs otherwise).
 
-    Returns the created ``MediaPoolItem`` objects in the **same order** as
-    ``paths``. We index returned items by file name to recover the order
-    because Resolve's import APIs do not guarantee preservation.
+    Files are imported **one call per path**, which looks wasteful but is
+    load-bearing: given several consecutively numbered stills in a single
+    call (``DSCF0043.JPG``, ``DSCF0044.JPG``, ``DSCF0045.JPG``), Resolve's
+    auto-detection collapses them into a *single* image-sequence clip named
+    ``DSCF[0043-0045].JPG``. That is catastrophic for a slideshow, where
+    consecutively numbered stills are the norm rather than the exception.
+    Importing one path at a time gives Resolve nothing to form a sequence
+    from. See ``docs/api-notes.md``.
+
+    Returns the ``MediaPoolItem`` objects in the **same order** as ``paths``,
+    with ``None`` for any that could not be imported or found.
     """
     if not paths:
         return []
 
-    norm_paths = [_normalize_for_resolve(p) for p in paths]
-    created = media_pool.ImportMedia(norm_paths) or []
-
-    by_name = {}
-    for item in created:
-        try:
-            fname = item.GetClipProperty("File Name")
-        except Exception:
-            fname = None
-        if fname:
-            by_name.setdefault(fname, []).append(item)
+    existing = _index_existing_clips(media_pool)
 
     ordered: List[Any] = []
-    for p in norm_paths:
-        bucket = by_name.get(os.path.basename(p))
-        if bucket:
-            ordered.append(bucket.pop(0))
-        else:
-            ordered.append(None)  # caller decides how to handle a missing import
+    for path in paths:
+        norm = _normalize_for_resolve(path)
+        key = norm.lower()
+
+        item = existing.get(key)
+        if item is None:
+            created = media_pool.ImportMedia([norm]) or []
+            item = created[0] if created else None
+            if item is not None:
+                existing[key] = item
+
+        ordered.append(item)
     return ordered
 
 
@@ -135,26 +174,73 @@ def _source_frame_count(media_pool_item: Any) -> Optional[int]:
     return frames if frames > 1 else None
 
 
+def mark_source_range(media_pool_item: Any, frames: int) -> bool:
+    """Mark ``frames`` frames of in/out on a pool item, so appends use that length.
+
+    ``AppendToTimeline``'s ``startFrame``/``endFrame`` keys are honoured for
+    video but **silently ignored for stills**: a still's source is one frame,
+    so any range is out of bounds and Resolve falls back to the "standard
+    still duration" user preference (120 frames at 24 fps by default). That
+    fallback is what makes an overlapping layout collapse — clips end up
+    longer than planned, collide, and get pushed along the track.
+
+    ``MediaPoolItem.SetMarkInOut`` *is* honoured for stills, so it is the only
+    reliable way to control slide length. Marks are set immediately before the
+    append and cleared afterwards by the builder.
+    """
+    if frames < 1:
+        return False
+    try:
+        return bool(media_pool_item.SetMarkInOut(0, frames - 1, "video"))
+    except Exception:
+        return False
+
+
+def clear_source_marks(media_pool_items: Sequence[Any]) -> None:
+    """Undo :func:`mark_source_range`, leaving the user's media pool as we found it."""
+    for item in media_pool_items:
+        if item is None:
+            continue
+        try:
+            item.ClearMarkInOut()
+        except Exception:
+            pass
+
+
 def _clip_infos(
     media_items: Sequence[Any],
     project_items: Sequence[MediaItem],
     project: SlideshowProject,
     fps: float,
 ) -> List[dict]:
-    """Build the ``clipInfo`` dicts for the flat (non-overlapping) layout."""
+    """Build the ``clipInfo`` dicts for the flat (non-overlapping) layout.
+
+    Length comes from a mark in/out on each pool item rather than
+    ``startFrame``/``endFrame``, which stills ignore — see
+    :func:`mark_source_range`.
+    """
     infos: List[dict] = []
     for mpi, item in zip(media_items, project_items):
         if mpi is None:
             continue
         frames = _seconds_to_frames(project.effective_duration(item), fps)
-        infos.append(
-            {
-                "mediaPoolItem": mpi,
-                "startFrame": 0,
-                "endFrame": frames - 1,
-            }
-        )
+        mark_source_range(mpi, frames)
+        infos.append({"mediaPoolItem": mpi, "mediaType": 1})
     return infos
+
+
+def _timeline_start_frame(timeline: Any) -> int:
+    """Absolute frame the timeline begins on (86400 for the usual 01:00:00:00).
+
+    ``recordFrame`` is absolute, not relative to the timeline start, so every
+    layout frame has to be shifted by this. Falls back to 0 if Resolve won't
+    say — a timeline starting at 0 is the only case where that is correct, and
+    it is better than refusing to build.
+    """
+    try:
+        return int(timeline.GetStartFrame())
+    except Exception:
+        return 0
 
 
 def _ensure_video_tracks(timeline: Any, count: int) -> None:
@@ -244,6 +330,7 @@ class TimelineBuilder:
     ) -> BuildResult:
         clip_infos = _clip_infos(media_items, self.project.items, self.project, fps)
         timeline = media_pool.CreateTimelineFromClips(self.project.name, clip_infos)
+        clear_source_marks(media_items)
         if timeline is None:
             raise RuntimeError(
                 "MediaPool.CreateTimelineFromClips returned None for project "
@@ -275,10 +362,15 @@ class TimelineBuilder:
         # AppendToTimeline targets the *current* timeline, so make ours current.
         resolve_project.SetCurrentTimeline(timeline)
         _ensure_video_tracks(timeline, layout.track_count)
+        origin = _timeline_start_frame(timeline)
 
         timeline_items: List[Any] = []
         for placed in layout.clips:
-            info = placed.to_clip_info(media_items[placed.index])
+            media_item = media_items[placed.index]
+            # Length must be marked on the pool item; stills ignore
+            # startFrame/endFrame in clipInfo (see mark_source_range).
+            mark_source_range(media_item, placed.length_frames)
+            info = placed.to_clip_info(media_item, record_offset=origin)
             appended = media_pool.AppendToTimeline([info]) or []
             if not appended:
                 raise RuntimeError(
@@ -286,11 +378,13 @@ class TimelineBuilder:
                     "frame {2} on V{3}.".format(
                         placed.index,
                         self.project.items[placed.index].path,
-                        placed.record_frame,
+                        placed.record_frame + origin,
                         placed.track_index,
                     )
                 )
             timeline_items.append(appended[0])
+
+        clear_source_marks(media_items)
 
         result = BuildResult(
             timeline=timeline,
@@ -306,15 +400,31 @@ class TimelineBuilder:
     def _apply_transitions(self, result: BuildResult, fps: float) -> None:
         """Plan every transition and push the merged result into each comp."""
         layout = result.layout
+        clips = layout.clips
         plans: List[Optional[TransitionPlan]] = []
-        for choice in layout.transitions:
+        for index, choice in enumerate(layout.transitions):
             if choice.is_cut():
                 plans.append(None)
-            else:
-                plans.append(plan_transition(_concrete_choice(choice), fps=fps))
+                continue
+            # Slides alternate V1/V2, so the incoming clip is only on top
+            # for every other transition. When it isn't, the plan has to be
+            # mirrored or the animation happens under an opaque clip and
+            # renders as a hard cut.
+            incoming_on_top = True
+            if index + 1 < len(clips):
+                incoming_on_top = (
+                    clips[index + 1].track_index >= clips[index].track_index
+                )
+            plans.append(
+                plan_transition(
+                    _concrete_choice(choice),
+                    fps=fps,
+                    incoming_on_top=incoming_on_top,
+                )
+            )
         result.transition_plans = plans
 
-        for position, placed in enumerate(layout.clips):
+        for position, placed in enumerate(clips):
             lead_in_plan = plans[position - 1] if position > 0 else None
             lead_out_plan = plans[position] if position < len(plans) else None
             if lead_in_plan is None and lead_out_plan is None:

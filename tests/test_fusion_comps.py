@@ -768,6 +768,41 @@ def test_insert_tool_chain_wires_tools_in_order():
     assert comp.added == [("Blur", 1, 0), ("Pixelate", 2, 0), ("Transform", 3, 0)]
 
 
+def test_insert_tool_chain_uses_source_input_for_ofx_tools():
+    """ResolveFX plugins expose ``Source``, not ``Input`` — wiring the wrong
+    one leaves the tool silently disconnected."""
+    comp = _FakeComp()
+
+    tools = fc.insert_tool_chain(
+        comp, [(fc.PIXELATE_TOOL, "P"), ("Transform", "X")]
+    )
+
+    assert "Input" not in tools[0].inputs
+    assert tools[0].inputs["Source"] == "MediaIn1-out"
+    assert tools[1].inputs["Input"] == "{0}-out".format(fc.PIXELATE_TOOL)
+
+
+def test_primary_image_input_defaults_to_input():
+    assert fc.primary_image_input("Blur") == "Input"
+    assert fc.primary_image_input("Transform") == "Input"
+    assert fc.primary_image_input(fc.PIXELATE_TOOL) == "Source"
+
+
+def test_pixel_size_to_frequency_is_inverse():
+    """PixelFrequency counts cells across the frame, so bigger blocks = lower value."""
+    clean = fc.pixel_size_to_frequency(1.0)
+    chunky = fc.pixel_size_to_frequency(60.0)
+    assert clean > chunky
+    assert chunky == pytest.approx(fc.PIXELATE_REFERENCE_WIDTH / 60.0)
+
+
+def test_pixel_size_to_frequency_never_collapses_the_frame():
+    """A frequency of 1 makes the whole image one flat cell — never emit it."""
+    for size in (0.0, -5.0, 1.0, 10.0, 1e6):
+        freq = fc.pixel_size_to_frequency(size)
+        assert fc.PIXELATE_MIN_FREQUENCY <= freq <= fc.PIXELATE_MAX_FREQUENCY
+
+
 def test_insert_tool_chain_with_no_specs_wires_media_in_to_media_out():
     comp = _FakeComp()
     assert fc.insert_tool_chain(comp, []) == []
@@ -818,7 +853,7 @@ def test_add_blur_and_pixelate_use_stable_names():
     assert pixelate.name == fc.DEFAULT_PIXELATE_NAME
     # Second call reuses rather than duplicating.
     assert fc.add_blur(comp) is blur
-    assert comp.added == [("Blur", 0, 0), ("Pixelate", 0, 0)]
+    assert comp.added == [("Blur", 0, 0), (fc.PIXELATE_TOOL, 0, 0)]
 
 
 def test_add_merge_wires_background_and_foreground():

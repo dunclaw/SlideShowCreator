@@ -7,11 +7,16 @@ touches Resolve. The plans it emits are consumed later by an applier
 
 Layout assumption (encoded in plan semantics):
 
-* The outgoing clip lives on V1 and plays through its tail normally.
-* The incoming clip lives on V2 and overlaps the outgoing clip's tail
-  by ``duration_frames`` frames. The transition's Fusion edits land on
-  the *incoming* clip for almost all kinds; a few (push, flip) also
-  animate the outgoing clip.
+* :meth:`Transition.plan` always plans for the **incoming clip on the
+  upper video track**: it plays over the outgoing clip's tail and almost
+  every kind animates the incoming side. A few (push, flip) animate both.
+* Slides alternate between V1 and V2, so for every other transition the
+  incoming clip lands *underneath* the outgoing one. Animating it there
+  would be invisible — the opaque outgoing clip covers it. For those,
+  :meth:`Transition.mirror` re-expresses the plan so the clip on the
+  upper track (the outgoing one) animates *away* to reveal the incoming
+  clip beneath. :func:`plan_transition` picks the right form via its
+  ``incoming_on_top`` argument.
 
 Each transition class implements :meth:`Transition.plan`, returning a
 :class:`TransitionPlan` whose ``incoming`` and ``outgoing`` fields are
@@ -78,14 +83,17 @@ class ClipPlan:
                             tells the applier to insert a Blur tool.
     * ``pixelate_size``   — Fusion ``Pixelate`` ``Size`` keyframes.
                             Non-None means insert a Pixelate tool.
-    * ``background_color``— RGB triple. Non-None means insert a
-                            Background tool of this colour beneath the
-                            clip's media so a fade-to-colour transition
-                            reveals it as the clip fades out.
+    * ``background_color``— RGB triple. Non-None means insert an opaque
+                            Background of this colour *beneath the clip's
+                            own image*, so the clip can dip through the
+                            colour. Driven by ``color_blend``.
+    * ``color_blend``     — opacity of the clip's image over
+                            ``background_color``: ``1`` shows the image,
+                            ``0`` shows the solid colour. Ignored when
+                            ``background_color`` is None.
     * ``composite_mode``  — how this clip composites onto the *other*
                             side of the transition. Only meaningful on
-                            the *incoming* ClipPlan; the outgoing clip
-                            is the base layer.
+                            the clip that ends up on the **upper** track.
     """
 
     transform: Optional[TransformAnimation] = None
@@ -93,6 +101,7 @@ class ClipPlan:
     blur_size: Optional[List[ScalarKeyframe]] = None
     pixelate_size: Optional[List[ScalarKeyframe]] = None
     background_color: Optional[RgbColor] = None
+    color_blend: Optional[List[ScalarKeyframe]] = None
     composite_mode: str = "normal"
 
     def __post_init__(self) -> None:
@@ -110,6 +119,7 @@ class ClipPlan:
             and not self.blend
             and not self.blur_size
             and not self.pixelate_size
+            and not self.color_blend
             and self.background_color is None
             and self.composite_mode == "normal"
         )
@@ -130,6 +140,59 @@ class TransitionPlan:
         return self.duration_frames <= 0 or (
             self.incoming.is_empty() and self.outgoing.is_empty()
         )
+
+
+# --------------------------------------------------------------------------- #
+# Mirroring (track-order adaptation)
+# --------------------------------------------------------------------------- #
+
+def reverse_keyframes(
+    keyframes: Optional[Sequence[Any]], duration_frames: int
+) -> Optional[List[Any]]:
+    """Play *keyframes* backwards within a ``duration_frames`` window.
+
+    ``(f, v)`` becomes ``(duration_frames - f, v)``, re-sorted. Works for
+    both scalar and Point keyframes because only the frame number moves.
+    """
+    if not keyframes:
+        return None
+    flipped = [(duration_frames - int(frame), value) for frame, value in keyframes]
+    flipped.sort(key=lambda item: item[0])
+    return flipped
+
+
+def reverse_transform(
+    animation: Optional[TransformAnimation], duration_frames: int
+) -> Optional[TransformAnimation]:
+    """Time-reverse every channel of a :class:`TransformAnimation`."""
+    if animation is None or animation.is_empty():
+        return None
+    reversed_anim = TransformAnimation(
+        center=reverse_keyframes(animation.center, duration_frames),
+        size=reverse_keyframes(animation.size, duration_frames),
+        angle=reverse_keyframes(animation.angle, duration_frames),
+        pivot=reverse_keyframes(animation.pivot, duration_frames),
+    )
+    return None if reversed_anim.is_empty() else reversed_anim
+
+
+def reverse_clip_plan(plan: Optional[ClipPlan], duration_frames: int) -> ClipPlan:
+    """Time-reverse every animated channel of a :class:`ClipPlan`.
+
+    Static attributes (``background_color``, ``composite_mode``) ride along
+    unchanged — they describe *what* the clip composites against, not when.
+    """
+    if plan is None:
+        return ClipPlan()
+    return ClipPlan(
+        transform=reverse_transform(plan.transform, duration_frames),
+        blend=reverse_keyframes(plan.blend, duration_frames),
+        blur_size=reverse_keyframes(plan.blur_size, duration_frames),
+        pixelate_size=reverse_keyframes(plan.pixelate_size, duration_frames),
+        background_color=plan.background_color,
+        color_blend=reverse_keyframes(plan.color_blend, duration_frames),
+        composite_mode=plan.composite_mode,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -191,6 +254,28 @@ class Transition(abc.ABC):
         """
         raise NotImplementedError
 
+    def mirror(self, plan: TransitionPlan) -> TransitionPlan:
+        """Re-express *plan* for the case where the incoming clip is below.
+
+        The default is a straight time-reversal with the two sides swapped:
+        whatever the incoming clip did to reveal itself, the outgoing clip
+        now does backwards to hide itself. That is correct for every kind
+        driven by opacity (dissolves, fades, zooms, pixelate, flip) and is
+        the right fallback for anything else.
+
+        Kinds whose look depends on a named direction override this — see
+        :mod:`slideshow.transitions.geometry`.
+        """
+        duration = plan.duration_frames
+        if duration <= 0:
+            return plan
+        return TransitionPlan(
+            kind=plan.kind,
+            duration_frames=duration,
+            incoming=reverse_clip_plan(plan.outgoing, duration),
+            outgoing=reverse_clip_plan(plan.incoming, duration),
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Dispatcher
@@ -222,12 +307,17 @@ def get_transition(kind: str) -> Transition:
 
 
 def plan_transition(
-    choice: TransitionChoice, *, fps: float = 24.0
+    choice: TransitionChoice, *, fps: float = 24.0, incoming_on_top: bool = True
 ) -> TransitionPlan:
     """Resolve *choice* to a concrete :class:`TransitionPlan`.
 
     Mirrors :class:`TransitionChoice` 1-to-1 — pass in what the project
     model holds, get back what the applier should run on the clips.
+
+    ``incoming_on_top`` says whether the incoming clip sits on the higher
+    video track. When it doesn't, the plan is mirrored (see
+    :meth:`Transition.mirror`) so the animation lands on the clip that is
+    actually visible.
     """
     if choice.duration_frames < 0:
         raise ValueError(
@@ -236,7 +326,10 @@ def plan_transition(
             )
         )
     impl = get_transition(choice.kind)
-    return impl.plan(choice.duration_frames, params=dict(choice.params), fps=fps)
+    plan = impl.plan(choice.duration_frames, params=dict(choice.params), fps=fps)
+    if not incoming_on_top:
+        plan = impl.mirror(plan)
+    return plan
 
 
 __all__ = [
@@ -251,4 +344,7 @@ __all__ = [
     "plan_transition",
     "register",
     "registered_kinds",
+    "reverse_clip_plan",
+    "reverse_keyframes",
+    "reverse_transform",
 ]

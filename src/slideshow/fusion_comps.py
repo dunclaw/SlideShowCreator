@@ -37,7 +37,7 @@ be isolated to the helpers in this file.
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 
 # --------------------------------------------------------------------------- #
@@ -53,11 +53,64 @@ DEFAULT_BLUR_NAME = "SlideShowBlur"
 DEFAULT_PIXELATE_NAME = "SlideShowPixelate"
 DEFAULT_BACKGROUND_NAME = "SlideShowBg"
 DEFAULT_MERGE_NAME = "SlideShowMerge"
+#: Inner "dip" pair: a solid colour the clip's image is blended against
+#: *before* the outer merge controls its overall opacity. Only built for
+#: dip-to-colour style transitions.
+DEFAULT_COLOR_BACKGROUND_NAME = "SlideShowDipBg"
+DEFAULT_COLOR_MERGE_NAME = "SlideShowDipMerge"
 
-#: Fusion input names for the scalar "amount" of each effect tool. Both
-#: tools lock X to Y by default, so driving the X input animates both axes.
+#: Fusion tool IDs. ``Blur`` is a native Fusion tool, but there is **no**
+#: native pixelate tool — ``comp.AddTool("Pixelate")`` returns ``None``. The
+#: effect is only available as a ResolveFX OFX plugin, addressed by its full
+#: reverse-DNS ID. Verified against Resolve Studio 20.3.3.
+BLUR_TOOL = "Blur"
+PIXELATE_TOOL = "ofx.com.blackmagicdesign.resolvefx.MosaicBlur"
+
+#: Fusion input names for the scalar "amount" of each effect tool.
+#: ``Blur`` locks X to Y by default, so driving ``XBlurSize`` animates both
+#: axes. The OFX mosaic tool exposes a single ``PixelFrequency`` control.
 BLUR_SIZE_INPUT = "XBlurSize"
-PIXELATE_SIZE_INPUT = "XPixelSize"
+PIXELATE_SIZE_INPUT = "PixelFrequency"
+
+#: Width, in pixels, that :func:`pixel_size_to_frequency` assumes when turning
+#: a block edge length into a cell count.
+PIXELATE_REFERENCE_WIDTH = 1920.0
+
+#: Clamp for the converted frequency. Below 2 the whole frame collapses to a
+#: single flat cell; above this the mosaic is finer than one pixel.
+PIXELATE_MIN_FREQUENCY = 2.0
+PIXELATE_MAX_FREQUENCY = 2000.0
+
+
+def pixel_size_to_frequency(
+    size: float, reference_width: float = PIXELATE_REFERENCE_WIDTH
+) -> float:
+    """Convert a mosaic block edge length into ResolveFX ``PixelFrequency``.
+
+    Transition plans describe pixelation the intuitive way — as a block size,
+    where ``1.0`` means "untouched" and larger means chunkier. ``PixelFrequency``
+    is the **reciprocal**: it counts cells across the frame, so *larger* means
+    *finer*. Writing a block size straight into it inverts the effect, and a
+    frequency of 1 turns the entire frame into a single flat colour.
+    """
+    if size <= 0:
+        return PIXELATE_MAX_FREQUENCY
+    freq = reference_width / float(size)
+    return max(PIXELATE_MIN_FREQUENCY, min(PIXELATE_MAX_FREQUENCY, freq))
+
+
+#: The image input of a tool is ``Input`` on native Fusion tools but
+#: ``Source`` on ResolveFX OFX plugins — connecting to the wrong one
+#: silently leaves the tool unwired.
+TOOL_IMAGE_INPUTS = {
+    PIXELATE_TOOL: "Source",
+}
+
+
+def primary_image_input(tool_type: str) -> str:
+    """Name of the main image input for *tool_type* (``Input`` for most tools)."""
+    return TOOL_IMAGE_INPUTS.get(tool_type, "Input")
+
 
 #: ``Merge.ApplyMode`` values matching ``ClipPlan.composite_mode``.
 MERGE_APPLY_MODES = {
@@ -434,7 +487,7 @@ def insert_tool_chain(
         tool = find_or_add_tool(
             comp, tool_type, tool_name, position=(x + offset, y)
         )
-        connect(upstream, tool, "Input")
+        connect(upstream, tool, primary_image_input(tool_type))
         tools.append(tool)
         upstream = tool
 
@@ -449,7 +502,7 @@ def add_blur(
     position: Tuple[int, int] = (0, 0),
 ) -> Any:
     """Find or create a Blur tool (unwired — use :func:`insert_tool_chain`)."""
-    return find_or_add_tool(comp, "Blur", name, position=position)
+    return find_or_add_tool(comp, BLUR_TOOL, name, position=position)
 
 
 def add_pixelate(
@@ -458,8 +511,12 @@ def add_pixelate(
     name: str = DEFAULT_PIXELATE_NAME,
     position: Tuple[int, int] = (0, 0),
 ) -> Any:
-    """Find or create a Pixelate tool (unwired)."""
-    return find_or_add_tool(comp, "Pixelate", name, position=position)
+    """Find or create a pixelate tool (unwired).
+
+    Uses the ResolveFX Mosaic Blur OFX plugin — Fusion has no native
+    ``Pixelate`` tool. See :data:`PIXELATE_TOOL`.
+    """
+    return find_or_add_tool(comp, PIXELATE_TOOL, name, position=position)
 
 
 def add_background(
@@ -626,13 +683,22 @@ def _safe_name(timeline_item: Any) -> str:
 
 __all__ = [
     "BLUR_SIZE_INPUT",
+    "BLUR_TOOL",
     "DEFAULT_BACKGROUND_NAME",
+    "DEFAULT_COLOR_BACKGROUND_NAME",
+    "DEFAULT_COLOR_MERGE_NAME",
     "DEFAULT_BLUR_NAME",
     "DEFAULT_MERGE_NAME",
     "DEFAULT_PIXELATE_NAME",
     "DEFAULT_TRANSFORM_NAME",
     "MERGE_APPLY_MODES",
     "PIXELATE_SIZE_INPUT",
+    "PIXELATE_TOOL",
+    "PIXELATE_REFERENCE_WIDTH",
+    "PIXELATE_MIN_FREQUENCY",
+    "PIXELATE_MAX_FREQUENCY",
+    "pixel_size_to_frequency",
+    "TOOL_IMAGE_INPUTS",
     "PointKeyframe",
     "ScalarKeyframe",
     "TransformAnimation",
@@ -645,6 +711,7 @@ __all__ = [
     "attach_transform_animation",
     "connect",
     "find_or_add_tool",
+    "primary_image_input",
     "find_tool",
     "get_active_comp",
     "insert_tool_chain",
