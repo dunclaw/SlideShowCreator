@@ -165,6 +165,28 @@ class TestDissolve:
         )
         assert plan.incoming.composite_mode == "non_add"
 
+    @pytest.mark.parametrize(
+        "kind", ["additive_dissolve", "non_additive_dissolve"]
+    )
+    def test_non_normal_composites_fade_the_outgoing_clip_out(self, kind):
+        """Add and Lighten are only the identity over black.
+
+        Left composited against a fully opaque outgoing clip, the incoming
+        image stays blown out for the whole overlap and then snaps to the
+        real picture at the cut. Fading the outgoing clip out underneath —
+        it is on the bottom track, where transparent renders black — makes
+        the transition actually resolve.
+        """
+        plan = plan_transition(TransitionChoice(kind=kind, duration_frames=24))
+        assert plan.outgoing.blend == [(0, 1.0), (24, 0.0)]
+
+    @pytest.mark.parametrize("kind", ["dissolve", "cross_fade"])
+    def test_normal_composites_leave_the_outgoing_clip_alone(self, kind):
+        """A plain dissolve crossfades *over* an opaque clip; fading that
+        clip out too would dip through black."""
+        plan = plan_transition(TransitionChoice(kind=kind, duration_frames=24))
+        assert plan.outgoing.is_empty()
+
 
 class TestBlurDissolve:
     def test_blur_dissolve_has_blur_on_both_clips(self):
@@ -332,20 +354,62 @@ class TestPixelate:
         plan = plan_transition(
             TransitionChoice(kind="pixelate", duration_frames=24)
         )
-        assert plan.incoming.pixelate_size is not None
-        assert plan.outgoing.pixelate_size is not None
-        # Default peak at midpoint.
         peak = DEFAULT_PIXELATE_PEAK_SIZE
-        assert plan.outgoing.pixelate_size[0] == (0, 1.0)
-        assert plan.outgoing.pixelate_size[-1] == (12, peak)
-        assert plan.incoming.pixelate_size[0] == (12, peak)
-        assert plan.incoming.pixelate_size[-1] == (24, 1.0)
+        # Outgoing coarsens up to the peak and then holds there to the end
+        # of its window; incoming holds and then resolves.
+        assert plan.outgoing.pixelate_size == [(0, 1.0), (8, peak), (24, peak)]
+        assert plan.incoming.pixelate_size == [(0, peak), (16, peak), (24, 1.0)]
 
-    def test_pixelate_blends_incoming(self):
+    def test_pixelate_holds_the_peak_long_enough_to_see(self):
+        """The whole point: ramping straight through flashes past."""
         plan = plan_transition(
             TransitionChoice(kind="pixelate", duration_frames=24)
         )
-        assert plan.incoming.blend == [(0, 0.0), (24, 1.0)]
+        peak = DEFAULT_PIXELATE_PEAK_SIZE
+        out_hold = [f for f, v in plan.outgoing.pixelate_size if v == peak]
+        in_hold = [f for f, v in plan.incoming.pixelate_size if v == peak]
+        # Frames 8..24 on the outgoing, 0..16 on the incoming — and those
+        # are different clips, so the visible hold is 8 frames either side
+        # of the midpoint at frame 12.
+        assert out_hold[0] == 8
+        assert in_hold[-1] == 16
+        assert in_hold[-1] - out_hold[0] == 8
+
+    def test_pixelate_swaps_inside_the_hold(self):
+        """A long crossfade of two pixelated images is just mud."""
+        plan = plan_transition(
+            TransitionChoice(kind="pixelate", duration_frames=24)
+        )
+        assert plan.incoming.blend == [(0, 0.0), (8, 0.0), (16, 1.0)]
+
+    def test_pixelate_hold_param(self):
+        """``hold=0`` collapses to the old ramp-straight-through shape."""
+        plan = plan_transition(
+            TransitionChoice(
+                kind="pixelate", duration_frames=24, params={"hold": 0.0}
+            )
+        )
+        assert plan.incoming.blend == [(0, 0.0), (12, 1.0)]
+
+    def test_pixelate_hold_cannot_swallow_the_ramps(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="pixelate", duration_frames=24, params={"hold": 5.0}
+            )
+        )
+        frames = [f for f, _ in plan.outgoing.pixelate_size]
+        assert frames == sorted(set(frames))
+        assert frames[1] >= 1
+
+    def test_pixelate_short_duration_stays_valid(self):
+        for duration in (1, 2, 3, 4, 5):
+            plan = plan_transition(
+                TransitionChoice(kind="pixelate", duration_frames=duration)
+            )
+            for keys in (plan.outgoing.pixelate_size, plan.incoming.pixelate_size,
+                         plan.incoming.blend):
+                frames = [f for f, _ in keys]
+                assert frames == sorted(set(frames)), (duration, keys)
 
     def test_pixelate_peak_param(self):
         plan = plan_transition(
@@ -355,8 +419,8 @@ class TestPixelate:
                 params={"peak_size": 100.0},
             )
         )
-        assert plan.outgoing.pixelate_size[-1] == (12, 100.0)
-        assert plan.incoming.pixelate_size[0] == (12, 100.0)
+        assert plan.outgoing.pixelate_size[1] == (8, 100.0)
+        assert plan.incoming.pixelate_size[0] == (0, 100.0)
 
 
 class TestSmoothCut:
@@ -513,12 +577,25 @@ class TestFlip:
         assert angle[0] == (12, -90.0)
         assert angle[-1] == (24, 0.0)
 
-    def test_flip_blend_handoff_at_midpoint(self):
+    def test_flip_blend_handoff_is_a_short_crossfade(self):
+        """A single-frame swap reads as a glitch — the two images are at
+        different angles either side of it, so the cut is plainly visible."""
         plan = plan_transition(TransitionChoice(kind="flip", duration_frames=24))
-        # outgoing snaps off at midpoint
-        assert plan.outgoing.blend[-1] == (12, 0.0)
-        # incoming snaps on at midpoint
-        assert plan.incoming.blend[-1] == (12, 1.0)
+        assert plan.outgoing.blend == [(10, 1.0), (14, 0.0)]
+        assert plan.incoming.blend == [(10, 0.0), (14, 1.0)]
+        # Centred on the midpoint, and short enough to still be a flip.
+        assert (10 + 14) / 2 == 12
+        assert 14 - 10 < 24 // 2
+
+    def test_flip_swap_window_stays_inside_a_short_overlap(self):
+        for duration in (1, 2, 3, 4, 6, 8):
+            plan = plan_transition(
+                TransitionChoice(kind="flip", duration_frames=duration)
+            )
+            for keys in (plan.outgoing.blend, plan.incoming.blend):
+                frames = [f for f, _ in keys]
+                assert frames == sorted(set(frames)), (duration, keys)
+                assert frames[0] >= 0 and frames[-1] <= duration, (duration, keys)
 
     def test_flip_vertical_axis_inverts_rotation(self):
         plan = plan_transition(
@@ -548,15 +625,31 @@ class TestDrop:
         center = plan.incoming.transform.center
         assert center[-1] == (24, (0.5, 0.5))
 
-    def test_drop_includes_overshoot_and_bounce(self):
+    def test_drop_accelerates_then_bounces_up_from_centre(self):
         plan = plan_transition(TransitionChoice(kind="drop", duration_frames=24))
         center = plan.incoming.transform.center
-        # 4 keyframes: start, overshoot, bounce, settle.
-        assert len(center) == 4
-        # Frame indices are strictly increasing.
-        frames = [k[0] for k in center]
-        assert frames == sorted(frames)
-        assert len(set(frames)) == len(frames)
+        frames = [f for f, _ in center]
+        ys = [y for _, (_x, y) in center]
+
+        assert frames == sorted(set(frames))
+        assert all(x == 0.5 for _f, (x, _y) in center)
+
+        # Gravity: most of the fall happens in the back half of the descent.
+        impact = ys.index(min(ys[: len(ys) // 2 + 1]))
+        travelled_by_half = 1.5 - ys[impact // 2]
+        assert travelled_by_half < (1.5 - 0.5) / 2, "descent looks linear"
+
+        # It lands *at* centre and bounces back up, rather than overshooting
+        # below centre — overshooting below is a spring, not a falling object.
+        assert min(ys) >= 0.5
+        assert max(ys[impact:]) > 0.5
+
+    def test_drop_bounces_decay(self):
+        plan = plan_transition(TransitionChoice(kind="drop", duration_frames=24))
+        ys = [y for _f, (_x, y) in plan.incoming.transform.center]
+        peaks = [y for y in ys[ys.index(0.5):] if y > 0.5]
+        assert len(peaks) >= 2, "a single bounce reads as a glitch"
+        assert peaks[1] - 0.5 < (peaks[0] - 0.5) / 2
 
     def test_drop_does_not_animate_outgoing(self):
         plan = plan_transition(TransitionChoice(kind="drop", duration_frames=24))
@@ -564,10 +657,16 @@ class TestDrop:
 
     def test_drop_short_duration_still_has_monotonic_keyframes(self):
         # Forces the de-duplication path in drop.py to kick in.
-        plan = plan_transition(TransitionChoice(kind="drop", duration_frames=4))
-        frames = [k[0] for k in plan.incoming.transform.center]
-        assert frames == sorted(frames)
-        assert len(set(frames)) == len(frames)
+        for duration in (1, 2, 3, 4, 5, 8):
+            plan = plan_transition(
+                TransitionChoice(kind="drop", duration_frames=duration)
+            )
+            center = plan.incoming.transform.center
+            frames = [k[0] for k in center]
+            assert frames == sorted(set(frames)), duration
+            assert frames[-1] == duration, duration
+            # However little room there is, it must still end at rest.
+            assert center[-1] == (duration, (0.5, 0.5)), duration
 
 
 # --------------------------------------------------------------------------- #

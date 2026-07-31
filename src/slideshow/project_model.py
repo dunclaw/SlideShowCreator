@@ -60,7 +60,8 @@ from typing import Any, Dict, List, Optional, Sequence
 #:   defaults to black). ``cross_fade`` is the Movie-Maker name for the
 #:   standard dissolve and is kept as a distinct kind so saved projects
 #:   show the user's chosen label.
-#: * Fades        — ``fade`` (through black), ``fade_through_gray``.
+#: * Fades        — ``fade`` (through black), ``fade_through_gray``,
+#:   ``fade_through_white``.
 #: * Effects      — ``blur_through_black``, ``pixelate``, ``smooth_cut``.
 #: * Geometry     — ``slide_*`` (new clip slides in over old),
 #:   ``push_*`` (both clips move together), ``zoom_in`` / ``zoom_out``
@@ -77,6 +78,7 @@ TRANSITION_KINDS: frozenset = frozenset({
     "dip_to_color",
     "fade",
     "fade_through_gray",
+    "fade_through_white",
     "blur_through_black",
     "pixelate",
     "smooth_cut",

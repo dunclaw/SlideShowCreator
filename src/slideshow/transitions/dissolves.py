@@ -9,8 +9,12 @@ visible underneath. They differ in how the two clips blend together:
   both kinds so the UI can preserve the user's chosen name.)
 * :class:`AdditiveDissolve` — additive blend; bright areas of each
   clip add together, briefly producing a "hot" mid-transition look.
+  The outgoing clip fades to black underneath, because Add is only the
+  identity over black — without that the transition never resolves to
+  the plain incoming picture.
 * :class:`NonAdditiveDissolve` — max-blend; takes the brighter pixel
-  of the two clips, creating a softer crossover with less bloom.
+  of the two clips, creating a softer crossover with less bloom. Fades
+  the outgoing clip out for the same reason.
 * :class:`BlurDissolve` — straight dissolve plus animated blur on
   both clips that peaks at mid-transition and drops back to 0.
 * :class:`DipToColor` — both clips fade to a solid colour at
@@ -120,10 +124,24 @@ class _BasicDissolve(Transition):
             blend=_fade_in_keys(duration_frames),
             composite_mode=self.COMPOSITE,
         )
+        outgoing = ClipPlan()
+        if self.COMPOSITE != "normal":
+            # A non-normal composite mode has to end on something it is
+            # the identity over, or the transition never resolves to the
+            # plain picture. Add and Lighten are both the identity over
+            # black, so fade the outgoing clip out underneath: it is on
+            # the bottom track, where transparent renders as black.
+            #
+            # Without this the incoming clip stays composited against a
+            # fully opaque outgoing clip right up to the end of its
+            # overlap, looking blown-out or hard-light the whole way, and
+            # then snapping to the real picture at the cut.
+            outgoing = ClipPlan(blend=[(0, 1.0), (duration_frames, 0.0)])
         return TransitionPlan(
             kind=self.KIND,
             duration_frames=duration_frames,
             incoming=incoming,
+            outgoing=outgoing,
         )
 
 

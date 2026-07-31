@@ -1,36 +1,79 @@
-"""Drop transition — incoming clip falls in from above with a bounce.
+"""Drop transition — incoming clip falls in from above and bounces.
 
-The incoming clip's Center starts above the frame and animates down to
-centre, slightly overshooting and settling. The outgoing clip stays
-put underneath until the incoming clip covers it.
+The incoming clip's Center starts above the frame, accelerates downward,
+lands at centre and bounces twice before settling. The outgoing clip
+stays put underneath until the incoming clip covers it.
 
-Keyframe sequence for the incoming clip's Y:
+Keyframe sequence for the incoming clip's Y (fractions of the overlap):
 
-* frame 0                    — Y = 1.5    (fully above the frame)
-* frame ~70%                 — Y = 0.35   (overshoot below centre)
-* frame ~85%                 — Y = 0.55   (bounce back above centre)
-* frame ``duration_frames``  — Y = 0.5    (settle at centre)
+* 0%    — Y = 1.5    fully above the frame, at rest
+* 18%   — Y = 1.40   barely moved; gravity is still building
+* 38%   — Y = 1.12
+* 60%   — Y = 0.5    impact, dead centre
+* 74%   — Y = 0.70   first bounce
+* 86%   — Y = 0.5    back down
+* 94%   — Y = 0.55   second, much smaller bounce
+* 100%  — Y = 0.5    settled
 
-X is fixed at 0.5 throughout. The exact percentages produce a single
-visible bounce; a future refinement could expose ``params["bounces"]``
-to chain multiple overshoots.
+The shape matters more than the numbers. Spending most of the fall in
+the first third of the distance is what reads as *gravity*; an evenly
+paced descent followed by a small late wobble reads as a glitch. The
+bounce goes **up** after impact rather than overshooting below centre —
+overshooting below is a spring, not a falling object — and the second
+bounce is roughly a third of the first so the decay is visible.
 
-A short blend ramp at the very start ensures the incoming clip's
-alpha is solid by the time it's visible — without it, very short
-overlaps could pop in unexpectedly.
+X is fixed at 0.5 throughout. A future refinement could expose
+``params["bounces"]`` to chain more overshoots, and a small rotation
+would sell the "thrown photograph" feel.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..fusion_comps import TransformAnimation
 from .base import ClipPlan, Transition, TransitionPlan, register
 
 
+#: ``(fraction of duration, Y)`` for the fall-and-settle. See module docs.
+DROP_PROFILE: Tuple[Tuple[float, float], ...] = (
+    (0.00, 1.50),
+    (0.18, 1.40),
+    (0.38, 1.12),
+    (0.60, 0.50),
+    (0.74, 0.70),
+    (0.86, 0.50),
+    (0.94, 0.55),
+    (1.00, 0.50),
+)
+
+
+def _profile_keys(
+    duration_frames: int, profile: Tuple[Tuple[float, float], ...]
+) -> List[Tuple[int, Tuple[float, float]]]:
+    """Snap a ``(fraction, y)`` profile onto integer frames.
+
+    Fractions collide on short overlaps, and Fusion needs strictly
+    increasing keyframe times, so later points are pushed forward and any
+    that no longer fit inside the overlap are dropped. The final resting
+    position is always kept, on the last frame, so the clip can never end
+    mid-fall.
+    """
+    keys: List[Tuple[int, Tuple[float, float]]] = []
+    for fraction, y in profile[:-1]:
+        frame = int(round(duration_frames * fraction))
+        if keys:
+            frame = max(frame, keys[-1][0] + 1)
+        if frame >= duration_frames:
+            break
+        keys.append((frame, (0.5, y)))
+    keys.append((duration_frames, (0.5, profile[-1][1])))
+    return keys
+
+
 @register("drop")
 class Drop(Transition):
-    """Incoming clip drops in from above with a single bounce-and-settle."""
+    """Incoming clip accelerates in from above, lands and bounces twice."""
 
     def plan(
         self,
@@ -42,22 +85,10 @@ class Drop(Transition):
         if duration_frames <= 0:
             return TransitionPlan(kind=self.KIND, duration_frames=0)
 
-        # Bounce timing as fractions of total overlap, then snapped to
-        # frame integers. For very short durations the fractions may
-        # collide; we de-duplicate while preserving order so SetKeyFrames
-        # always sees strictly increasing times.
-        f_overshoot = max(1, int(round(duration_frames * 0.70)))
-        f_bounce = max(f_overshoot + 1, int(round(duration_frames * 0.85)))
-        f_end = max(f_bounce + 1, duration_frames)
-
-        center_keys = [
-            (0, (0.5, 1.5)),
-            (f_overshoot, (0.5, 0.35)),
-            (f_bounce, (0.5, 0.55)),
-            (f_end, (0.5, 0.5)),
-        ]
         incoming = ClipPlan(
-            transform=TransformAnimation(center=center_keys),
+            transform=TransformAnimation(
+                center=_profile_keys(duration_frames, DROP_PROFILE),
+            ),
         )
         return TransitionPlan(
             kind=self.KIND,
