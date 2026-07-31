@@ -7,6 +7,9 @@ Options of note:
     --transition KIND   transition between slides (default: dissolve).
                         Use ``--list-transitions`` to see them all.
     --frames N          transition length in frames (default: 24).
+    --sweep             build one timeline that uses a *different* transition
+                        at every slide boundary, and print where each one
+                        lands. The fastest way to eyeball the whole library.
     --flat              build the old single-track, hard-cut timeline
                         instead — handy for A/B debugging.
 
@@ -40,6 +43,32 @@ def _gather(folder: str) -> list:
     return files
 
 
+def _timecode(frame: int, fps: float) -> str:
+    """Frame count to ``MM:SS+ff``, measured from the start of the timeline."""
+    seconds, remainder = divmod(int(frame), int(round(fps)))
+    minutes, seconds = divmod(seconds, 60)
+    return "{0:02d}:{1:02d}+{2:02d}".format(minutes, seconds, remainder)
+
+
+def _report_sweep(result, kinds, fps: float) -> None:
+    """Print where each transition in a sweep lands, so it can be found."""
+    layout = result.layout
+    if layout is None:
+        return
+    print("  transition map (timeline frame / timecode from start):")
+    for index, kind in enumerate(kinds):
+        head = layout.segments_for_index(index + 1)[0]
+        print(
+            "    {0:>6} {1}  {2:<20} slides {3} -> {4}".format(
+                head.record_frame,
+                _timecode(head.record_frame, fps),
+                kind,
+                index,
+                index + 1,
+            )
+        )
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("folder", nargs="?", help="Folder of images to add to the slideshow")
@@ -63,6 +92,12 @@ def main(argv=None) -> int:
         help="Use only the first N images (0 = all)",
     )
     p.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Use a different transition at every slide boundary, covering "
+             "every registered kind, and print where each one lands",
+    )
+    p.add_argument(
         "--list-transitions",
         action="store_true",
         help="Print every available transition kind and exit",
@@ -80,14 +115,32 @@ def main(argv=None) -> int:
         print("Not a directory: {0}".format(args.folder), file=sys.stderr)
         return 2
 
+    sweep_kinds = list(registered_kinds()) if args.sweep else []
+    if args.sweep and args.flat:
+        p.error("--sweep needs the overlapping layout, so it can't be used with --flat")
+
     paths = _gather(args.folder)
-    if args.limit > 0:
+    if args.sweep:
+        # One more slide than transitions, and no wrapping: reusing an image
+        # either side of a boundary would make the transition hard to read.
+        needed = len(sweep_kinds) + 1
+        if len(paths) < needed:
+            print(
+                "--sweep needs at least {0} images, found {1} in {2}".format(
+                    needed, len(paths), args.folder
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        paths = paths[:needed]
+    elif args.limit > 0:
         paths = paths[: args.limit]
     if not paths:
         print("No images found in {0}".format(args.folder), file=sys.stderr)
         return 2
 
-    if args.transition not in registered_kinds() and args.transition != "none":
+    if not args.sweep and args.transition not in registered_kinds() \
+            and args.transition != "none":
         print(
             "Unknown transition {0!r}. Known kinds: {1}".format(
                 args.transition, ", ".join(registered_kinds())
@@ -96,12 +149,21 @@ def main(argv=None) -> int:
         )
         return 2
 
+    name = args.name
+    if args.sweep and name == p.get_default("name"):
+        name = "SSC Transition Sweep"
+
     project = SlideshowProject.from_paths(
-        paths, name=args.name, default_item_duration_seconds=args.seconds
+        paths, name=name, default_item_duration_seconds=args.seconds
     )
     project.default_transition = TransitionChoice(
         kind=args.transition, duration_frames=args.frames
     )
+    if args.sweep:
+        for item, kind in zip(project.items, sweep_kinds):
+            item.outgoing_transition = TransitionChoice(
+                kind=kind, duration_frames=args.frames
+            )
 
     try:
         result = build_slideshow(project, overlap=not args.flat)
@@ -124,10 +186,12 @@ def main(argv=None) -> int:
                 result.layout.total_frames,
                 result.layout.track_count,
                 len(result.transition_plans),
-                args.transition,
+                "sweep" if args.sweep else args.transition,
                 result.comps_applied,
             )
         )
+        if args.sweep:
+            _report_sweep(result, sweep_kinds, result.layout.fps)
     return 0
 
 

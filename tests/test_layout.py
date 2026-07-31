@@ -318,6 +318,37 @@ def test_unclamped_transition_object_is_reused():
     assert layout.transitions[0] is proj.default_transition
 
 
+def test_a_cut_with_a_duration_still_gets_no_overlap():
+    """``kind="none"`` wins over any duration it happens to carry.
+
+    Honouring the duration would carve out an overlap window that nothing
+    animates in: a hard cut placed early, with the slide silently losing
+    that much screen time.
+    """
+    proj = _project(3, transition="none", frames=24)
+    layout = plan_layout(proj)
+    assert [t.duration_frames for t in layout.transitions] == [0, 0]
+    assert [c.segment for c in layout.clips] == [SEGMENT_WHOLE] * 3
+    assert [c.record_frame for c in layout.clips] == [0, 96, 192]
+    assert layout.track_count == 1
+
+
+def test_a_cut_among_real_transitions_breaks_the_upper_track():
+    proj = _project(4, frames=24)
+    proj.items[1].outgoing_transition = TransitionChoice(
+        kind="none", duration_frames=24
+    )
+    layout = plan_layout(proj)
+    # Slide 2 has no incoming transition, so it stays whole on V1.
+    assert [c.segment for c in layout.segments_for_index(2)] == [SEGMENT_WHOLE]
+    assert [c.segment for c in layout.segments_for_index(3)] == [
+        SEGMENT_HEAD, SEGMENT_BODY
+    ]
+    lower = [c for c in layout.clips if c.track_index == LOWER_TRACK]
+    for previous, following in zip(lower, lower[1:]):
+        assert following.record_frame == previous.record_end_frame
+
+
 # --------------------------------------------------------------------------- #
 # Source length limits
 # --------------------------------------------------------------------------- #

@@ -322,7 +322,14 @@ def plan_layout(
         lengths.append(max(1, length))
 
     choices = _requested_overlaps(project)
-    overlaps = _clamp_overlaps(lengths, [c.duration_frames for c in choices])
+    # A hard cut must request *no* overlap regardless of the duration it
+    # carries. ``TransitionChoice(kind="none", duration_frames=24)`` is easy
+    # to write by accident, and honouring the 24 would carve out an overlap
+    # window that nothing ever animates in — a hard cut placed 24 frames
+    # early, with the slide silently losing that much screen time.
+    overlaps = _clamp_overlaps(
+        lengths, [0 if c.is_cut() else c.duration_frames for c in choices]
+    )
 
     transitions = [
         replace(choice, duration_frames=d) if d != choice.duration_frames else choice
