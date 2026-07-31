@@ -50,7 +50,12 @@ import abc
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Type
 
-from ..fusion_comps import PointKeyframe, ScalarKeyframe, TransformAnimation
+from ..fusion_comps import (
+    PageTurnAnimation,
+    PointKeyframe,
+    ScalarKeyframe,
+    TransformAnimation,
+)
 from ..project_model import TransitionChoice
 
 
@@ -94,6 +99,10 @@ class ClipPlan:
     * ``composite_mode``  — how this clip composites onto the *other*
                             side of the transition. Only meaningful on
                             the clip that ends up on the **upper** track.
+    * ``page_turn``       — 3D page rotating about one edge. Non-None
+                            replaces the whole 2D image chain with a Fusion
+                            3D scene, so it cannot be combined with
+                            ``transform`` / ``blur_size`` / ``pixelate_size``.
     """
 
     transform: Optional[TransformAnimation] = None
@@ -103,6 +112,7 @@ class ClipPlan:
     background_color: Optional[RgbColor] = None
     color_blend: Optional[List[ScalarKeyframe]] = None
     composite_mode: str = "normal"
+    page_turn: Optional[PageTurnAnimation] = None
 
     def __post_init__(self) -> None:
         if self.composite_mode not in COMPOSITE_MODES:
@@ -111,6 +121,17 @@ class ClipPlan:
                     sorted(COMPOSITE_MODES), self.composite_mode
                 )
             )
+        if self.page_turn is not None and not self.page_turn.is_empty():
+            clashes = sorted(
+                name
+                for name in ("blur_size", "pixelate_size", "transform")
+                if getattr(self, name)
+            )
+            if clashes:
+                raise ValueError(
+                    "ClipPlan.page_turn replaces the 2D image chain, so it "
+                    "cannot be combined with {0}".format(", ".join(clashes))
+                )
 
     def is_empty(self) -> bool:
         """True when this plan has no effects (transform/blend/blur/etc.)."""
@@ -122,6 +143,7 @@ class ClipPlan:
             and not self.color_blend
             and self.background_color is None
             and self.composite_mode == "normal"
+            and (self.page_turn is None or self.page_turn.is_empty())
         )
 
 
@@ -176,6 +198,24 @@ def reverse_transform(
     return None if reversed_anim.is_empty() else reversed_anim
 
 
+def reverse_page_turn(
+    animation: Optional[PageTurnAnimation], duration_frames: int
+) -> Optional[PageTurnAnimation]:
+    """Time-reverse a page turn, so a page arriving instead departs.
+
+    The hinge edge is left alone: a page still pivots on the same edge, it
+    just swings the other way in time.
+    """
+    if animation is None or animation.is_empty():
+        return None
+    return PageTurnAnimation(
+        angle=animation.reversed_angle(duration_frames),
+        hinge=animation.hinge,
+        focal_length=animation.focal_length,
+        cull_backface=animation.cull_backface,
+    )
+
+
 def reverse_clip_plan(plan: Optional[ClipPlan], duration_frames: int) -> ClipPlan:
     """Time-reverse every animated channel of a :class:`ClipPlan`.
 
@@ -192,6 +232,7 @@ def reverse_clip_plan(plan: Optional[ClipPlan], duration_frames: int) -> ClipPla
         background_color=plan.background_color,
         color_blend=reverse_keyframes(plan.color_blend, duration_frames),
         composite_mode=plan.composite_mode,
+        page_turn=reverse_page_turn(plan.page_turn, duration_frames),
     )
 
 
@@ -335,6 +376,7 @@ def plan_transition(
 __all__ = [
     "COMPOSITE_MODES",
     "ClipPlan",
+    "PageTurnAnimation",
     "PointKeyframe",
     "RgbColor",
     "ScalarKeyframe",
@@ -346,5 +388,6 @@ __all__ = [
     "registered_kinds",
     "reverse_clip_plan",
     "reverse_keyframes",
+    "reverse_page_turn",
     "reverse_transform",
 ]

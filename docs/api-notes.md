@@ -411,6 +411,39 @@ comp.SetAttrs({"COMPB_Modified": True})
 - **Point inputs** (Center, Pivot) animate via `AddModifier(input, "XYPath")` + per-axis `AddModifier("X" / "Y", "BezierSpline")` on the XYPath; each child spline takes the same `{frame: [value]}` format.
 - `comp.Execute(lua_string)` exists as a Lua escape hatch and is confirmed to run in the `LoadFusionCompByName` handle's context — useful if a future input type can't be driven from external Python. Inside Lua: subscript assignment `tool.Center[frame] = {x, y}` is the canonical Point-keyframe idiom. We don't currently need this for the proven scalar+Point patterns.
 
+### The 3D system (page turns)
+
+A `Renderer3D` feeding `MediaOut1` **does** render correctly inside a Resolve timeline-clip comp — a 3D scene is a legitimate way to build a transition, not just a Fusion-page toy. `Transform3D`, `ImagePlane3D`, `Camera3D`, `Merge3D`, `Renderer3D`, `Shape3D` and `Bender3D` are all present and scriptable.
+
+There is **no native page-turn or page-fold tool** in either Fusion or ResolveFX. `fusion.GetRegList(fusion.CT_Tool)` returns 395 tools on Resolve Studio 20.3.3 and none of them match `Page` or `Turn`, so a page turn has to be assembled from the 3D primitives. The graph we use is:
+
+```
+MediaIn1 ─► Shape3D ─► Transform3D ─► Merge3D ─► Renderer3D ─► MediaOut1
+           (material)   (rotate Y)      ▲
+                                    Camera3D
+```
+
+Two scale traps, and both fail *silently* — the render succeeds, it is just the wrong size, which on a timeline looks like a mis-timed cut rather than a broken comp:
+
+- **The plane is ~1 world unit, not pixels/100.** `Shape3D`'s `SurfacePlaneInputs.Width` / `.Height` both default to `1.0`. `ImagePlane3D` behaves the same way but hides those inputs (it derives its size from the image and gives you no way to read it back), which is why we use `Shape3D`. Assuming pixels/100 puts the camera ~20× too far away and renders a postage stamp.
+- **`Renderer3D` defaults `Width`/`Height` to the *source* image resolution**, not the timeline format. That happens to be what the rest of our pipeline wants — Resolve fits the comp output to the timeline afterwards, exactly as it does for the 2D path — so read it back rather than overriding it. But it means the plane's aspect must be derived from the renderer, not assumed 16:9; a portrait JPG renders 1536×2048.
+
+Set `SurfacePlaneInputs.SizeLock = 0` **before** writing Width and Height, or they move together.
+
+Fitting the camera so a flat page is pixel-identical to the untouched photo:
+
+- `Camera3D.AoV` is **derived, not stored** — it is recomputed from `FLength` and the film back, so set the focal length first and read `AoV` back. With the default `BMD_URSA_4K_16x9` gate, `ApertureH = 0.4677"` and `FLength = 35` gives `AoV = 19.264°` (`2·atan(11.88/2/35)`).
+- `AovType = 0` means AoV is **vertical**, and `ResolutionGateFit` defaults to `Height`. So for a unit-height plane: `camZ = 0.5 / tan(AoV/2)` — 2.946 at 35mm, 1.515 at 18mm. Fitting the height fits the width too, as long as the plane's aspect matches the renderer's.
+- Fusion's default 35mm lens is too long to read as a fold; the page barely foreshortens. ~18mm is a good default, and below ~12mm the page distorts visibly at the edges.
+
+Other 3D notes:
+
+- Input names on 3D tools are dotted (`Transform3DOp.Rotate.Y`, `SurfacePlaneInputs.Visibility.CullBackFace`). `set_scalar_keyframes` handles them fine — Fusion renames the connected spline to a clean `SlideShowPageXfYRotation` rather than echoing the dots.
+- **Turn on `SurfacePlaneInputs.Visibility.CullBackFace`.** Past 90° a plane shows a mirrored copy of its own image, which reads as a glitch rather than as the back of a page.
+- **Turn off `SurfacePlaneInputs.Lighting.IsAffectedByLights`.** With no lights in the scene the renderer otherwise darkens the photo.
+- Rotating about Y with the pivot on a vertical edge gives a door-style swing. Positive angles tip the free edge *toward* the camera (reads as a page being laid down); negative tips it away (reads as swinging up from below).
+- Scene geometry is wired with `SceneInput` / `SceneInput1` / `SceneInput2`, not `Input`; the image goes into `Shape3D.MaterialInput`.
+
 ## Bridge gotchas
 
 - **`scriptapp("Resolve")` will crash the host interpreter** (Windows: exit code `-1073741819` / `0xC0000005` access violation) if no Resolve process is running — `fusionscript.dll` segfaults rather than returning `None`. Always pre-check for a running Resolve process before calling it (see `slideshow.resolve_bridge.is_resolve_running`).

@@ -47,12 +47,14 @@ from ..fusion_comps import (
     DEFAULT_TRANSFORM_NAME,
     PIXELATE_SIZE_INPUT,
     PIXELATE_TOOL,
+    PageTurnAnimation,
     PointKeyframe,
     ScalarKeyframe,
     TransformAnimation,
     add_background,
     add_merge,
     apply_transform_animation,
+    build_page_turn_graph,
     connect,
     find_tool,
     get_active_comp,
@@ -154,6 +156,36 @@ def _merge_transforms(
     return None if merged.is_empty() else merged
 
 
+def _merge_page_turns(
+    lead_in: Optional[PageTurnAnimation],
+    lead_out: Optional[PageTurnAnimation],
+    lead_out_offset: int,
+) -> Optional[PageTurnAnimation]:
+    """Merge the page turn into and out of one clip.
+
+    A clip has a single 3D scene, so the two halves have to share a hinge and
+    a lens; the lead-in wins when they disagree. Under the split-track layout
+    no segment ever carries both halves, so that tie-break is a safety net
+    rather than something the builder relies on.
+    """
+    if lead_in is None and lead_out is None:
+        return None
+    angle = _merge_keyframes(
+        lead_in.angle if lead_in else None,
+        lead_out.angle if lead_out else None,
+        lead_out_offset,
+    )
+    if not angle:
+        return None
+    source = lead_in if lead_in is not None else lead_out
+    return PageTurnAnimation(
+        angle=angle,
+        hinge=source.hinge,
+        focal_length=source.focal_length,
+        cull_backface=source.cull_backface,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # CompSpec
 # --------------------------------------------------------------------------- #
@@ -175,6 +207,7 @@ class CompSpec:
     background_color: Optional[RgbColor] = None
     color_blend: Optional[List[ScalarKeyframe]] = None
     composite_mode: str = "normal"
+    page_turn: Optional[PageTurnAnimation] = None
 
     def is_empty(self) -> bool:
         """True when this comp would be a no-op (so we skip building it)."""
@@ -186,6 +219,7 @@ class CompSpec:
             and not self.color_blend
             and self.background_color is None
             and self.composite_mode == "normal"
+            and (self.page_turn is None or self.page_turn.is_empty())
         )
 
 
@@ -242,6 +276,12 @@ def merge_clip_plans(
     elif lead_out is not None and lead_out.composite_mode != "normal":
         composite = lead_out.composite_mode
 
+    page_turn = _merge_page_turns(
+        lead_in.page_turn if lead_in else None,
+        lead_out.page_turn if lead_out else None,
+        offset,
+    )
+
     return CompSpec(
         length_frames=length_frames,
         transform=_merge_transforms(
@@ -255,6 +295,7 @@ def merge_clip_plans(
         background_color=background,
         color_blend=scalar("color_blend"),
         composite_mode=composite,
+        page_turn=page_turn,
     )
 
 
@@ -289,6 +330,12 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
     reused, keyed by role (``transform``, ``blur``, ``pixelate``,
     ``background``, ``merge``) — handy for tests and diagnostics.
     """
+    if spec.page_turn is not None and not spec.page_turn.is_empty():
+        # A page turn is a whole different pipeline: the image becomes a
+        # texture on a 3D plane, so there is no 2D chain to hang a Blur or a
+        # Transform off. ClipPlan rejects that combination at plan time.
+        return build_page_turn_graph(comp, spec.page_turn)
+
     chain: List[Tuple[str, str]] = []
     if spec.blur_size:
         chain.append((BLUR_TOOL, DEFAULT_BLUR_NAME))
@@ -425,6 +472,7 @@ def apply_comp_spec(timeline_item: Any, spec: CompSpec) -> Optional[Any]:
 
 __all__ = [
     "CompSpec",
+    "PageTurnAnimation",
     "PointKeyframe",
     "ScalarKeyframe",
     "TIMELINE_COMPOSITE_MODES",

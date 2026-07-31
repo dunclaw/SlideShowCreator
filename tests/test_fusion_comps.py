@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from slideshow import fusion_comps as fc
+from tests.fusion_fakes import FAKE_TOOL_DEFAULTS, fake_get_input
 
 
 # --------------------------------------------------------------------------- #
@@ -711,13 +712,16 @@ class _FakeTool:
     def __init__(self, name):
         self.name = name
         self.Output = "{0}-out".format(name)
-        self.inputs = {}
+        self.inputs = dict(FAKE_TOOL_DEFAULTS.get(name, {}))
 
     def ConnectInput(self, input_name, source):
         self.inputs[input_name] = source
 
     def SetInput(self, input_name, value):
         self.inputs[input_name] = value
+
+    def GetInput(self, input_name, frame=None):
+        return fake_get_input(self.inputs, input_name)
 
     def SetAttrs(self, attrs):
         self.name = attrs.get("TOOLS_Name", self.name)

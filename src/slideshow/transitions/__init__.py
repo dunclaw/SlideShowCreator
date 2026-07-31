@@ -51,6 +51,7 @@ from . import effects as _effects  # noqa: F401
 from . import geometry as _geometry  # noqa: F401
 from . import flip as _flip  # noqa: F401
 from . import drop as _drop  # noqa: F401
+from . import page_turn as _page_turn  # noqa: F401
 
 from .applier import (  # noqa: E402  (must follow the registry imports)
     CompSpec,

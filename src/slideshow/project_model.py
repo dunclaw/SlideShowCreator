@@ -67,6 +67,9 @@ from typing import Any, Dict, List, Optional, Sequence
 #:   ``push_*`` (both clips move together), ``zoom_in`` / ``zoom_out``
 #:   (zoom-blur transition — NOT to be confused with the per-clip motion
 #:   of the same name), ``flip``, ``drop``.
+#: * 3D           — ``page_turn``: the incoming photo rotates in about a
+#:   vertical edge like a page being laid down. The only kind that builds a
+#:   Fusion 3D scene rather than a 2D image chain.
 TRANSITION_KINDS: frozenset = frozenset({
     "none",
     "auto",
@@ -87,6 +90,7 @@ TRANSITION_KINDS: frozenset = frozenset({
     "zoom_in",    "zoom_out",
     "flip",
     "drop",
+    "page_turn",
 })
 
 

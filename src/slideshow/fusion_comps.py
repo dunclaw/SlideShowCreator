@@ -37,6 +37,7 @@ be isolated to the helpers in this file.
 from __future__ import annotations
 
 import contextlib
+import math
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 
@@ -118,6 +119,57 @@ MERGE_APPLY_MODES = {
     "add": "Add",
     "non_add": "Maximum",
 }
+
+
+# --------------------------------------------------------------------------- #
+# 3D tool identifiers
+# --------------------------------------------------------------------------- #
+
+#: Fusion's 3D system. There is **no** native page-turn / page-fold tool in
+#: either Fusion or ResolveFX (checked against all 395 registered tool IDs on
+#: Resolve Studio 20.3.3), so a page turn has to be built out of these.
+#:
+#: ``Shape3D`` is used in preference to ``ImagePlane3D`` because it exposes
+#: ``Width``/``Height`` explicitly — ``ImagePlane3D`` derives its size from the
+#: image and gives no way to read it back, so fitting a camera to it is
+#: guesswork. ``Shape3D`` also carries the subdivisions a ``Bender3D`` would
+#: need to curl the page later.
+SHAPE3D_TOOL = "Shape3D"
+TRANSFORM3D_TOOL = "Transform3D"
+CAMERA3D_TOOL = "Camera3D"
+MERGE3D_TOOL = "Merge3D"
+RENDERER3D_TOOL = "Renderer3D"
+
+PAGE_PLANE_NAME = "SlideShowPage"
+PAGE_TRANSFORM_NAME = "SlideShowPageXf"
+PAGE_CAMERA_NAME = "SlideShowPageCam"
+PAGE_MERGE_NAME = "SlideShowPageScene"
+PAGE_RENDERER_NAME = "SlideShowPageRender"
+
+#: 3D tool input names. The ``Transform3DOp.`` prefix is shared by every tool
+#: that has a 3D transform (including ``Shape3D`` and ``Camera3D``).
+SCENE_INPUT = "SceneInput"
+MERGE3D_SCENE_INPUT_1 = "SceneInput1"
+MERGE3D_SCENE_INPUT_2 = "SceneInput2"
+PLANE_MATERIAL_INPUT = "MaterialInput"
+TRANSFORM3D_ROTATE_Y = "Transform3DOp.Rotate.Y"
+TRANSFORM3D_PIVOT_X = "Transform3DOp.Pivot.X"
+TRANSFORM3D_TRANSLATE_Z = "Transform3DOp.Translate.Z"
+PLANE_SIZE_LOCK = "SurfacePlaneInputs.SizeLock"
+PLANE_WIDTH = "SurfacePlaneInputs.Width"
+PLANE_HEIGHT = "SurfacePlaneInputs.Height"
+PLANE_CULL_BACKFACE = "SurfacePlaneInputs.Visibility.CullBackFace"
+PLANE_LIT = "SurfacePlaneInputs.Lighting.IsAffectedByLights"
+CAMERA_FOCAL_LENGTH = "FLength"
+CAMERA_AOV = "AoV"
+
+#: Hinge edges a page can rotate about.
+PAGE_HINGES: frozenset = frozenset({"left", "right"})
+
+#: Default page-turn lens, in mm. Fusion's own default is 35mm, which is too
+#: long to read as a fold — the page barely foreshortens. Shorter is wider and
+#: more dramatic; below about 12mm the page distorts noticeably at the edges.
+DEFAULT_PAGE_FOCAL_LENGTH = 18.0
 
 
 # --------------------------------------------------------------------------- #
@@ -651,6 +703,174 @@ def attach_transform_animation(
         apply_transform_animation(comp, xform, animation)
     mark_modified(comp)
     return xform
+
+
+# --------------------------------------------------------------------------- #
+# 3D page turn
+# --------------------------------------------------------------------------- #
+
+class PageTurnAnimation:
+    """Declarative description of a rigid page rotating about one edge.
+
+    * ``angle``        — list of ``(frame, degrees)`` about the Y (vertical)
+                         axis. ``0`` is flat-on to camera and fills the frame
+                         exactly; ``+90`` is edge-on with the free edge tipped
+                         *toward* the camera; ``-90`` tips it away.
+    * ``hinge``        — ``"right"`` (default) or ``"left"``: which edge of the
+                         page stays put. US books are read left-to-right so
+                         pages sweep right-to-left, which is a right hinge.
+    * ``focal_length`` — camera focal length in mm. Shorter is wider, which
+                         exaggerates the perspective and sells the fold.
+                         The camera is always re-fitted to match, so this
+                         changes the *feel* without changing the framing.
+    * ``cull_backface``— hide the reverse of the page. Without it a page past
+                         90 degrees shows a mirrored copy of its own image,
+                         which reads as a glitch rather than a page.
+
+    Frame numbers are clip-local, matching :class:`TransformAnimation`.
+    """
+
+    __slots__ = ("angle", "hinge", "focal_length", "cull_backface")
+
+    def __init__(
+        self,
+        *,
+        angle: Optional[Sequence[ScalarKeyframe]] = None,
+        hinge: str = "right",
+        focal_length: float = DEFAULT_PAGE_FOCAL_LENGTH,
+        cull_backface: bool = True,
+    ) -> None:
+        if hinge not in PAGE_HINGES:
+            raise ValueError(
+                "PageTurnAnimation.hinge must be one of {0}, got {1!r}".format(
+                    sorted(PAGE_HINGES), hinge
+                )
+            )
+        if focal_length <= 0:
+            raise ValueError(
+                "PageTurnAnimation.focal_length must be > 0, got {0!r}".format(
+                    focal_length
+                )
+            )
+        self.angle = list(angle) if angle else None
+        self.hinge = hinge
+        self.focal_length = float(focal_length)
+        self.cull_backface = bool(cull_backface)
+
+    def is_empty(self) -> bool:
+        return not self.angle
+
+    def reversed_angle(self, duration_frames: int) -> List[ScalarKeyframe]:
+        """``angle`` played backwards within a ``duration_frames`` window."""
+        if not self.angle:
+            return []
+        flipped = [
+            (duration_frames - int(frame), value) for frame, value in self.angle
+        ]
+        flipped.sort(key=lambda item: item[0])
+        return flipped
+
+
+def camera_distance(plane_height: float, aov_degrees: float) -> float:
+    """Distance at which a plane of *plane_height* exactly fills the frame.
+
+    Fusion's ``Camera3D`` reports a **vertical** angle of view (``AovType`` 0,
+    derived from ``ApertureH``), and its default ``ResolutionGateFit`` is
+    ``Height``, so fitting the height fits the width too as long as the plane's
+    aspect matches the render's.
+    """
+    if plane_height <= 0:
+        raise ValueError("plane_height must be > 0, got {0!r}".format(plane_height))
+    half_aov = math.radians(float(aov_degrees)) / 2.0
+    if half_aov <= 0:
+        raise ValueError("aov_degrees must be > 0, got {0!r}".format(aov_degrees))
+    return (plane_height / 2.0) / math.tan(half_aov)
+
+
+def build_page_turn_graph(
+    comp: Any,
+    animation: PageTurnAnimation,
+    *,
+    media_in_name: str = "MediaIn1",
+    media_out_name: str = "MediaOut1",
+) -> dict:
+    """Replace *comp*'s image chain with a 3D page rotating about one edge.
+
+    The graph is::
+
+        MediaIn1 ─► Shape3D ─► Transform3D ─► Merge3D ─► Renderer3D ─► MediaOut1
+                   (material)   (rotate Y)      ▲
+                                            Camera3D
+
+    Assumes the caller holds the comp lock.
+
+    Two things make this fit the frame exactly, and both are easy to get
+    wrong:
+
+    * ``Shape3D``'s plane is **one world unit** square by default, *not*
+      pixels/100. Its ``Width``/``Height`` are set explicitly here (with
+      ``SizeLock`` cleared first, or they move together) to a unit-height
+      rectangle matching the render aspect.
+    * ``Renderer3D`` defaults its ``Width``/``Height`` to the *source* image
+      resolution, not the timeline's. That is what the rest of the pipeline
+      expects, so it is read back rather than overridden — but it means the
+      plane aspect has to be derived from the renderer, not assumed 16:9.
+
+    Get either wrong and the render still succeeds, it is just the wrong size
+    — which looks like a mis-timed cut rather than a broken graph.
+
+    Returns the tools it created or reused, keyed by role.
+    """
+    media_in = _require_tool(comp, media_in_name)
+    media_out = _require_tool(comp, media_out_name)
+
+    plane = find_or_add_tool(comp, SHAPE3D_TOOL, PAGE_PLANE_NAME, position=(1, 0))
+    xform = find_or_add_tool(comp, TRANSFORM3D_TOOL, PAGE_TRANSFORM_NAME, position=(2, 0))
+    camera = find_or_add_tool(comp, CAMERA3D_TOOL, PAGE_CAMERA_NAME, position=(2, 2))
+    merge = find_or_add_tool(comp, MERGE3D_TOOL, PAGE_MERGE_NAME, position=(3, 0))
+    renderer = find_or_add_tool(comp, RENDERER3D_TOOL, PAGE_RENDERER_NAME, position=(4, 0))
+
+    connect(media_in, plane, PLANE_MATERIAL_INPUT)
+    connect(plane, xform, SCENE_INPUT)
+    connect(xform, merge, MERGE3D_SCENE_INPUT_1)
+    connect(camera, merge, MERGE3D_SCENE_INPUT_2)
+    connect(merge, renderer, SCENE_INPUT)
+    connect(renderer, media_out, "Input")
+
+    width = float(renderer.GetInput("Width") or 1920.0)
+    height = float(renderer.GetInput("Height") or 1080.0)
+    plane_height = 1.0
+    plane_width = plane_height * (width / height if height else 1.0)
+
+    plane.SetInput(PLANE_SIZE_LOCK, 0.0)
+    plane.SetInput(PLANE_WIDTH, plane_width)
+    plane.SetInput(PLANE_HEIGHT, plane_height)
+    # No lights in the scene, so leave the texture unlit rather than let the
+    # renderer fall back to its default lighting and darken the photo.
+    plane.SetInput(PLANE_LIT, 0.0)
+    plane.SetInput(PLANE_CULL_BACKFACE, 1.0 if animation.cull_backface else 0.0)
+
+    camera.SetInput(CAMERA_FOCAL_LENGTH, animation.focal_length)
+    aov = float(camera.GetInput(CAMERA_AOV) or 0.0)
+    distance = camera_distance(plane_height, aov)
+    camera.SetInput(TRANSFORM3D_TRANSLATE_Z, distance)
+
+    sign = 1.0 if animation.hinge == "right" else -1.0
+    xform.SetInput(TRANSFORM3D_PIVOT_X, sign * plane_width / 2.0)
+    if animation.angle:
+        set_scalar_keyframes(comp, xform, TRANSFORM3D_ROTATE_Y, animation.angle)
+
+    return {
+        "plane": plane,
+        "transform": xform,
+        "camera": camera,
+        "merge": merge,
+        "renderer": renderer,
+        "plane_size": (plane_width, plane_height),
+        "render_size": (width, height),
+        "aov": aov,
+        "camera_distance": distance,
+    }
 
 
 # --------------------------------------------------------------------------- #

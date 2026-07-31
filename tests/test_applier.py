@@ -36,6 +36,7 @@ from slideshow.transitions.applier import (
 from slideshow.transitions.base import ClipPlan, TransitionPlan
 from slideshow.fusion_comps import PIXELATE_TOOL, TransformAnimation
 from slideshow.project_model import TransitionChoice
+from tests.fusion_fakes import FAKE_TOOL_DEFAULTS, fake_get_input
 
 
 # --------------------------------------------------------------------------- #
@@ -249,7 +250,7 @@ class _FakeTool:
         self.name = name
         self.comp = comp
         self.Output = "{0}-out".format(name)
-        self.inputs = {}
+        self.inputs = dict(FAKE_TOOL_DEFAULTS.get(name, {}))
         self.connections = {}
         self.keyframes = None
 
@@ -272,6 +273,9 @@ class _FakeTool:
 
     def SetInput(self, input_name, value):
         self.inputs[input_name] = value
+
+    def GetInput(self, input_name, frame=None):
+        return fake_get_input(self.inputs, input_name)
 
     def SetAttrs(self, attrs):
         self.name = attrs.get("TOOLS_Name", self.name)
@@ -572,6 +576,130 @@ def test_every_kind_can_be_planned_merged_and_applied(kind):
 
     if not spec.is_empty():
         assert comp.attrs == {"COMPB_Modified": True}
+        # Renderer3D is the tail of the page-turn graph; every other kind
+        # ends in a Transform, or a Merge when it needs opacity.
         assert comp.tools["MediaOut1"].connections["Input"] in (
-            "Transform-out", "Merge-out"
+            "Transform-out", "Merge-out", "Renderer3D-out"
         )
+
+
+# --------------------------------------------------------------------------- #
+# 3D page turn
+# --------------------------------------------------------------------------- #
+
+def _page_spec(**kwargs):
+    kwargs.setdefault("angle", [(0, 100.0), (24, 0.0)])
+    return CompSpec(length_frames=60, page_turn=fc.PageTurnAnimation(**kwargs))
+
+
+def test_page_turn_builds_a_3d_scene_instead_of_the_2d_chain():
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _page_spec())
+
+    assert set(comp.added) == {
+        "Shape3D", "Transform3D", "Camera3D", "Merge3D", "Renderer3D",
+        "BezierSpline",  # drives the rotation
+    }
+    assert "Transform" not in comp.added
+    # MediaIn textures the plane; the renderer is what MediaOut sees.
+    assert built["plane"].connections["MaterialInput"] == "MediaIn1-out"
+    assert built["transform"].connections["SceneInput"] == "Shape3D-out"
+    assert built["merge"].connections["SceneInput1"] == "Transform3D-out"
+    assert built["merge"].connections["SceneInput2"] == "Camera3D-out"
+    assert built["renderer"].connections["SceneInput"] == "Merge3D-out"
+    assert comp.tools["MediaOut1"].connections["Input"] == "Renderer3D-out"
+
+
+def test_page_plane_is_unit_height_and_matches_the_render_aspect():
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _page_spec())
+
+    plane = built["plane"]
+    # SizeLock has to be cleared first or Width and Height move together.
+    assert plane.inputs[fc.PLANE_SIZE_LOCK] == 0.0
+    assert plane.inputs[fc.PLANE_HEIGHT] == 1.0
+    # The fake renderer reports 1920x1080, like a real one reporting the
+    # source resolution rather than the timeline's.
+    assert plane.inputs[fc.PLANE_WIDTH] == pytest.approx(1920.0 / 1080.0)
+    assert built["plane_size"] == (pytest.approx(16.0 / 9.0), 1.0)
+
+
+def test_camera_is_fitted_so_a_flat_page_fills_the_frame():
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _page_spec(focal_length=20.0))
+
+    camera = built["camera"]
+    assert camera.inputs[fc.CAMERA_FOCAL_LENGTH] == 20.0
+    # Half the plane height over the tangent of half the vertical AoV. Getting
+    # this wrong renders a correct-looking graph at the wrong scale, which is
+    # only visible as a jump at the end of the transition.
+    expected = fc.camera_distance(1.0, built["aov"])
+    assert camera.inputs[fc.TRANSFORM3D_TRANSLATE_Z] == pytest.approx(expected)
+    assert built["camera_distance"] == pytest.approx(expected)
+
+
+def test_a_shorter_lens_brings_the_camera_closer():
+    wide = build_comp_graph(_FakeComp(), _page_spec(focal_length=14.0))
+    long = build_comp_graph(_FakeComp(), _page_spec(focal_length=35.0))
+
+    assert wide["aov"] > long["aov"]
+    assert wide["camera_distance"] < long["camera_distance"]
+
+
+@pytest.mark.parametrize(
+    "hinge,sign", [("right", 1.0), ("left", -1.0)]
+)
+def test_hinge_picks_which_edge_the_page_pivots_on(hinge, sign):
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _page_spec(hinge=hinge))
+
+    half_width = built["plane_size"][0] / 2.0
+    assert built["transform"].inputs[fc.TRANSFORM3D_PIVOT_X] == pytest.approx(
+        sign * half_width
+    )
+
+
+def test_backface_culling_is_on_by_default_and_can_be_turned_off():
+    on = build_comp_graph(_FakeComp(), _page_spec())
+    off = build_comp_graph(_FakeComp(), _page_spec(cull_backface=False))
+
+    assert on["plane"].inputs[fc.PLANE_CULL_BACKFACE] == 1.0
+    assert off["plane"].inputs[fc.PLANE_CULL_BACKFACE] == 0.0
+    # Lighting is always off: there are no lights, so leaving it on lets the
+    # renderer darken the photo.
+    assert on["plane"].inputs[fc.PLANE_LIT] == 0.0
+
+
+def test_page_turn_graph_is_rebuilt_not_duplicated():
+    comp = _FakeComp()
+
+    build_comp_graph(comp, _page_spec())
+    build_comp_graph(comp, _page_spec(focal_length=24.0))
+
+    assert comp.added.count("Shape3D") == 1
+    assert comp.added.count("Renderer3D") == 1
+
+
+def test_camera_distance_rejects_nonsense():
+    with pytest.raises(ValueError):
+        fc.camera_distance(0.0, 30.0)
+    with pytest.raises(ValueError):
+        fc.camera_distance(1.0, 0.0)
+
+
+def test_page_turn_survives_the_merge_into_a_comp_spec():
+    plan = plan_transition(TransitionChoice(kind="page_turn", duration_frames=18))
+    clip = PlacedClip(
+        index=1, track_index=2, record_frame=0, length_frames=18,
+        lead_in_frames=18, lead_out_frames=0,
+    )
+
+    spec = comp_spec_for_clip(clip, lead_in_plan=plan)
+
+    assert spec.page_turn is not None
+    assert spec.page_turn.angle[0][0] == 0
+    assert spec.page_turn.angle[-1] == (18, 0.0)

@@ -36,6 +36,8 @@ from slideshow.transitions.geometry import (
     DEFAULT_ZOOM_IN_START_SIZE,
     DEFAULT_ZOOM_OUT_START_SIZE,
 )
+from slideshow.fusion_comps import DEFAULT_PAGE_FOCAL_LENGTH, PageTurnAnimation
+from slideshow.transitions.page_turn import PAGE_START_ANGLE, page_angle_keys
 
 
 # --------------------------------------------------------------------------- #
@@ -814,3 +816,128 @@ class TestRoundTrip:
                 params={"unrecognised_key": 999},
             )
             plan_transition(choice)
+
+
+
+# --------------------------------------------------------------------------- #
+# Page turn
+# --------------------------------------------------------------------------- #
+
+class TestPageTurn:
+    def test_only_the_incoming_page_moves(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=36)
+        )
+
+        assert plan.incoming.page_turn is not None
+        # The photo being covered up does nothing, exactly like the page under
+        # the one being turned.
+        assert plan.outgoing.is_empty()
+
+    def test_the_page_comes_to_rest_exactly_flat(self):
+        # Any residual angle on the last frame shows up as a visible jump,
+        # because the next frame is the body segment showing the plain photo.
+        for duration in (2, 5, 12, 24, 36, 120):
+            plan = plan_transition(
+                TransitionChoice(kind="page_turn", duration_frames=duration)
+            )
+            angle = plan.incoming.page_turn.angle
+            assert angle[-1] == (duration, 0.0)
+            assert angle[0][0] == 0
+            assert angle[0][1] == pytest.approx(PAGE_START_ANGLE)
+
+    def test_keyframes_are_strictly_increasing_at_any_length(self):
+        for duration in range(1, 60):
+            keys = page_angle_keys(duration, PAGE_START_ANGLE)
+            frames = [frame for frame, _ in keys]
+            assert frames == sorted(set(frames)), duration
+            assert frames[-1] == duration
+
+    def test_the_arc_is_front_loaded(self):
+        keys = page_angle_keys(100, 100.0)
+        midpoint = [value for frame, value in keys if frame == 55][0]
+        # Past halfway in time the page should be most of the way down, not
+        # halfway -- a linear sweep reads mechanical.
+        assert midpoint < 50.0
+
+    def test_hinge_defaults_to_right_and_can_be_overridden(self):
+        default = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=24)
+        )
+        left = plan_transition(
+            TransitionChoice(
+                kind="page_turn", duration_frames=24, params={"hinge": "left"}
+            )
+        )
+
+        assert default.incoming.page_turn.hinge == "right"
+        assert left.incoming.page_turn.hinge == "left"
+
+    def test_nonsense_params_fall_back_to_the_defaults(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn",
+                duration_frames=24,
+                params={"hinge": "sideways", "focal_length": "wide", "angle": None},
+            )
+        )
+
+        page = plan.incoming.page_turn
+        assert page.hinge == "right"
+        assert page.focal_length == DEFAULT_PAGE_FOCAL_LENGTH
+        assert page.angle[0][1] == pytest.approx(PAGE_START_ANGLE)
+
+    def test_a_negative_focal_length_is_ignored(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn", duration_frames=24, params={"focal_length": -5}
+            )
+        )
+
+        assert plan.incoming.page_turn.focal_length == DEFAULT_PAGE_FOCAL_LENGTH
+
+    def test_zero_duration_is_a_cut(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=0)
+        )
+
+        assert plan.is_cut
+        assert plan.incoming.page_turn is None
+
+    def test_mirroring_makes_the_page_leave_instead_of_arrive(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=24),
+            incoming_on_top=False,
+        )
+
+        # Mirrored, the clip on top is the outgoing one and its page swings
+        # back out the way it came.
+        page = plan.outgoing.page_turn
+        assert page is not None
+        assert page.angle[0] == (0, 0.0)
+        assert page.angle[-1][0] == 24
+        assert page.angle[-1][1] == pytest.approx(PAGE_START_ANGLE)
+        # The hinge is a property of the page, not of the direction of travel.
+        assert page.hinge == "right"
+
+    def test_page_turn_cannot_be_stacked_on_the_2d_chain(self):
+        # They are different pipelines -- silently dropping one would be worse.
+        with pytest.raises(ValueError):
+            ClipPlan(
+                page_turn=PageTurnAnimation(angle=[(0, 90.0), (10, 0.0)]),
+                blur_size=[(0, 10.0), (10, 0.0)],
+            )
+
+    def test_an_empty_page_turn_does_not_block_the_2d_chain(self):
+        plan = ClipPlan(
+            page_turn=PageTurnAnimation(), blur_size=[(0, 10.0), (10, 0.0)]
+        )
+
+        assert plan.page_turn.is_empty()
+        assert not plan.is_empty()
+
+    def test_hinge_and_focal_length_are_validated(self):
+        with pytest.raises(ValueError):
+            PageTurnAnimation(hinge="middle")
+        with pytest.raises(ValueError):
+            PageTurnAnimation(focal_length=0)
