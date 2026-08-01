@@ -874,6 +874,41 @@ class TestPageTurn:
         assert default.incoming.page_turn.hinge == "right"
         assert left.incoming.page_turn.hinge == "left"
 
+    def test_a_left_hinge_mirrors_the_sign_of_the_angle(self):
+        # The free edge has to lift *toward* the camera either way. Rotating
+        # about Y sends pivot-relative x to z' = -x*sin(angle), and the two
+        # hinges put the free edge on opposite sides of the pivot, so the raw
+        # angle has to flip with them.
+        right = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=24)
+        )
+        left = plan_transition(
+            TransitionChoice(
+                kind="page_turn", duration_frames=24, params={"hinge": "left"}
+            )
+        )
+
+        assert right.incoming.page_turn.angle[0][1] == pytest.approx(PAGE_START_ANGLE)
+        assert left.incoming.page_turn.angle[0][1] == pytest.approx(-PAGE_START_ANGLE)
+        # Mirrored, not merely negative somewhere: every key is the negation
+        # of its counterpart, and both still rest at exactly flat.
+        for (rf, rv), (lf, lv) in zip(
+            right.incoming.page_turn.angle, left.incoming.page_turn.angle
+        ):
+            assert rf == lf
+            assert lv == pytest.approx(-rv)
+        assert left.incoming.page_turn.angle[-1][1] == pytest.approx(0.0)
+
+    def test_an_explicit_angle_is_mirrored_by_the_hinge_too(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn",
+                duration_frames=24,
+                params={"hinge": "left", "angle": 60.0},
+            )
+        )
+        assert plan.incoming.page_turn.angle[0][1] == pytest.approx(-60.0)
+
     def test_nonsense_params_fall_back_to_the_defaults(self):
         plan = plan_transition(
             TransitionChoice(
@@ -1007,7 +1042,30 @@ class TestPageTurnAway:
         assert angles[0][0] == 0
         assert angles[0][1] == pytest.approx(0.0)
         assert angles[-1][0] == 36
-        assert angles[-1][1] == pytest.approx(PAGE_START_ANGLE)
+        # Negative because it hinges left: that is what lifts the free right
+        # edge off the screen towards the viewer instead of sinking it in.
+        assert angles[-1][1] == pytest.approx(-PAGE_START_ANGLE)
+
+    def test_it_lifts_off_the_screen_rather_than_into_it(self):
+        # Regression: the away variant used to reuse page_turn's positive
+        # angle with a left hinge, which rotated the page away from the
+        # camera -- it read as the photo sinking into the screen.
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn_away", duration_frames=36),
+            incoming_on_top=False,
+        )
+        assert all(value <= 0.0 for _, value in plan.outgoing.page_turn.angle)
+
+    def test_overriding_the_hinge_flips_the_angle_back(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn_away",
+                duration_frames=36,
+                params={"hinge": "right"},
+            ),
+            incoming_on_top=False,
+        )
+        assert plan.outgoing.page_turn.angle[-1][1] == pytest.approx(PAGE_START_ANGLE)
 
     def test_hinge_is_still_overridable(self):
         plan = plan_transition(

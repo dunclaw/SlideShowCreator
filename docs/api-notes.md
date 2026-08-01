@@ -465,10 +465,21 @@ Other 3D notes:
 - Input names on 3D tools are dotted (`Transform3DOp.Rotate.Y`, `SurfacePlaneInputs.Visibility.CullBackFace`). `set_scalar_keyframes` handles them fine — Fusion renames the connected spline to a clean `SlideShowPageXfYRotation` rather than echoing the dots.
 - **Turn on `SurfacePlaneInputs.Visibility.CullBackFace`.** Past 90° a plane shows a mirrored copy of its own image, which reads as a glitch rather than as the back of a page.
 - **Turn off `SurfacePlaneInputs.Lighting.IsAffectedByLights`.** With no lights in the scene the renderer otherwise darkens the photo.
-- Rotating about Y with the pivot on a vertical edge gives a door-style swing. Positive angles tip the free edge *toward* the camera (reads as a page being laid down); negative tips it away (reads as swinging up from below).
+- Rotating about Y with the pivot on a vertical edge gives a door-style swing. A point at pivot-relative `x` lands at `z' = -x·sin(θ)`, and the camera is at `+Z`, so **the sign that lifts the free edge toward the camera depends on which edge the hinge is**: a right hinge puts the free edge at negative `x` and wants a *positive* angle, a left hinge puts it at positive `x` and wants a *negative* one. Give both the same raw angle and one of them sinks into the screen instead of lifting off it. `PageTurn.plan` negates the angle for a left hinge so that "positive tips the free edge toward the camera" is true of the *free edge*, whichever side it is on.
 - Scene geometry is wired with `SceneInput` / `SceneInput1` / `SceneInput2`, not `Input`; the image goes into `Shape3D.MaterialInput`.
 - The angle must rest at **exactly 0.0 on the final frame**. The next frame is a different timeline clip showing the untouched photo, so any residual rotation reads as a jump.
 - Two transitions use this graph, differing only in which slide moves: `page_turn` rotates the **incoming** photo in (hinged right), and `page_turn_away` rotates the **outgoing** photo out (hinged left, so the free right edge lifts and sweeps left over the spine). The latter is the only transition that needs the outgoing clip on the upper track — see *The split-track layout* above.
+
+#### Where the hinge sits, and why it can't be the screen edge
+
+The page is the photo, so the hinge is at the *photo's* edge. Photos of different aspect ratios are pillarboxed differently by Resolve, so the hinge lands at a different screen x for each one, which weakens the book illusion. Two ways to force the hinge to the frame edge were built and rendered, and **both were rejected**:
+
+- **Photo printed on a frame-sized black card.** Fixes the hinge and hides whatever is on the track below, but under a perspective camera the near edge of a tilted page blows up enormously — at 45° the screen is filled by the card's *black margin* with a sliver of photo in it. It reads as a black curtain, not a page. Longer lenses only fix it by flattening the fold away.
+- **Photo-sized page, pivot moved out to the frame edge.** The plane then orbits a pivot outside itself, so it swings bodily toward the camera: at 45° the centre is ~30% closer and the photo is visibly zoomed and cropped mid-turn.
+
+The blow-up is inherent to a perspective camera, and it is only tolerable in the shipped `page_turn` *because* the whole page is photo. So the hinge stays on the photo edge. What the varying hinge actually exposes is that slides don't fill the frame — the real fix is a project-level background/framing pass so every slide covers the frame identically, at which point neighbouring photos stop bleeding around each other during a turn.
+
+To *see* any of this: gallery stills are unreliable (`GalleryStillAlbum.ExportStills` returns `False` indefinitely once the album has been cleared with `DeleteStills`, while `GrabStill` keeps succeeding, and `Gallery.AddStillAlbum` doesn't exist in 20.3.3). Render instead — `Project.SetRenderSettings({"MarkIn": f, "MarkOut": f, ...})` plus `AddRenderJob` / `StartRendering` is dependable — then pull frames out with `ffmpeg`. Note that `SetCurrentRenderFormatAndCodec("jpg", "None")` silently does nothing after `LoadRenderPreset`, so you get a one-frame `.mov`; extracting from it is easier than fighting the preset.
 
 ## Bridge gotchas
 

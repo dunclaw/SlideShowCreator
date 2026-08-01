@@ -31,6 +31,11 @@ Angles
 negative angles tip it away, which reads as the page swinging up from below.
 Positive is the default for that reason.
 
+That statement is about the *free* edge, not about the raw rotation, so the
+sign flips with the hinge: see :meth:`PageTurn.plan`. A left-hinged page given
+the same raw angle as a right-hinged one would sink into the screen instead of
+lifting off it.
+
 The sweep starts a little past 90° so the page begins fractionally behind
 edge-on. With back-face culling on it is invisible until it crosses 90°,
 which hides the pop-in and costs only a frame or two.
@@ -134,6 +139,17 @@ class PageTurn(Transition):
             focal_length = DEFAULT_PAGE_FOCAL_LENGTH
         if focal_length <= 0:
             focal_length = DEFAULT_PAGE_FOCAL_LENGTH
+
+        # Rotating about Y sends a point at pivot-relative ``x`` to
+        # ``z' = -x·sin(angle)``, and the camera is at +Z. A right hinge puts
+        # the free edge at negative x, so a positive angle lifts it toward the
+        # camera; a left hinge puts it at positive x, where the same angle
+        # would push it *into* the screen instead. Mirroring the sign with the
+        # hinge keeps "positive tips the free edge toward the camera" true for
+        # both, so the two directions are mirror images and not two different
+        # motions.
+        if hinge == "left":
+            start_angle = -start_angle
 
         incoming = ClipPlan(
             page_turn=PageTurnAnimation(
