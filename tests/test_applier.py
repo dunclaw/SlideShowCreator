@@ -632,13 +632,116 @@ def test_camera_is_fitted_so_a_flat_page_fills_the_frame():
     built = build_comp_graph(comp, _page_spec(focal_length=20.0))
 
     camera = built["camera"]
-    assert camera.inputs[fc.CAMERA_FOCAL_LENGTH] == 20.0
     # Half the plane height over the tangent of half the vertical AoV. Getting
     # this wrong renders a correct-looking graph at the wrong scale, which is
     # only visible as a jump at the end of the transition.
     expected = fc.camera_distance(1.0, built["aov"])
     assert camera.inputs[fc.TRANSFORM3D_TRANSLATE_Z] == pytest.approx(expected)
     assert built["camera_distance"] == pytest.approx(expected)
+
+
+def test_a_frame_filling_page_is_backed_off_until_it_clears_the_camera():
+    # The fake renderer reports 16:9, so the plane is 1.778 wide -- wider than
+    # the 1.515 the requested lens would put the camera at. Left alone the
+    # page sweeps straight through the lens and the render falls apart.
+    built = build_comp_graph(_FakeComp(), _page_spec(focal_length=18.0))
+
+    width = built["plane_size"][0]
+    assert built["focal_length"] > 18.0
+    assert built["camera_distance"] > width
+    assert built["camera_distance"] == pytest.approx(width * fc.PAGE_CAMERA_CLEARANCE)
+    # The lens the camera actually got is the one we report.
+    assert built["camera"].inputs[fc.CAMERA_FOCAL_LENGTH] == pytest.approx(
+        built["focal_length"]
+    )
+
+
+def test_a_narrow_page_keeps_the_lens_it_asked_for():
+    built = build_comp_graph(_FakeComp(), _page_spec(focal_length=18.0))
+
+    # The clamp is width-driven, so a page narrower than the fitted distance
+    # is left alone. Checked directly on the helper because the fake renderer
+    # only ever reports 16:9.
+    assert fc.page_focal_length_for_clearance(18.0, 1.5152, 0.75) == 18.0
+    assert fc.page_focal_length_for_clearance(18.0, 1.5152, 1.3333) == pytest.approx(
+        18.0 * 1.3333 * fc.PAGE_CAMERA_CLEARANCE / 1.5152
+    )
+    assert built["focal_length"] > 18.0
+
+
+def test_the_clamp_lands_on_the_same_distance_from_any_starting_lens():
+    # d = h*F/apertureH, so distance is linear in focal length -- which is
+    # what lets us buy clearance by lengthening the lens without changing what
+    # a resting page looks like. Whatever lens you start from, the clamp
+    # should arrive at the same required distance.
+    width = 1.7778
+    required = width * fc.PAGE_CAMERA_CLEARANCE
+    for focal, fitted in ((18.0, 1.5152), (12.0, 1.5152 * 12.0 / 18.0)):
+        clamped = fc.page_focal_length_for_clearance(focal, fitted, width)
+        assert fitted * clamped / focal == pytest.approx(required)
+
+
+def test_page_focal_length_rejects_nonsense():
+    with pytest.raises(ValueError):
+        fc.page_focal_length_for_clearance(0.0, 1.5, 1.0)
+    with pytest.raises(ValueError):
+        fc.page_focal_length_for_clearance(18.0, 0.0, 1.0)
+
+
+def test_entry_angle_depends_only_on_width_over_distance():
+    # tan(theta) = 2d/W, so the height cancels and doubling both leaves it put.
+    assert fc.page_entry_angle(1.0, 2.0) == pytest.approx(
+        fc.page_entry_angle(2.0, 4.0)
+    )
+    # A wider page enters later -- it has further to swing before its free
+    # edge comes back inside the frame.
+    assert fc.page_entry_angle(1.7778, 2.0444) < fc.page_entry_angle(0.75, 1.5152)
+    assert fc.page_entry_angle(1.7778, 2.0444) == pytest.approx(66.5, abs=0.5)
+    assert fc.page_entry_angle(0.75, 1.5152) == pytest.approx(76.1, abs=0.5)
+
+
+def test_entry_angle_rejects_nonsense():
+    with pytest.raises(ValueError):
+        fc.page_entry_angle(0.0, 1.5)
+    with pytest.raises(ValueError):
+        fc.page_entry_angle(1.0, 0.0)
+
+
+def test_angles_are_scaled_into_the_visible_range():
+    keys = [(0, 100.0), (8, 86.0), (16, 45.0), (30, 0.0)]
+
+    fitted = fc.fit_angles_to_frame(keys, 66.5)
+
+    assert [f for f, _ in fitted] == [0, 8, 16, 30]
+    assert fitted[0][1] == pytest.approx(66.5)
+    # Scaled, not clipped: the eased shape survives intact.
+    assert fitted[1][1] == pytest.approx(86.0 * 0.665)
+    # And it still rests at exactly flat, or the cut into the body segment
+    # shows a jump.
+    assert fitted[-1][1] == 0.0
+
+
+def test_angles_already_in_range_are_left_alone():
+    keys = [(0, 60.0), (10, 20.0), (24, 0.0)]
+
+    assert fc.fit_angles_to_frame(keys, 66.5) == keys
+    assert fc.fit_angles_to_frame([], 66.5) == []
+
+
+def test_negative_angles_are_scaled_by_magnitude():
+    # page_turn_away sweeps negative; scaling has to key off the magnitude or
+    # the away variant would be left unfitted.
+    fitted = fc.fit_angles_to_frame([(0, -100.0), (30, 0.0)], 66.5)
+
+    assert fitted[0][1] == pytest.approx(-66.5)
+
+
+def test_the_built_page_uses_the_fitted_angles():
+    built = build_comp_graph(_FakeComp(), _page_spec())
+
+    peak = max(abs(value) for _, value in built["angle"])
+    assert peak == pytest.approx(built["entry_angle"])
+    assert built["angle"][-1][1] == 0.0
 
 
 def test_a_shorter_lens_brings_the_camera_closer():

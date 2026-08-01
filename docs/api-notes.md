@@ -470,14 +470,23 @@ Other 3D notes:
 - The angle must rest at **exactly 0.0 on the final frame**. The next frame is a different timeline clip showing the untouched photo, so any residual rotation reads as a jump.
 - Two transitions use this graph, differing only in which slide moves: `page_turn` rotates the **incoming** photo in (hinged right), and `page_turn_away` rotates the **outgoing** photo out (hinged left, so the free right edge lifts and sweeps left over the spine). The latter is the only transition that needs the outgoing clip on the upper track — see *The split-track layout* above.
 
-#### Where the hinge sits, and why it can't be the screen edge
+#### Page width, camera clearance and the entry angle
 
-The page is the photo, so the hinge is at the *photo's* edge. Photos of different aspect ratios are pillarboxed differently by Resolve, so the hinge lands at a different screen x for each one, which weakens the book illusion. Two ways to force the hinge to the frame edge were built and rendered, and **both were rejected**:
+The page is sized to the photo, so its width in world units is the photo's aspect over the frame's: a 3:4 portrait is 0.75 wide, a 4:3 landscape 1.333, a native 16:9 photo (or anything under fill/crop framing) exactly 1.778. Two things follow from that width, and both bite hardest exactly where you want the feature to work.
 
-- **Photo printed on a frame-sized black card.** Fixes the hinge and hides whatever is on the track below, but under a perspective camera the near edge of a tilted page blows up enormously — at 45° the screen is filled by the card's *black margin* with a sliver of photo in it. It reads as a black curtain, not a page. Longer lenses only fix it by flattening the fold away.
-- **Photo-sized page, pivot moved out to the frame edge.** The plane then orbits a pivot outside itself, so it swings bodily toward the camera: at 45° the centre is ~30% closer and the photo is visibly zoomed and cropped mid-turn.
+**The page must clear the camera.** Rotation about Y maps `x` into `z` and leaves `y` alone, so the free edge reaches `plane_width` toward the camera at 90° — the *width*, not the corner distance. At 18mm the camera sits at 1.515. A 4:3 photo (1.333) squeaks through with 13% to spare, which is why letterboxed landscape turns look fine. A frame-filling page at 1.778 does **not**: it sweeps through the lens and out behind it, and the render collapses into a smear with no fold at all. Verified — a page turn built from 16:9 sources was unwatchable.
 
-The blow-up is inherent to a perspective camera, and it is only tolerable in the shipped `page_turn` *because* the whole page is photo. So the hinge stays on the photo edge. What the varying hinge actually exposes is that slides don't fill the frame — the real fix is a project-level background/framing pass so every slide covers the frame identically, at which point neighbouring photos stop bleeding around each other during a turn.
+Fix by *lengthening the lens*, not by moving the camera: distance is exactly linear in focal length (`d = (h/2)/tan(aov/2)` and `tan(aov/2) = (apertureH/2)/F`, so `d = h·F/apertureH`), so scaling `F` scales `d` by the same factor and leaves the resting frame pixel-identical. `page_focal_length_for_clearance` does this, with `PAGE_CAMERA_CLEARANCE = 1.15` — deliberately just above the 1.136 that 4:3 already gets for free, so the case that already looks right is left untouched and 16:9 is backed off by the minimum that works (18mm → 24.3mm).
+
+**Most of the arc happens off-screen.** This is the counter-intuitive one. A page swung far over is very close to the camera, and a point close to the camera projects a long way out — so at 80° a frame-filling page is entirely off the *side* of the screen, not edge-on in the middle of it. It slides into frame only when its free edge comes back inside, and covers the frame again within another 20°. Setting the projected free edge equal to the frame edge:
+
+```
+(W/2 - W·cos θ)·d = (d - W·sin θ)·(W/2)   →   tan θ = 2d/W
+```
+
+The height cancels: the entry angle depends only on width over camera distance. A letterboxed portrait enters at 76°, a frame-filling page at 66.5°. Sweeping from 100° therefore spends the first third of the transition on a page nobody can see and then dumps the entire fold into four or five frames, which reads as a hard wipe.
+
+`page_entry_angle` computes it and `fit_angles_to_frame` rescales the planned sweep so its peak *is* the entry angle. Scaling rather than clipping keeps the eased profile and the exact 0.0 resting angle. This is done in the comp builder, not at plan time, because the plan describes the shape of the motion and only the builder knows the geometry it will be rendered against.
 
 To *see* any of this: gallery stills are unreliable (`GalleryStillAlbum.ExportStills` returns `False` indefinitely once the album has been cleared with `DeleteStills`, while `GrabStill` keeps succeeding, and `Gallery.AddStillAlbum` doesn't exist in 20.3.3). Render instead — `Project.SetRenderSettings({"MarkIn": f, "MarkOut": f, ...})` plus `AddRenderJob` / `StartRendering` is dependable — then pull frames out with `ffmpeg`. Note that `SetCurrentRenderFormatAndCodec("jpg", "None")` silently does nothing after `LoadRenderPreset`, so you get a one-frame `.mov`; extracting from it is easier than fighting the preset.
 

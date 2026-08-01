@@ -171,6 +171,17 @@ PAGE_HINGES: frozenset = frozenset({"left", "right"})
 #: more dramatic; below about 12mm the page distorts noticeably at the edges.
 DEFAULT_PAGE_FOCAL_LENGTH = 18.0
 
+#: How much further from the camera than its own width a page must sit. A page
+#: hinged on a vertical edge reaches ``plane_width`` toward the camera at 90°,
+#: so anything below 1.0 means it sweeps straight through the lens.
+#:
+#: 1.15 is deliberately just above the 1.136 that a letterboxed 4:3 photo gets
+#: for free at 18mm — that case looks right as it is, so it stays untouched,
+#: while a frame-filling page gets backed off by the smallest amount that
+#: actually works. Raising this flattens the fold on wide pages for no visible
+#: benefit.
+PAGE_CAMERA_CLEARANCE = 1.15
+
 
 # --------------------------------------------------------------------------- #
 # Locking
@@ -787,6 +798,103 @@ def camera_distance(plane_height: float, aov_degrees: float) -> float:
     return (plane_height / 2.0) / math.tan(half_aov)
 
 
+def page_focal_length_for_clearance(
+    focal_length: float,
+    fitted_distance: float,
+    plane_width: float,
+    clearance: float = PAGE_CAMERA_CLEARANCE,
+) -> float:
+    """Lengthen *focal_length* until the swinging page clears the camera.
+
+    The page hinges on a vertical edge and rotates about Y, which maps ``x``
+    into ``z`` and leaves ``y`` alone — so the *whole* swing happens within
+    ``plane_width`` of the pivot, and the free edge reaches its closest
+    approach to the camera at 90°, at ``fitted_distance - plane_width``.
+
+    When the plane is wider than the camera is distant that value goes
+    negative: the page sweeps **through** the camera and out behind it, and
+    the render dissolves into garbage — no fold, just the photo smearing and
+    snapping. That is not an edge case. A 4:3 photo letterboxed into a 16:9
+    frame is 1.333 wide against a distance of 1.515 and squeaks through with
+    13% to spare, but a native 16:9 photo — or any photo once fill/crop
+    framing is switched on — is 1.778 wide and does not.
+
+    Backing the camera off alone would shrink the resting page, so we lengthen
+    the lens instead: distance is exactly linear in focal length (both
+    ``d = (h/2)/tan(aov/2)`` and ``tan(aov/2) = (apertureH/2)/F``, so
+    ``d = h·F/apertureH``), which means scaling ``F`` scales ``d`` by the same
+    factor and leaves the resting frame pixel-identical. The only cost is a
+    gentler fold, and only for pages wide enough to need it.
+
+    Returns *focal_length* unchanged when there is already enough room.
+    """
+    if focal_length <= 0:
+        raise ValueError("focal_length must be > 0, got {0!r}".format(focal_length))
+    if fitted_distance <= 0:
+        raise ValueError(
+            "fitted_distance must be > 0, got {0!r}".format(fitted_distance)
+        )
+    required = float(plane_width) * float(clearance)
+    if required <= fitted_distance:
+        return float(focal_length)
+    return float(focal_length) * required / fitted_distance
+
+
+def page_entry_angle(plane_width: float, distance: float) -> float:
+    """Angle, in degrees, at which the page's free edge crosses the frame edge.
+
+    A page swung far over is very close to the camera, and a point close to
+    the camera projects a long way out: at 80° a frame-filling page sits
+    entirely *off* the side of the screen, not edge-on in the middle of it as
+    you would expect. It only slides into frame once its free edge comes back
+    inside, and from there it covers the whole frame within another 20°.
+
+    Working out where that happens: with the pivot on the right edge, the free
+    edge sits at ``x = W/2 - W·cos(θ)``, ``z = W·sin(θ)``, the camera is at
+    ``d``, and the frame's half-width at rest is ``W/2``. Setting the
+    projected position equal to the frame edge,
+
+    ``(W/2 - W·cos θ)·d = (d - W·sin θ)·(W/2)``
+
+    collapses to ``tan θ = 2d/W`` — the height cancels out entirely, so this
+    depends only on how wide the page is relative to the camera distance.
+
+    Sweeping from any angle above this wastes frames on a page nobody can see
+    and then dumps the whole fold into the last few, which reads as a hard
+    wipe rather than a turn. Wider pages enter later: a letterboxed portrait
+    photo enters at 76°, a frame-filling one at 66°.
+    """
+    if plane_width <= 0:
+        raise ValueError("plane_width must be > 0, got {0!r}".format(plane_width))
+    if distance <= 0:
+        raise ValueError("distance must be > 0, got {0!r}".format(distance))
+    return math.degrees(math.atan2(2.0 * distance, plane_width))
+
+
+def fit_angles_to_frame(
+    angle: List[ScalarKeyframe], entry_angle: float
+) -> List[ScalarKeyframe]:
+    """Rescale *angle* so its largest excursion is *entry_angle*.
+
+    The transition plans the *shape* of the sweep — front-loaded, resting at
+    exactly 0 on the last frame — without knowing the geometry it will be
+    rendered against. Scaling here rather than at plan time keeps that split:
+    the same plan produces a turn that uses all of its frames whether the page
+    is a narrow portrait photo or fills the frame.
+
+    Scaling, not clipping, so the eased profile is preserved and the page
+    still comes to rest at exactly 0. A sweep already inside the visible range
+    is returned untouched.
+    """
+    if not angle:
+        return []
+    peak = max(abs(value) for _, value in angle)
+    if peak <= 0 or peak <= entry_angle:
+        return list(angle)
+    scale = entry_angle / peak
+    return [(frame, value * scale) for frame, value in angle]
+
+
 def build_page_turn_graph(
     comp: Any,
     animation: PageTurnAnimation,
@@ -853,12 +961,24 @@ def build_page_turn_graph(
     camera.SetInput(CAMERA_FOCAL_LENGTH, animation.focal_length)
     aov = float(camera.GetInput(CAMERA_AOV) or 0.0)
     distance = camera_distance(plane_height, aov)
+    # A page as wide as the camera is distant swings through the lens. Widen
+    # the gap by lengthening the lens, which moves the camera back without
+    # changing what a resting page looks like.
+    focal_length = page_focal_length_for_clearance(
+        animation.focal_length, distance, plane_width
+    )
+    if focal_length != animation.focal_length:
+        camera.SetInput(CAMERA_FOCAL_LENGTH, focal_length)
+        aov = float(camera.GetInput(CAMERA_AOV) or 0.0)
+        distance = camera_distance(plane_height, aov)
     camera.SetInput(TRANSFORM3D_TRANSLATE_Z, distance)
 
     sign = 1.0 if animation.hinge == "right" else -1.0
     xform.SetInput(TRANSFORM3D_PIVOT_X, sign * plane_width / 2.0)
-    if animation.angle:
-        set_scalar_keyframes(comp, xform, TRANSFORM3D_ROTATE_Y, animation.angle)
+    entry_angle = page_entry_angle(plane_width, distance)
+    angle = fit_angles_to_frame(animation.angle or [], entry_angle)
+    if angle:
+        set_scalar_keyframes(comp, xform, TRANSFORM3D_ROTATE_Y, angle)
 
     return {
         "plane": plane,
@@ -869,7 +989,10 @@ def build_page_turn_graph(
         "plane_size": (plane_width, plane_height),
         "render_size": (width, height),
         "aov": aov,
+        "focal_length": focal_length,
         "camera_distance": distance,
+        "entry_angle": entry_angle,
+        "angle": angle,
     }
 
 
@@ -943,4 +1066,13 @@ __all__ = [
     "set_merge_apply_mode",
     "set_point_keyframes",
     "set_scalar_keyframes",
+    "DEFAULT_PAGE_FOCAL_LENGTH",
+    "PAGE_CAMERA_CLEARANCE",
+    "PAGE_HINGES",
+    "PageTurnAnimation",
+    "build_page_turn_graph",
+    "camera_distance",
+    "fit_angles_to_frame",
+    "page_entry_angle",
+    "page_focal_length_for_clearance",
 ]
