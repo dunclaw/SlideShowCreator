@@ -25,6 +25,7 @@ from typing import Any, List, Optional, Sequence
 from .layout import (
     SEGMENT_BODY,
     SEGMENT_HEAD,
+    SEGMENT_TAIL,
     SEGMENT_WHOLE,
     TimelineLayout,
     plan_layout,
@@ -38,6 +39,7 @@ from .transitions import (
     apply_comp_spec,
     comp_spec_for_clip,
     plan_transition,
+    wants_outgoing_on_top,
 )
 
 
@@ -272,13 +274,22 @@ def _concrete_choice(choice: TransitionChoice) -> TransitionChoice:
     )
 
 
+def _prefers_outgoing_on_top(choice: TransitionChoice) -> bool:
+    """Layout hook: does this boundary need the outgoing slide on V2?
+
+    Resolves ``auto`` first, so a layout decision and the plan built from it
+    can't disagree about which kind is actually running.
+    """
+    return wants_outgoing_on_top(_concrete_choice(choice))
+
+
 def _incoming_on_top(layout: TimelineLayout, transition_index: int) -> bool:
     """Is the incoming slide on a higher track than the outgoing one?
 
-    The split layout always says yes — that is the whole point of it — but
-    the applier derives it from the real placement rather than assuming, so
-    the two modules stay independent and any future layout that stacks
-    differently still gets correctly mirrored plans.
+    Derived from the real placement rather than from the transition, so
+    layout and planning stay independent: whichever side ``plan_layout``
+    chose to lift onto V2 is the side that gets animated, and a layout that
+    stacks differently still gets correctly mirrored plans.
     """
     try:
         outgoing = layout.segments_for_index(transition_index)[-1]
@@ -395,7 +406,12 @@ class TimelineBuilder:
         if self.respect_source_length:
             source_frames = [_source_frame_count(mpi) for mpi in media_items]
 
-        layout = plan_layout(self.project, fps=fps, source_frames=source_frames)
+        layout = plan_layout(
+            self.project,
+            fps=fps,
+            source_frames=source_frames,
+            prefers_outgoing_on_top=_prefers_outgoing_on_top,
+        )
 
         timeline = media_pool.CreateEmptyTimeline(self.project.name)
         if timeline is None:
@@ -460,9 +476,10 @@ class TimelineBuilder:
         result.transition_plans = plans
 
         for position, placed in enumerate(clips):
-            # A head carries the transition into its slide; a body (or an
-            # unsplit slide) carries the transition out of it. Nothing ever
-            # carries both, but merge_clip_plans handles that anyway.
+            # A head carries the transition into its slide and a tail the one
+            # out of it. A body carries whichever half the boundary did not
+            # lift onto V2 — which can be both, when the slide before it
+            # animates out and the slide after it animates in.
             lead_in_plan = None
             if placed.lead_in_frames > 0 and placed.index > 0:
                 lead_in_plan = plans[placed.index - 1]
@@ -506,6 +523,7 @@ __all__ = [
     "DEFAULT_TIMELINE_FPS",
     "SEGMENT_BODY",
     "SEGMENT_HEAD",
+    "SEGMENT_TAIL",
     "SEGMENT_WHOLE",
     "BuildResult",
     "TimelineBuilder",

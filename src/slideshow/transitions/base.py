@@ -274,6 +274,16 @@ class Transition(abc.ABC):
 
     KIND: ClassVar[str] = "<abstract>"
 
+    #: Does this transition animate the *outgoing* slide rather than the
+    #: incoming one? Almost all animate the incoming slide arriving over the
+    #: settled one, and the layout puts that slide on the upper track. A few
+    #: only read the other way round — a page peeling away to reveal the next
+    #: photo underneath is the outgoing slide moving, and it has to be on top
+    #: to be seen at all. Setting this makes the layout lift the outgoing
+    #: slide instead, which in turn makes :func:`plan_transition` mirror the
+    #: plan so the animation lands on the clip that is actually visible.
+    PREFERS_OUTGOING_ON_TOP: ClassVar[bool] = False
+
     @abc.abstractmethod
     def plan(
         self,
@@ -347,6 +357,20 @@ def get_transition(kind: str) -> Transition:
     return cls()
 
 
+def wants_outgoing_on_top(choice: Optional[TransitionChoice]) -> bool:
+    """Does *choice* need the outgoing slide on the upper video track?
+
+    The layout asks this per boundary to decide whether to carve a HEAD off
+    the incoming slide or a TAIL off the outgoing one. Unknown kinds, cuts
+    and unresolved ``auto`` all answer "no", so an unexpected value degrades
+    to the ordinary incoming-on-top layout rather than failing the build.
+    """
+    if choice is None or choice.is_cut():
+        return False
+    cls = _REGISTRY.get(choice.kind)
+    return bool(cls is not None and cls.PREFERS_OUTGOING_ON_TOP)
+
+
 def plan_transition(
     choice: TransitionChoice, *, fps: float = 24.0, incoming_on_top: bool = True
 ) -> TransitionPlan:
@@ -390,4 +414,5 @@ __all__ = [
     "reverse_keyframes",
     "reverse_page_turn",
     "reverse_transform",
+    "wants_outgoing_on_top",
 ]

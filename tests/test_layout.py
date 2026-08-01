@@ -18,6 +18,7 @@ from slideshow.layout import (
     MIN_VISIBLE_FRAMES,
     SEGMENT_BODY,
     SEGMENT_HEAD,
+    SEGMENT_TAIL,
     SEGMENT_WHOLE,
     UPPER_TRACK,
     PlacedClip,
@@ -407,3 +408,169 @@ def test_empty_layout_properties():
     assert layout.track_count == 1
     assert layout.total_frames == 0
     assert layout.total_seconds == 0.0
+
+
+# ------------------------------------------------------------------ #
+# Outgoing on top (TAIL segments)
+# ------------------------------------------------------------------ #
+
+
+def _outgoing_project(kinds, *, duration=2.0, frames=12):
+    """One slide per kind plus a trailing slide, each with the given kind out."""
+    items = [
+        MediaItem(path="s{0}.jpg".format(i), duration_seconds=duration)
+        for i in range(len(kinds) + 1)
+    ]
+    for item, kind in zip(items, kinds):
+        item.outgoing_transition = TransitionChoice(
+            kind=kind, duration_frames=frames
+        )
+    return SlideshowProject(name="T", items=items)
+
+
+def _by_kind(*wanted):
+    """Predicate: outgoing goes on top for exactly these transition kinds."""
+    return lambda choice: choice.kind in wanted
+
+
+def _assert_tracks_are_sane(layout):
+    """V1 is gapless and covers the timeline; V2 segments never collide."""
+    lower = sorted(
+        (c for c in layout.clips if c.track_index == LOWER_TRACK),
+        key=lambda c: c.record_frame,
+    )
+    at = 0
+    for clip in lower:
+        assert clip.record_frame == at
+        at += clip.length_frames
+    assert at == layout.total_frames
+
+    upper = sorted(
+        (c for c in layout.clips if c.track_index == UPPER_TRACK),
+        key=lambda c: c.record_frame,
+    )
+    for first, second in zip(upper, upper[1:]):
+        assert first.record_frame + first.length_frames <= second.record_frame
+
+    for clip in layout.clips:
+        assert clip.length_frames >= 1
+
+
+def test_outgoing_on_top_carves_a_tail_instead_of_a_head():
+    layout = plan_layout(
+        _outgoing_project(["page_turn_away"]),
+        fps=24.0,
+        prefers_outgoing_on_top=_by_kind("page_turn_away"),
+    )
+    body, tail = layout.segments_for_index(0)
+    assert (body.segment, body.track_index) == (SEGMENT_BODY, LOWER_TRACK)
+    assert (tail.segment, tail.track_index) == (SEGMENT_TAIL, UPPER_TRACK)
+    assert tail.length_frames == 12
+    assert tail.lead_out_frames == 12
+    # The incoming slide is not split at all — it just sits on V1 underneath.
+    (whole,) = layout.segments_for_index(1)
+    assert (whole.segment, whole.track_index) == (SEGMENT_WHOLE, LOWER_TRACK)
+    assert whole.lead_in_frames == 12
+
+
+def test_tail_starts_where_the_next_slide_does():
+    layout = plan_layout(
+        _outgoing_project(["page_turn_away"]),
+        fps=24.0,
+        prefers_outgoing_on_top=_by_kind("page_turn_away"),
+    )
+    tail = layout.segments_for_index(0)[-1]
+    following = layout.segments_for_index(1)[0]
+    assert tail.record_frame == following.record_frame
+
+
+def test_default_predicate_keeps_the_incoming_on_top_layout():
+    plain = plan_layout(_outgoing_project(["page_turn_away"] * 3), fps=24.0)
+    assert [c.segment for c in plain.clips].count(SEGMENT_TAIL) == 0
+    assert [c.segment for c in plain.clips].count(SEGMENT_HEAD) == 3
+
+
+def test_tracks_stay_sane_for_every_mix_of_sides():
+    mixes = (
+        ["dissolve"] * 4,
+        ["page_turn_away"] * 4,
+        ["dissolve", "page_turn_away", "dissolve", "page_turn_away"],
+        ["page_turn_away", "dissolve", "page_turn_away", "dissolve"],
+    )
+    for kinds in mixes:
+        layout = plan_layout(
+            _outgoing_project(kinds),
+            fps=24.0,
+            prefers_outgoing_on_top=_by_kind("page_turn_away"),
+        )
+        _assert_tracks_are_sane(layout)
+
+
+def test_total_length_does_not_depend_on_which_side_is_lifted():
+    kinds = ["dissolve", "page_turn_away", "dissolve"]
+    plain = plan_layout(_outgoing_project(kinds), fps=24.0)
+    lifted = plan_layout(
+        _outgoing_project(kinds),
+        fps=24.0,
+        prefers_outgoing_on_top=_by_kind("page_turn_away"),
+    )
+    assert lifted.total_frames == plain.total_frames
+    assert _slide_starts(lifted) == _slide_starts(plain)
+    assert _slide_lengths(lifted) == _slide_lengths(plain)
+
+
+def test_a_slide_can_be_split_at_both_ends():
+    layout = plan_layout(
+        _outgoing_project(["dissolve", "page_turn_away"]),
+        fps=24.0,
+        prefers_outgoing_on_top=_by_kind("page_turn_away"),
+    )
+    head, body, tail = layout.segments_for_index(1)
+    assert [head.segment, body.segment, tail.segment] == [
+        SEGMENT_HEAD,
+        SEGMENT_BODY,
+        SEGMENT_TAIL,
+    ]
+    assert [head.track_index, body.track_index, tail.track_index] == [
+        UPPER_TRACK,
+        LOWER_TRACK,
+        UPPER_TRACK,
+    ]
+    # The body is what is left after both overlaps are carved off, and it
+    # keeps no lead of its own — both went to the lifted segments.
+    assert body.length_frames == 48 - 12 - 12
+    assert (body.lead_in_frames, body.lead_out_frames) == (0, 0)
+
+
+def test_a_body_between_two_lifted_neighbours_carries_both_leads():
+    # Slide 1 is lifted out of on its left and into on its right, so its own
+    # V1 segment is the un-lifted half of both boundaries.
+    layout = plan_layout(
+        _outgoing_project(["page_turn_away", "dissolve"]),
+        fps=24.0,
+        prefers_outgoing_on_top=_by_kind("page_turn_away"),
+    )
+    (middle,) = layout.segments_for_index(1)
+    assert middle.segment == SEGMENT_WHOLE
+    assert (middle.lead_in_frames, middle.lead_out_frames) == (12, 12)
+
+
+def test_clamped_overlap_still_leaves_a_visible_tail_body():
+    # A short slide whose overlaps are clamped must not lose its V1 segment.
+    project = SlideshowProject(
+        name="T",
+        items=[
+            MediaItem(path="a.jpg", duration_seconds=4.0),
+            MediaItem(path="b.jpg", duration_seconds=20.0 / 24.0),
+            MediaItem(path="c.jpg", duration_seconds=4.0),
+        ],
+        default_transition=TransitionChoice(
+            kind="page_turn_away", duration_frames=18
+        ),
+    )
+    layout = plan_layout(
+        project, fps=24.0, prefers_outgoing_on_top=_by_kind("page_turn_away")
+    )
+    _assert_tracks_are_sane(layout)
+    bodies = [c for c in layout.segments_for_index(1) if c.track_index == LOWER_TRACK]
+    assert len(bodies) == 1 and bodies[0].length_frames >= MIN_VISIBLE_FRAMES

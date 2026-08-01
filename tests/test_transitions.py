@@ -23,6 +23,7 @@ from slideshow.transitions import (
     plan_transition,
     registered_kinds,
     reverse_keyframes,
+    wants_outgoing_on_top,
 )
 from slideshow.transitions.dissolves import (
     DEFAULT_BLUR_DISSOLVE_PEAK_SIZE,
@@ -941,3 +942,79 @@ class TestPageTurn:
             PageTurnAnimation(hinge="middle")
         with pytest.raises(ValueError):
             PageTurnAnimation(focal_length=0)
+
+
+# --------------------------------------------------------------------------- #
+# Which side goes on the upper track
+# --------------------------------------------------------------------------- #
+
+
+class TestWantsOutgoingOnTop:
+    def test_ordinary_transitions_want_the_incoming_on_top(self):
+        for kind in ("dissolve", "fade", "slide_left", "flip", "page_turn"):
+            choice = TransitionChoice(kind=kind, duration_frames=12)
+            assert wants_outgoing_on_top(choice) is False
+
+    def test_page_turn_away_wants_the_outgoing_on_top(self):
+        choice = TransitionChoice(kind="page_turn_away", duration_frames=12)
+        assert wants_outgoing_on_top(choice) is True
+
+    def test_cuts_and_missing_choices_answer_no(self):
+        assert wants_outgoing_on_top(None) is False
+        assert wants_outgoing_on_top(TransitionChoice(kind="none")) is False
+        assert (
+            wants_outgoing_on_top(
+                TransitionChoice(kind="dissolve", duration_frames=0)
+            )
+            is False
+        )
+
+    def test_unresolved_auto_answers_no(self):
+        # "auto" has no implementation registered, so it must degrade to the
+        # ordinary layout rather than raise. The builder resolves it first.
+        assert wants_outgoing_on_top(TransitionChoice(kind="auto")) is False
+
+
+class TestPageTurnAway:
+    def test_it_asks_for_the_outgoing_slide_on_top(self):
+        assert get_transition("page_turn_away").PREFERS_OUTGOING_ON_TOP is True
+        assert get_transition("page_turn").PREFERS_OUTGOING_ON_TOP is False
+
+    def test_it_hinges_on_the_opposite_edge_to_page_turn(self):
+        away = plan_transition(
+            TransitionChoice(kind="page_turn_away", duration_frames=36)
+        )
+        assert away.incoming.page_turn.hinge == "left"
+        toward = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=36)
+        )
+        assert toward.incoming.page_turn.hinge == "right"
+
+    def test_mirroring_moves_the_rotation_onto_the_outgoing_clip(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn_away", duration_frames=36),
+            incoming_on_top=False,
+        )
+        assert plan.incoming.page_turn is None
+        assert plan.outgoing.page_turn is not None
+
+    def test_the_mirrored_page_starts_flat_and_swings_out(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn_away", duration_frames=36),
+            incoming_on_top=False,
+        )
+        angles = plan.outgoing.page_turn.angle
+        assert angles[0][0] == 0
+        assert angles[0][1] == pytest.approx(0.0)
+        assert angles[-1][0] == 36
+        assert angles[-1][1] == pytest.approx(PAGE_START_ANGLE)
+
+    def test_hinge_is_still_overridable(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn_away",
+                duration_frames=24,
+                params={"hinge": "right"},
+            )
+        )
+        assert plan.incoming.page_turn.hinge == "right"

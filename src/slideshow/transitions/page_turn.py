@@ -1,29 +1,33 @@
-"""Page turn — the incoming photo swings in like a page being laid down.
+"""Page turns — 3D rotations about a vertical edge, like turning a page.
 
-This is a genuine 3D rotation, not the in-plane spin :mod:`flip` does. The
-incoming image becomes a texture on a ``Shape3D`` plane, hinged on one
-vertical edge, and rotates about the Y axis until it lies flat and fills the
-frame exactly. See :func:`slideshow.fusion_comps.build_page_turn_graph` for
-the node graph and the camera fit that makes "flat" mean "pixel-identical to
-the untouched photo".
+Two transitions live here. Both are genuine 3D rotations, not the in-plane
+spin :mod:`flip` does: the image becomes a texture on a ``Shape3D`` plane,
+hinged on one vertical edge, and rotates about the Y axis until it lies flat
+and fills the frame exactly. See
+:func:`slideshow.fusion_comps.build_page_turn_graph` for the node graph and
+the camera fit that makes "flat" mean "pixel-identical to the untouched
+photo".
 
-Direction
----------
+Two directions
+--------------
 
-The page hinges on its **right** edge by default, so it sweeps right-to-left
-— the way a page turns in a book read left-to-right.
+:class:`PageTurn` moves the **incoming** photo: it arrives from off to the
+right, rotates down onto the stack and comes to rest — the page you are
+turning *to* dropping into place. Hinged right, so it sweeps right-to-left,
+the way a page turns in a book read left-to-right.
 
-It is the *incoming* page that moves: it arrives from off to the right,
-rotates down onto the stack and comes to rest. The other reading — the
-outgoing page peeling away to reveal the next photo underneath — needs the
-outgoing clip on the upper track, which the split-track layout never
-produces, so it is a separate piece of work rather than a parameter here.
+:class:`PageTurnAway` moves the **outgoing** photo instead: it lifts off and
+sweeps away to the left, uncovering the next photo underneath. That needs the
+outgoing clip on the upper track, which it asks for via
+:attr:`~slideshow.transitions.base.Transition.PREFERS_OUTGOING_ON_TOP`; it is
+otherwise the same plan, mirrored in time by ``plan_transition``. Hinged
+left, so the free right edge is the one that lifts.
 
 Angles
 ------
 
-``0°`` is flat-on and fills the frame. Positive angles tip the free (left)
-edge **toward** the camera, which reads as a page being lowered onto a pile;
+``0°`` is flat-on and fills the frame. Positive angles tip the free edge
+**toward** the camera, which reads as a page being lowered onto a pile;
 negative angles tip it away, which reads as the page swinging up from below.
 Positive is the default for that reason.
 
@@ -34,7 +38,7 @@ which hides the pop-in and costs only a frame or two.
 ``params``
 ----------
 
-* ``hinge`` — ``"right"`` (default) or ``"left"``.
+* ``hinge`` — ``"right"`` or ``"left"``; defaults per transition.
 * ``angle`` — start angle in degrees (default :data:`PAGE_START_ANGLE`).
 * ``focal_length`` — camera focal length in mm. Shorter exaggerates the
   fold. Default :data:`slideshow.fusion_comps.DEFAULT_PAGE_FOCAL_LENGTH`.
@@ -42,7 +46,7 @@ which hides the pop-in and costs only a frame or two.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 from ..fusion_comps import (
     DEFAULT_PAGE_FOCAL_LENGTH,
@@ -99,6 +103,11 @@ def page_angle_keys(duration_frames: int, start_angle: float) -> List[ScalarKeyf
 class PageTurn(Transition):
     """Incoming photo rotates in about a vertical edge and lands flat."""
 
+    #: Which edge the page pivots on when ``params`` doesn't say. Hinging on
+    #: the right brings the incoming page in from the right, like the page
+    #: you are turning *to* dropping into place.
+    DEFAULT_HINGE: ClassVar[str] = "right"
+
     def plan(
         self,
         duration_frames: int,
@@ -110,9 +119,9 @@ class PageTurn(Transition):
             return TransitionPlan(kind=self.KIND, duration_frames=0)
         params = params or {}
 
-        hinge = str(params.get("hinge", "right")).lower()
+        hinge = str(params.get("hinge", self.DEFAULT_HINGE)).lower()
         if hinge not in PAGE_HINGES:
-            hinge = "right"
+            hinge = self.DEFAULT_HINGE
         try:
             start_angle = float(params.get("angle", PAGE_START_ANGLE))
         except (TypeError, ValueError):
@@ -142,4 +151,34 @@ class PageTurn(Transition):
         )
 
 
-__all__ = ["PAGE_PROFILE", "PAGE_START_ANGLE", "PageTurn", "page_angle_keys"]
+@register("page_turn_away")
+class PageTurnAway(PageTurn):
+    """Outgoing photo peels away, revealing the next one underneath.
+
+    The other reading of a page turn, and the one that needs the *outgoing*
+    slide on the upper track — a page lifting off the stack has to be above
+    the photo it uncovers. :attr:`PREFERS_OUTGOING_ON_TOP` tells the layout
+    to lift it, and :func:`~slideshow.transitions.base.plan_transition` then
+    mirrors this plan so the rotation lands on the clip that moves.
+
+    Planned identically to :class:`PageTurn` and mirrored into place, rather
+    than written out backwards here, so the two stay in step: any change to
+    the arc, the lens or the resting angle applies to both.
+    """
+
+    PREFERS_OUTGOING_ON_TOP = True
+
+    #: Hinged on the *left*, so the free right edge lifts and sweeps left
+    #: over the spine — a page being turned right-to-left, the way a book is
+    #: read. (:class:`PageTurn` hinges right because it is the page landing,
+    #: not the page leaving.)
+    DEFAULT_HINGE = "left"
+
+
+__all__ = [
+    "PAGE_PROFILE",
+    "PAGE_START_ANGLE",
+    "PageTurn",
+    "PageTurnAway",
+    "page_angle_keys",
+]

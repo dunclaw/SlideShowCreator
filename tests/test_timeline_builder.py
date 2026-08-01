@@ -564,3 +564,89 @@ def test_unreadable_clip_properties_are_treated_as_unbounded():
     broken = MagicMock()
     broken.GetClipProperty.side_effect = Exception("PyRemoteObject says no")
     assert tb._source_frame_count(broken) is None
+
+
+# --------------------------------------------------------------------------- #
+# Outgoing-on-top transitions
+# --------------------------------------------------------------------------- #
+
+
+def test_outgoing_on_top_transitions_lift_the_departing_slide():
+    ctx, project, mp, _new, _tl = _wire_mock_context()
+    _serve_one_at_a_time(mp, _mock_media(["s0.jpg", "s1.jpg", "s2.jpg"]))
+
+    result = tb.TimelineBuilder(
+        _overlap_project(kind="page_turn_away", frames=24), context=ctx
+    ).build()
+
+    segments = [(c.index, c.segment, c.track_index) for c in result.layout.clips]
+    assert segments == [
+        (0, tb.SEGMENT_BODY, 1),
+        (0, tb.SEGMENT_TAIL, 2),
+        (1, tb.SEGMENT_BODY, 1),
+        (1, tb.SEGMENT_TAIL, 2),
+        (2, tb.SEGMENT_WHOLE, 1),
+    ]
+
+
+def test_the_lifted_outgoing_clip_is_the_one_that_gets_the_comp():
+    ctx, project, mp, _new, _tl = _wire_mock_context()
+    _serve_one_at_a_time(mp, _mock_media(["s0.jpg", "s1.jpg", "s2.jpg"]))
+
+    result = tb.TimelineBuilder(
+        _overlap_project(kind="page_turn_away", frames=24), context=ctx
+    ).build()
+
+    # Both plans are mirrored, so the rotation lands on the outgoing half...
+    assert result.comps_applied == 2
+    for plan in result.transition_plans:
+        assert plan.incoming.is_empty()
+        assert plan.outgoing.page_turn is not None
+
+    # ...and the only clips carrying a comp are the two V2 tails.
+    for position, placed in enumerate(result.layout.clips):
+        item = result.timeline_items[position]
+        if placed.segment == tb.SEGMENT_TAIL:
+            item.LoadFusionCompByName.assert_called()
+        else:
+            item.LoadFusionCompByName.assert_not_called()
+
+
+def test_v1_stays_gapless_when_sides_are_mixed():
+    ctx, project, mp, _new, _tl = _wire_mock_context()
+    _serve_one_at_a_time(mp, _mock_media(["s0.jpg", "s1.jpg", "s2.jpg"]))
+
+    proj = _overlap_project(kind="dissolve", frames=24)
+    proj.items[0].outgoing_transition = TransitionChoice(
+        kind="page_turn_away", duration_frames=24
+    )
+    result = tb.TimelineBuilder(proj, context=ctx).build()
+
+    lower = sorted(
+        (c for c in result.layout.clips if c.track_index == 1),
+        key=lambda c: c.record_frame,
+    )
+    at = 0
+    for clip in lower:
+        assert clip.record_frame == at
+        at += clip.length_frames
+    assert at == result.layout.total_frames
+    # Slide 1 is uncovered on its left and covered on its right, so it stays
+    # whole while carrying both leads.
+    (middle,) = result.layout.segments_for_index(1)
+    assert middle.segment == tb.SEGMENT_WHOLE
+    assert (middle.lead_in_frames, middle.lead_out_frames) == (24, 24)
+
+
+def test_auto_is_resolved_before_the_layout_decides_which_side_to_lift():
+    ctx, project, mp, _new, _tl = _wire_mock_context()
+    _serve_one_at_a_time(mp, _mock_media(["s0.jpg", "s1.jpg"]))
+
+    # AUTO_FALLBACK_KIND is an ordinary incoming-on-top transition, so an
+    # auto boundary must produce a head, never a tail.
+    result = tb.TimelineBuilder(
+        _overlap_project(count=2, kind="auto", frames=24), context=ctx
+    ).build()
+
+    assert [c.segment for c in result.layout.clips].count(tb.SEGMENT_TAIL) == 0
+    assert [c.segment for c in result.layout.clips].count(tb.SEGMENT_HEAD) == 1

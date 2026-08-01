@@ -41,6 +41,7 @@ from .base import (
     reverse_clip_plan,
     reverse_keyframes,
     reverse_transform,
+    wants_outgoing_on_top,
 )
 
 # Eagerly import every implementation module so their @register decorators
@@ -84,4 +85,5 @@ __all__ = [
     "reverse_clip_plan",
     "reverse_keyframes",
     "reverse_transform",
+    "wants_outgoing_on_top",
 ]

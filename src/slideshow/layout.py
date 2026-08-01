@@ -6,8 +6,8 @@ arithmetic that makes transitions possible is fully unit-testable.
 Layout model
 ------------
 
-Every slide is split into up to two timeline clips, cut at the frame the
-*previous* slide ends::
+Every slide is split into up to three timeline clips, cut at the frames where
+its transitions start and end::
 
             slide 0        slide 1        slide 2        slide 3
     V2                     ┌────┐         ┌────┐         ┌────┐
@@ -16,32 +16,55 @@ Every slide is split into up to two timeline clips, cut at the frame the
                            ^^^^^^         ^^^^^^
                            overlap = transition duration
 
-* The **head** sits on V2 and covers exactly the incoming overlap — the
-  window in which the transition animates.
+* The **head** sits on V2 and covers the incoming overlap — the window in
+  which the transition animates.
 * The **body** sits on V1 and covers the rest of the slide.
-* Slide 0 has no incoming transition, so it is a single V1 clip.
+* The **tail** sits on V2 and covers the outgoing overlap. See below.
+* A slide with neither is a single ``WHOLE`` clip on V1.
 
-Two properties fall out of cutting at the previous slide's end frame, and
-both matter:
+Two properties fall out of cutting at the overlap boundaries, and both
+matter:
 
 1. **V1 is contiguous** — bodies butt up end-to-end with no gaps and no
    collisions, because a slide's body starts exactly where its predecessor
    finishes.
-2. **The incoming clip is always on top.** Alternating V1/V2 could not
-   manage that — the incoming slide landed underneath for every other
-   transition, where animating it is invisible and renders as a hard cut.
-   Here every slide animates in over the settled one below it.
+2. **Whichever slide the transition animates is the one on top.**
+   Alternating V1/V2 could not manage that — the incoming slide landed
+   underneath for every other transition, where animating it is invisible
+   and renders as a hard cut.
 
-The outgoing half of a transition (``push``, ``flip``, ``blur_dissolve``…)
-animates the *previous* slide, which during the overlap is the tail of that
-slide's V1 body — so two-sided transitions still work.
+Which side goes on top
+----------------------
 
-The split frame is one where the slide is static and fully opaque (its
-incoming animation has just finished), so the cut is invisible.
+Most transitions animate the *incoming* slide over the settled one below, so
+the default is a head on V2. But some only work the other way round: a page
+peeling away to reveal the next photo underneath has to be the *outgoing*
+slide that moves, and it has to be on top to be seen at all.
+
+So each boundary puts exactly one of the two slides on V2:
+
+* **incoming on top** (default) — the next slide gets a HEAD.
+* **outgoing on top** — the previous slide gets a TAIL, and the next slide
+  starts on V1 at the overlap, unsplit at that end.
+
+``plan_layout``'s ``prefers_outgoing_on_top`` predicate decides per boundary;
+:func:`slideshow.transitions.wants_outgoing_on_top` is the implementation the
+builder passes in. Layout stays ignorant of what any given transition does —
+it just needs to know which side moves.
+
+Either way the arithmetic holds: exactly ``overlap`` frames of one slide sit
+on V2 above the other, so V1 stays contiguous and V2 never collides with
+itself. A slide can be split at both ends (TAIL from the boundary before it
+puts *it* on V1 through the overlap, HEAD from the boundary after it), which
+is why a body can carry both a lead-in and a lead-out.
+
+The split frames are ones where the slide is static and fully opaque (its
+incoming animation has just finished, or its outgoing one has yet to start),
+so the cuts are invisible.
 
 A consequence of the split is that ``TimelineLayout.clips`` holds
-*segments*, not slides: two entries can share the same ``index``. Use
-:meth:`TimelineLayout.segments_for_index` to get both.
+*segments*, not slides: up to three entries can share the same ``index``. Use
+:meth:`TimelineLayout.segments_for_index` to get them all.
 
 Durations
 ---------
@@ -61,9 +84,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from .project_model import SlideshowProject, TransitionChoice
+
+
+#: Asked, per boundary, whether that transition animates the outgoing slide
+#: rather than the incoming one.
+OutgoingOnTopPredicate = Callable[[TransitionChoice], bool]
 
 
 #: Frame rate assumed when Resolve doesn't tell us otherwise.
@@ -78,12 +106,13 @@ MIN_VISIBLE_FRAMES = 1
 LOWER_TRACK = 1
 UPPER_TRACK = 2
 
-#: ``PlacedClip.segment`` values. A slide with no incoming transition is a
-#: single ``WHOLE`` clip; otherwise it is split into a ``HEAD`` (on V2,
-#: covering the overlap it animates through) and a ``BODY`` (on V1).
+#: ``PlacedClip.segment`` values. A slide with no overlap on either side is
+#: a single ``WHOLE`` clip. Otherwise it is cut into a ``BODY`` on V1 plus a
+#: ``HEAD`` and/or ``TAIL`` on V2 covering the overlaps it animates through.
 SEGMENT_WHOLE = "whole"
 SEGMENT_HEAD = "head"
 SEGMENT_BODY = "body"
+SEGMENT_TAIL = "tail"
 
 
 def seconds_to_frames(seconds: float, fps: float) -> int:
@@ -99,10 +128,10 @@ def seconds_to_frames(seconds: float, fps: float) -> int:
 class PlacedClip:
     """One timeline clip: a whole slide, or one half of a split slide.
 
-    * ``index``              — index into ``SlideshowProject.items``. Two
+    * ``index``              — index into ``SlideshowProject.items``. All
       segments of the same slide share it.
-    * ``segment``            — :data:`SEGMENT_WHOLE`, :data:`SEGMENT_HEAD`
-      or :data:`SEGMENT_BODY`.
+    * ``segment``            — :data:`SEGMENT_WHOLE`, :data:`SEGMENT_HEAD`,
+      :data:`SEGMENT_BODY` or :data:`SEGMENT_TAIL`.
     * ``track_index``        — 1-based video track (V1 = 1).
     * ``record_frame``       — timeline frame the clip starts on.
     * ``length_frames``      — how many frames the clip occupies.
@@ -110,10 +139,12 @@ class PlacedClip:
       handed to ``AppendToTimeline``.
     * ``lead_in_frames``     — frames shared with the *previous* slide; the
       transition into this clip animates over ``[0, lead_in_frames]`` in
-      clip-local coordinates. Only ever set on a HEAD.
+      clip-local coordinates. Set on a HEAD, or on a BODY whose incoming
+      transition put the *outgoing* slide on top instead.
     * ``lead_out_frames``    — frames shared with the *next* slide; that
       transition animates over ``[length_frames - lead_out_frames,
-      length_frames]``. Only ever set on a BODY or WHOLE.
+      length_frames]``. Set on a TAIL, or on a BODY / WHOLE whose outgoing
+      transition put the *incoming* slide on top.
     """
 
     index: int
@@ -140,9 +171,9 @@ class PlacedClip:
     def visible_frames(self) -> int:
         """Frames during which this *segment* is the only thing on screen.
 
-        Zero for a HEAD, which is entirely overlap by construction. For a
-        whole-slide figure, sum the segments and use the slide's lead-in and
-        lead-out.
+        Zero for a HEAD or a TAIL, which are entirely overlap by
+        construction. For a whole-slide figure, sum the segments and use the
+        slide's lead-in and lead-out.
         """
         return self.length_frames - self.lead_in_frames - self.lead_out_frames
 
@@ -217,8 +248,8 @@ class TimelineLayout:
     def clip_for_index(self, index: int) -> PlacedClip:
         """The first segment for ``items[index]``.
 
-        That is the HEAD when the slide is split — the piece that carries
-        the transition into it.
+        That is the HEAD when the slide has one — the piece that carries the
+        transition into it — and otherwise the BODY (or WHOLE).
         """
         return self.segments_for_index(index)[0]
 
@@ -291,6 +322,7 @@ def plan_layout(
     *,
     fps: float = DEFAULT_FPS,
     source_frames: Optional[Sequence[Optional[int]]] = None,
+    prefers_outgoing_on_top: Optional[OutgoingOnTopPredicate] = None,
 ) -> TimelineLayout:
     """Compute where every clip lands and how long each overlap really is.
 
@@ -299,6 +331,12 @@ def plan_layout(
       frames (``None`` for "unbounded", which is the right answer for
       still images). A clip is never asked to play more frames than its
       source has.
+    * ``prefers_outgoing_on_top`` — predicate asked, per boundary, whether
+      that transition animates the *outgoing* slide rather than the incoming
+      one; those boundaries get a TAIL instead of a HEAD. Defaults to "no"
+      for every transition, which is the historic incoming-on-top layout.
+      :func:`slideshow.transitions.wants_outgoing_on_top` is what the builder
+      passes.
 
     Raises :class:`ValueError` for an empty project.
     """
@@ -337,55 +375,82 @@ def plan_layout(
     ]
 
     clips: List[PlacedClip] = []
+    # Which side of each boundary goes on the upper track. Exactly one slide
+    # per boundary is lifted onto V2, which is what keeps V1 contiguous.
+    outgoing_on_top = [
+        bool(d > 0 and prefers_outgoing_on_top is not None
+             and prefers_outgoing_on_top(choice))
+        for choice, d in zip(transitions, overlaps)
+    ]
+
     record_frame = 0
     for i, length in enumerate(lengths):
         lead_in = overlaps[i - 1] if i > 0 else 0
         lead_out = overlaps[i] if i < len(overlaps) else 0
 
-        if lead_in > 0:
-            # Head: the overlap window, on V2, animating in over the
-            # previous slide's body which is still running underneath.
+        # A head only exists when the boundary before this slide put the
+        # incoming side on top; a tail only when the boundary after it put
+        # the outgoing side on top. Whatever isn't carved off stays with the
+        # body, which is why the body can end up carrying a lead-in.
+        head_frames = 0 if i == 0 or outgoing_on_top[i - 1] else lead_in
+        tail_frames = lead_out if (
+            i < len(overlaps) and outgoing_on_top[i]
+        ) else 0
+        body_length = length - head_frames - tail_frames
+
+        if head_frames > 0:
+            # The overlap window, on V2, animating in over the previous
+            # slide's body which is still running underneath.
             clips.append(
                 PlacedClip(
                     index=i,
                     segment=SEGMENT_HEAD,
                     track_index=UPPER_TRACK,
                     record_frame=record_frame,
-                    length_frames=lead_in,
+                    length_frames=head_frames,
                     source_start_frame=0,
-                    source_end_frame=lead_in - 1,
-                    lead_in_frames=lead_in,
+                    source_end_frame=head_frames - 1,
+                    lead_in_frames=head_frames,
                 )
             )
-            # Body: everything after the transition has landed, on V1. It
-            # starts exactly where the previous slide ends, which keeps V1
-            # contiguous and makes the cut fall on a static, opaque frame.
-            body_length = length - lead_in
+
+        # The settled part of the slide, on V1. It starts exactly where the
+        # previous slide's V1 part ends, which keeps V1 contiguous and makes
+        # every cut fall on a static, opaque frame.
+        clips.append(
+            PlacedClip(
+                index=i,
+                segment=(
+                    SEGMENT_WHOLE
+                    if head_frames == 0 and tail_frames == 0
+                    else SEGMENT_BODY
+                ),
+                track_index=LOWER_TRACK,
+                record_frame=record_frame + head_frames,
+                length_frames=body_length,
+                source_start_frame=0,
+                source_end_frame=body_length - 1,
+                lead_in_frames=lead_in - head_frames,
+                lead_out_frames=lead_out - tail_frames,
+            )
+        )
+
+        if tail_frames > 0:
+            # This slide is the one that animates out, so it has to be above
+            # the next slide rather than under it.
             clips.append(
                 PlacedClip(
                     index=i,
-                    segment=SEGMENT_BODY,
-                    track_index=LOWER_TRACK,
-                    record_frame=record_frame + lead_in,
-                    length_frames=body_length,
+                    segment=SEGMENT_TAIL,
+                    track_index=UPPER_TRACK,
+                    record_frame=record_frame + length - tail_frames,
+                    length_frames=tail_frames,
                     source_start_frame=0,
-                    source_end_frame=body_length - 1,
-                    lead_out_frames=lead_out,
+                    source_end_frame=tail_frames - 1,
+                    lead_out_frames=tail_frames,
                 )
             )
-        else:
-            clips.append(
-                PlacedClip(
-                    index=i,
-                    segment=SEGMENT_WHOLE,
-                    track_index=LOWER_TRACK,
-                    record_frame=record_frame,
-                    length_frames=length,
-                    source_start_frame=0,
-                    source_end_frame=length - 1,
-                    lead_out_frames=lead_out,
-                )
-            )
+
         record_frame += length - lead_out
 
     return TimelineLayout(fps=fps, clips=clips, transitions=transitions)
@@ -397,7 +462,9 @@ __all__ = [
     "MIN_VISIBLE_FRAMES",
     "SEGMENT_BODY",
     "SEGMENT_HEAD",
+    "SEGMENT_TAIL",
     "SEGMENT_WHOLE",
+    "OutgoingOnTopPredicate",
     "PlacedClip",
     "TimelineLayout",
     "UPPER_TRACK",

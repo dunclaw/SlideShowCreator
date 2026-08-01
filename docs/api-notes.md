@@ -79,15 +79,17 @@ V2 clip with a Fusion comp.
 
 ### The split-track layout (implemented in `slideshow.layout`)
 
-Every slide except the first is cut into **two timeline clips**:
+At each boundary between two slides, exactly **one** of them is lifted onto
+**V2** for the length of the overlap, and the other stays on **V1**. That
+splits a slide into up to three segments:
 
-- a **head** on **V2**, exactly as long as the incoming transition, sitting
-  over the tail of the previous slide;
-- a **body** on **V1**, holding the rest, starting at the frame the previous
-  slide ends.
+- a **head** on **V2** — the incoming transition window, sitting over the
+  previous slide;
+- a **body** on **V1** — the settled middle;
+- a **tail** on **V2** — the outgoing transition window, sitting over the
+  next slide.
 
-Slide 0 (and any slide with no incoming transition) is a single whole clip on
-V1.
+A slide with neither a head nor a tail is a single **whole** clip on V1.
 
 ```
 V2          ┌────┐          ┌────┐          ┌────┐
@@ -98,26 +100,48 @@ V1  ┌───────┴────┼──────────┴�
 
 Why this shape rather than alternating slides V1/V2/V1/…:
 
-- **The incoming slide is always on top.** Almost every transition animates
-  the incoming side, so under an alternating layout half the slides animated
-  *underneath* an opaque clip and rendered as hard cuts.
+- **The animated slide is always on top.** Under an alternating layout half
+  the slides animated *underneath* an opaque clip and rendered as hard cuts.
 - **V1 is contiguous end to end**, so there is never a gap or a hole to see
   through.
-- **The head/body cut is invisible.** It lands on the frame where the
-  transition finishes — the image is static and fully opaque there.
+- **Every segment cut is invisible.** It lands on a frame where the image is
+  static and fully opaque.
 - With no transitions at all, every slide is a single V1 clip and the result
   is identical to the old flat layout.
 
+#### Which side gets lifted
+
+Almost every transition animates the **incoming** slide arriving over the
+settled one, so the default is to carve a head off the incoming slide. A few
+only read the other way round — `page_turn_away`, where a page peels off to
+reveal the next photo, is the outgoing slide moving, and it has to be above
+the photo it uncovers. Those set
+`Transition.PREFERS_OUTGOING_ON_TOP = True`; `plan_layout` asks per boundary
+via its `prefers_outgoing_on_top` predicate (the builder passes
+`transitions.wants_outgoing_on_top`, composed with its `auto` resolution so
+the layout and the plan can't disagree about which kind is running) and
+carves a tail off the outgoing slide instead.
+
+Nothing downstream needs to know which happened:
+
+- `timeline_builder._incoming_on_top` compares the two segments' real track
+  indices, so a tail boundary reports `False` and `plan_transition` mirrors
+  the plan automatically — the animation always lands on the lifted clip.
+- The applier keys purely off `lead_in_frames` / `lead_out_frames`, which the
+  layout moves onto whichever segment ended up owning each half.
+
+Contiguity survives because each boundary assigns its whole overlap to
+exactly one side: `head_next + tail_prev == overlap`, always.
+
 Two consequences worth remembering:
 
-- A head carries only a lead-**in** and a body only a lead-**out**, so no
-  segment ever needs two plans merged. `transitions.applier.merge_clip_plans`
-  still handles the two-sided case, because a layout that doesn't split (or a
-  future one that stacks differently) can still produce it.
+- A **body can carry both** a lead-in and a lead-out — when the slide before
+  it animates out *and* the slide after it animates in, both halves stay on
+  V1. `transitions.applier.merge_clip_plans` handles that.
 - Overlaps must be clamped so a slide's two transitions never meet in the
   middle. `slideshow.layout` shrinks them proportionally until every slide
   keeps at least one frame to itself — which also guarantees a body is never
-  shorter than its outgoing overlap.
+  shorter than one frame, whichever ends get carved off it.
 
 `TimelineLayout.clips` therefore holds *segments*, not slides: use
 `segments_for_index(i)` / `clip_for_index(i)`, and `BuildResult.items_for_index(i)`
@@ -443,6 +467,8 @@ Other 3D notes:
 - **Turn off `SurfacePlaneInputs.Lighting.IsAffectedByLights`.** With no lights in the scene the renderer otherwise darkens the photo.
 - Rotating about Y with the pivot on a vertical edge gives a door-style swing. Positive angles tip the free edge *toward* the camera (reads as a page being laid down); negative tips it away (reads as swinging up from below).
 - Scene geometry is wired with `SceneInput` / `SceneInput1` / `SceneInput2`, not `Input`; the image goes into `Shape3D.MaterialInput`.
+- The angle must rest at **exactly 0.0 on the final frame**. The next frame is a different timeline clip showing the untouched photo, so any residual rotation reads as a jump.
+- Two transitions use this graph, differing only in which slide moves: `page_turn` rotates the **incoming** photo in (hinged right), and `page_turn_away` rotates the **outgoing** photo out (hinged left, so the free right edge lifts and sweeps left over the spine). The latter is the only transition that needs the outgoing clip on the upper track — see *The split-track layout* above.
 
 ## Bridge gotchas
 
