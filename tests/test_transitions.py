@@ -306,6 +306,58 @@ class TestDipToColor:
         assert plan.incoming.blend == [(0, 0.0), (1, 1.0)]
 
 
+class TestDipToImageColor:
+    def test_it_dips_through_the_picture_rather_than_a_fixed_colour(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_image_color", duration_frames=24)
+        )
+        assert plan.kind == "dip_to_image_color"
+        assert plan.incoming.background_from_image is True
+        assert plan.outgoing.is_empty()
+
+    def test_its_timing_is_identical_to_a_plain_dip(self):
+        image = plan_transition(
+            TransitionChoice(kind="dip_to_image_color", duration_frames=24)
+        )
+        fixed = plan_transition(
+            TransitionChoice(kind="dip_to_color", duration_frames=24)
+        )
+        assert image.incoming.blend == fixed.incoming.blend
+        assert image.incoming.color_blend == fixed.incoming.color_blend
+
+    def test_a_fixed_colour_is_carried_as_the_fallback(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="dip_to_image_color",
+                duration_frames=24,
+                params={"color": (1.0, 0.0, 0.0)},
+            )
+        )
+        assert plan.incoming.background_color == (1.0, 0.0, 0.0)
+
+    def test_the_plain_dip_does_not_sample_the_picture(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_color", duration_frames=24)
+        )
+        assert plan.incoming.background_from_image is False
+
+    def test_mirroring_carries_the_sampling_flag_onto_the_outgoing_clip(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_image_color", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert plan.incoming.is_empty()
+        assert plan.outgoing.background_from_image is True
+
+    def test_too_short_to_dip_degrades_to_a_crossfade_without_sampling(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_image_color", duration_frames=1)
+        )
+        assert plan.incoming.background_from_image is False
+        assert plan.incoming.background_color is None
+        assert plan.incoming.blend == [(0, 0.0), (1, 1.0)]
+
+
 class TestFades:
     def test_fade_dips_through_black(self):
         plan = plan_transition(TransitionChoice(kind="fade", duration_frames=24))

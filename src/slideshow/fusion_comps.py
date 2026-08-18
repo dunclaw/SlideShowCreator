@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 
 # --------------------------------------------------------------------------- #
@@ -60,12 +60,41 @@ DEFAULT_MERGE_NAME = "SlideShowMerge"
 DEFAULT_COLOR_BACKGROUND_NAME = "SlideShowDipBg"
 DEFAULT_COLOR_MERGE_NAME = "SlideShowDipMerge"
 
+#: The three tools of the average-colour chain, which stands in for the
+#: solid Background when a dip takes its colour from the picture itself.
+DEFAULT_AVERAGE_DOWN_NAME = "SlideShowAvgDown"
+DEFAULT_AVERAGE_UP_NAME = "SlideShowAvgUp"
+DEFAULT_AVERAGE_COLOR_NAME = "SlideShowAvgColor"
+
 #: Fusion tool IDs. ``Blur`` is a native Fusion tool, but there is **no**
 #: native pixelate tool — ``comp.AddTool("Pixelate")`` returns ``None``. The
 #: effect is only available as a ResolveFX OFX plugin, addressed by its full
 #: reverse-DNS ID. Verified against Resolve Studio 20.3.3.
 BLUR_TOOL = "Blur"
 PIXELATE_TOOL = "ofx.com.blackmagicdesign.resolvefx.MosaicBlur"
+
+#: Fusion's resize tool. The plain ``Resize`` ID does *not* exist in Resolve
+#: 20.3.3 — ``comp.AddTool("Resize")`` returns ``None``; the tool is
+#: registered as ``BetterResize``.
+RESIZE_TOOL = "BetterResize"
+
+#: Saturation and gamma applied to a photo's average colour before it is used
+#: as a dip background.
+#:
+#: Averaging a whole photograph down to one pixel is a doubly destructive
+#: operation. It is strongly *desaturating* — mixing every hue in the frame
+#: together pulls the result toward grey — and it inherits the picture's
+#: overall exposure, so a dim indoor shot averages to a murky near-black.
+#: Left raw it produces exactly the "odd wash of grey" that the fixed mid-grey
+#: dip suffers from, only darker.
+#:
+#: So we keep the *hue* the average identified and throw away its exposure.
+#: Saturation pushes the surviving colour cast back up to something you can
+#: actually name, and the gamma lift normalises brightness: it raises a dark
+#: average a long way and a bright one barely at all, so every photo dips to a
+#: comparably lit tint instead of the dip's brightness varying with the slide.
+IMAGE_COLOR_SATURATION = 2.5
+IMAGE_COLOR_GAMMA = 2.2
 
 #: Fusion input names for the scalar "amount" of each effect tool.
 #: ``Blur`` locks X to Y by default, so driving ``XBlurSize`` animates both
@@ -605,6 +634,68 @@ def add_background(
     return tool
 
 
+def add_image_average(
+    comp: Any,
+    source: Any,
+    *,
+    saturation: float = IMAGE_COLOR_SATURATION,
+    gamma: float = IMAGE_COLOR_GAMMA,
+    position: Tuple[int, int] = (0, 3),
+) -> Dict[str, Any]:
+    """Build a full-frame flat field of *source*'s average colour.
+
+    Used in place of :func:`add_background` when a dip should wash through
+    the picture's own colour rather than a fixed one. Three tools::
+
+        source ─> BetterResize(1x1) ─> BetterResize(frame) ─> BrightnessContrast
+
+    Collapsing the image to a single pixel *is* the averaging step — a
+    downscale that extreme has to combine every source pixel into the one
+    output pixel — and scaling that pixel back up gives a flat field of the
+    result. Doing it this way means we never have to decode the image in
+    Python: the plug-in has to run under Resolve's bundled interpreter with
+    the standard library only, so it has no way to read a JPEG, and Fusion
+    is holding the decoded pixels anyway.
+
+    The average is deliberately taken from the *raw* image rather than from
+    the end of the 2D chain, so a transition that scales or moves the photo
+    doesn't make the dip colour drift while it plays.
+
+    Returns the three tools keyed ``down`` / ``up`` / ``tint``; ``tint`` is
+    the one to composite against.
+    """
+    x, y = position
+
+    down = find_or_add_tool(
+        comp, RESIZE_TOOL, DEFAULT_AVERAGE_DOWN_NAME, position=(x, y)
+    )
+    # KeepAspect would quietly refuse the 1x1 request on a non-square frame,
+    # and UseFrameFormatSettings would override Width/Height outright.
+    down.SetInput("UseFrameFormatSettings", 0.0)
+    down.SetInput("KeepAspect", 0.0)
+    down.SetInput("Width", 1.0)
+    down.SetInput("Height", 1.0)
+    connect(source, down, "Input")
+
+    up = find_or_add_tool(
+        comp, RESIZE_TOOL, DEFAULT_AVERAGE_UP_NAME, position=(x + 1, y)
+    )
+    # Back to the comp's own frame format, so the Merge below gets a
+    # background the same size as the foreground it has to cover.
+    up.SetInput("KeepAspect", 0.0)
+    up.SetInput("UseFrameFormatSettings", 1.0)
+    connect(down, up, "Input")
+
+    tint = find_or_add_tool(
+        comp, "BrightnessContrast", DEFAULT_AVERAGE_COLOR_NAME, position=(x + 2, y)
+    )
+    tint.SetInput("Saturation", float(saturation))
+    tint.SetInput("Gamma", float(gamma))
+    connect(up, tint, "Input")
+
+    return {"down": down, "up": up, "tint": tint}
+
+
 def add_merge(
     comp: Any,
     *,
@@ -1028,6 +1119,9 @@ __all__ = [
     "BLUR_SIZE_INPUT",
     "BLUR_TOOL",
     "DEFAULT_BACKGROUND_NAME",
+    "DEFAULT_AVERAGE_COLOR_NAME",
+    "DEFAULT_AVERAGE_DOWN_NAME",
+    "DEFAULT_AVERAGE_UP_NAME",
     "DEFAULT_COLOR_BACKGROUND_NAME",
     "DEFAULT_COLOR_MERGE_NAME",
     "DEFAULT_BLUR_NAME",
@@ -1035,6 +1129,9 @@ __all__ = [
     "DEFAULT_PIXELATE_NAME",
     "DEFAULT_TRANSFORM_NAME",
     "MERGE_APPLY_MODES",
+    "IMAGE_COLOR_GAMMA",
+    "IMAGE_COLOR_SATURATION",
+    "RESIZE_TOOL",
     "PIXELATE_SIZE_INPUT",
     "PIXELATE_TOOL",
     "PIXELATE_REFERENCE_WIDTH",
@@ -1047,6 +1144,7 @@ __all__ = [
     "TransformAnimation",
     "add_background",
     "add_blur",
+    "add_image_average",
     "add_merge",
     "add_pixelate",
     "apply_transform_animation",

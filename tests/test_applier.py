@@ -34,7 +34,13 @@ from slideshow.transitions.applier import (
     merge_clip_plans,
 )
 from slideshow.transitions.base import ClipPlan, TransitionPlan
-from slideshow.fusion_comps import PIXELATE_TOOL, TransformAnimation
+from slideshow.fusion_comps import (
+    IMAGE_COLOR_GAMMA,
+    IMAGE_COLOR_SATURATION,
+    PIXELATE_TOOL,
+    RESIZE_TOOL,
+    TransformAnimation,
+)
 from slideshow.project_model import TransitionChoice
 from tests.fusion_fakes import FAKE_TOOL_DEFAULTS, fake_get_input
 
@@ -384,6 +390,116 @@ def test_background_colour_inserts_a_dip_merge_under_the_opacity_merge():
     assert built["background"].inputs["TopLeftAlpha"] == 0.0
     assert built["merge"].connections["Foreground"] == "Merge-out"
     assert comp.tools["MediaOut1"].connections["Input"] == "Merge-out"
+
+
+def _image_dip_spec(**kwargs):
+    base = dict(
+        length_frames=50,
+        background_color=(0.0, 0.0, 0.0),
+        background_from_image=True,
+        color_blend=[(0, 0.0), (10, 0.0), (20, 1.0)],
+        blend=[(0, 0.0), (10, 1.0)],
+    )
+    base.update(kwargs)
+    return CompSpec(**base)
+
+
+def test_an_image_dip_averages_the_photo_down_to_a_single_pixel():
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _image_dip_spec())
+
+    down = built["average_down"]
+    assert down.inputs["Width"] == 1.0
+    assert down.inputs["Height"] == 1.0
+    # Either of these would quietly override the 1x1 request.
+    assert down.inputs["KeepAspect"] == 0.0
+    assert down.inputs["UseFrameFormatSettings"] == 0.0
+
+
+def test_the_average_is_taken_from_the_raw_image_not_the_animated_chain():
+    comp = _FakeComp()
+    spec = _image_dip_spec(
+        transform=TransformAnimation(center=[(0, (0.0, 0.5)), (20, (0.5, 0.5))]),
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    # Sampling downstream of the Transform would let the dip colour drift
+    # as the photo slides across the frame.
+    assert built["average_down"].connections["Input"] == "MediaIn1-out"
+
+
+def test_the_flat_field_is_scaled_back_up_to_the_comp_frame_format():
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _image_dip_spec())
+
+    up = built["average_up"]
+    assert up.connections["Input"] == "BetterResize-out"
+    assert up.inputs["UseFrameFormatSettings"] == 1.0
+
+
+def test_the_average_colour_is_saturated_and_brightness_normalised():
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _image_dip_spec())
+
+    tint = built["average_color"]
+    assert tint.inputs["Saturation"] == IMAGE_COLOR_SATURATION
+    assert tint.inputs["Gamma"] == IMAGE_COLOR_GAMMA
+    # Averaging a whole photo both desaturates it and inherits its exposure,
+    # so pushing colour back up and lifting brightness is the entire point of
+    # this tool being in the chain.
+    assert IMAGE_COLOR_SATURATION > 1.0
+    assert IMAGE_COLOR_GAMMA > 1.0
+
+
+def test_an_image_dip_composites_against_the_average_instead_of_a_background():
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _image_dip_spec())
+
+    assert built["color_background"] is built["average_color"]
+    assert "BrightnessContrast" in comp.added
+    # The solid-colour Background is for the fixed dip only.
+    assert built["color_merge"].connections["Background"] == "BrightnessContrast-out"
+    assert built["color_merge"].connections["Foreground"] == "Transform-out"
+
+
+def test_an_image_dip_still_ends_up_under_the_opacity_merge():
+    comp = _FakeComp()
+
+    built = build_comp_graph(comp, _image_dip_spec())
+
+    assert built["merge"].connections["Foreground"] == "Merge-out"
+    assert comp.tools["MediaOut1"].connections["Input"] == "Merge-out"
+
+
+def test_a_fixed_dip_builds_no_averaging_tools():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        background_color=(0.5, 0.5, 0.5),
+        blend=[(0, 0.0), (10, 1.0)],
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    assert "average_down" not in built
+    assert RESIZE_TOOL not in comp.added
+    assert built["color_background"].inputs["TopLeftRed"] == 0.5
+
+
+def test_an_image_dip_is_rebuilt_in_place_rather_than_duplicated():
+    comp = _FakeComp()
+    spec = _image_dip_spec()
+
+    first = build_comp_graph(comp, spec)
+    second = build_comp_graph(comp, spec)
+
+    for role in ("average_down", "average_up", "average_color"):
+        assert second[role] is first[role]
 
 
 def test_blend_goes_on_the_merge_when_a_background_exists():

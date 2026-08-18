@@ -490,6 +490,23 @@ The height cancels: the entry angle depends only on width over camera distance. 
 
 To *see* any of this: gallery stills are unreliable (`GalleryStillAlbum.ExportStills` returns `False` indefinitely once the album has been cleared with `DeleteStills`, while `GrabStill` keeps succeeding, and `Gallery.AddStillAlbum` doesn't exist in 20.3.3). Render instead — `Project.SetRenderSettings({"MarkIn": f, "MarkOut": f, ...})` plus `AddRenderJob` / `StartRendering` is dependable — then pull frames out with `ffmpeg`. Note that `SetCurrentRenderFormatAndCodec("jpg", "None")` silently does nothing after `LoadRenderPreset`, so you get a one-frame `.mov`; extracting from it is easier than fighting the preset.
 
+### Sampling a photograph's colour without decoding it
+
+The plug-in has to run under Resolve's bundled interpreter with the standard library only, so it cannot read a JPEG — but Fusion is already holding the decoded pixels, and it will do the arithmetic if you ask in the right shape.
+
+Collapsing the image to a single pixel *is* an averaging step: a downscale that extreme has to combine every source pixel into the one output pixel. Scaling that pixel back up gives a flat field of the result, which composites like any other Background. `add_image_average` builds it as `BetterResize(1×1) → BetterResize(frame) → BrightnessContrast`.
+
+Two things to know about the resize tool:
+
+- **There is no `Resize` tool.** `comp.AddTool("Resize")` returns `None` in 20.3.3; the registered ID is **`BetterResize`**.
+- `KeepAspect` and `UseFrameFormatSettings` both silently override `Width`/`Height`, so both must be cleared on the downscale or the 1×1 request is ignored. On the way back up, setting `UseFrameFormatSettings` is the easiest way to land on exactly the comp's frame size.
+
+The raw average is not usable on its own. Averaging is doubly destructive: it is strongly desaturating, because mixing every hue in the frame together pulls the result toward grey, and it inherits the picture's exposure, so a dim indoor shot averages to a murky near-black. Measured on a real slideshow frame the raw average came out `(69, 63, 59)` — a colour indistinguishable from the mid-grey dip it was meant to improve on.
+
+So keep the hue and throw away the exposure: `BrightnessContrast` with `Saturation` above 1 to make the surviving cast nameable, and `Gamma` above 1 to normalise brightness. Gamma is the right control rather than `Gain` precisely because it is non-linear — it lifts a dark average a long way and a bright one hardly at all, so every slide dips to a comparably lit tint instead of the dip's brightness swinging with the picture.
+
+Take the average from `MediaIn1` rather than from the end of the 2D chain, or a transition that scales or moves the photo will make the dip colour drift while it plays.
+
 ## Bridge gotchas
 
 - **`scriptapp("Resolve")` will crash the host interpreter** (Windows: exit code `-1073741819` / `0xC0000005` access violation) if no Resolve process is running — `fusionscript.dll` segfaults rather than returning `None`. Always pre-check for a running Resolve process before calling it (see `slideshow.resolve_bridge.is_resolve_running`).

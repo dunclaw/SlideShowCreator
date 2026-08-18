@@ -96,6 +96,11 @@ class ClipPlan:
                             ``background_color``: ``1`` shows the image,
                             ``0`` shows the solid colour. Ignored when
                             ``background_color`` is None.
+    * ``background_from_image``
+                          — take the dip colour from the clip's own picture
+                            (its average, saturation-boosted) instead of the
+                            fixed ``background_color``. ``background_color``
+                            is still carried as the fallback.
     * ``composite_mode``  — how this clip composites onto the *other*
                             side of the transition. Only meaningful on
                             the clip that ends up on the **upper** track.
@@ -111,6 +116,7 @@ class ClipPlan:
     pixelate_size: Optional[List[ScalarKeyframe]] = None
     background_color: Optional[RgbColor] = None
     color_blend: Optional[List[ScalarKeyframe]] = None
+    background_from_image: bool = False
     composite_mode: str = "normal"
     page_turn: Optional[PageTurnAnimation] = None
 
@@ -142,6 +148,7 @@ class ClipPlan:
             and not self.pixelate_size
             and not self.color_blend
             and self.background_color is None
+            and not self.background_from_image
             and self.composite_mode == "normal"
             and (self.page_turn is None or self.page_turn.is_empty())
         )
@@ -219,8 +226,9 @@ def reverse_page_turn(
 def reverse_clip_plan(plan: Optional[ClipPlan], duration_frames: int) -> ClipPlan:
     """Time-reverse every animated channel of a :class:`ClipPlan`.
 
-    Static attributes (``background_color``, ``composite_mode``) ride along
-    unchanged — they describe *what* the clip composites against, not when.
+    Static attributes (``background_color``, ``background_from_image``,
+    ``composite_mode``) ride along unchanged — they describe *what* the clip
+    composites against, not when.
     """
     if plan is None:
         return ClipPlan()
@@ -231,6 +239,7 @@ def reverse_clip_plan(plan: Optional[ClipPlan], duration_frames: int) -> ClipPla
         pixelate_size=reverse_keyframes(plan.pixelate_size, duration_frames),
         background_color=plan.background_color,
         color_blend=reverse_keyframes(plan.color_blend, duration_frames),
+        background_from_image=plan.background_from_image,
         composite_mode=plan.composite_mode,
         page_turn=reverse_page_turn(plan.page_turn, duration_frames),
     )

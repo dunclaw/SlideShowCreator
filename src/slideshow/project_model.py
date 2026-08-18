@@ -57,9 +57,10 @@ from typing import Any, Dict, List, Optional, Sequence
 #: * Dissolves    — ``dissolve`` and Resolve's native dissolve variants
 #:   (``additive_dissolve``, ``non_additive_dissolve``, ``blur_dissolve``,
 #:   ``dip_to_color`` — colour via ``params["color"] = "#RRGGBB"``,
-#:   defaults to black). ``cross_fade`` is the Movie-Maker name for the
-#:   standard dissolve and is kept as a distinct kind so saved projects
-#:   show the user's chosen label.
+#:   defaults to black; ``dip_to_image_color`` — the same dip, but the
+#:   colour is sampled from the incoming photograph). ``cross_fade`` is
+#:   the Movie-Maker name for the standard dissolve and is kept as a
+#:   distinct kind so saved projects show the user's chosen label.
 #: * Fades        — ``fade`` (through black), ``fade_through_gray``,
 #:   ``fade_through_white``.
 #: * Effects      — ``blur_through_black``, ``pixelate``, ``smooth_cut``.
@@ -81,6 +82,7 @@ TRANSITION_KINDS: frozenset = frozenset({
     "non_additive_dissolve",
     "blur_dissolve",
     "dip_to_color",
+    "dip_to_image_color",
     "fade",
     "fade_through_gray",
     "fade_through_white",

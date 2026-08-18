@@ -52,6 +52,7 @@ from ..fusion_comps import (
     ScalarKeyframe,
     TransformAnimation,
     add_background,
+    add_image_average,
     add_merge,
     apply_transform_animation,
     build_page_turn_graph,
@@ -206,6 +207,7 @@ class CompSpec:
     pixelate_size: Optional[List[ScalarKeyframe]] = None
     background_color: Optional[RgbColor] = None
     color_blend: Optional[List[ScalarKeyframe]] = None
+    background_from_image: bool = False
     composite_mode: str = "normal"
     page_turn: Optional[PageTurnAnimation] = None
 
@@ -218,6 +220,7 @@ class CompSpec:
             and not self.pixelate_size
             and not self.color_blend
             and self.background_color is None
+            and not self.background_from_image
             and self.composite_mode == "normal"
             and (self.page_turn is None or self.page_turn.is_empty())
         )
@@ -267,6 +270,11 @@ def merge_clip_plans(
     elif lead_out is not None and lead_out.background_color is not None:
         background = lead_out.background_color
 
+    from_image = bool(
+        (lead_in is not None and lead_in.background_from_image)
+        or (lead_out is not None and lead_out.background_from_image)
+    )
+
     # composite_mode belongs to whichever half is on the upper track. A
     # mirrored plan moves it onto the lead-out, so honour both, preferring
     # the lead-in when they disagree.
@@ -294,6 +302,7 @@ def merge_clip_plans(
         pixelate_size=scalar("pixelate_size"),
         background_color=background,
         color_blend=scalar("color_blend"),
+        background_from_image=from_image,
         composite_mode=composite,
         page_turn=page_turn,
     )
@@ -380,7 +389,18 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
     # can get out of the way of the clip on the track below). One merge could
     # only do one of those two things.
     head = transform
-    if spec.background_color is not None:
+    if spec.background_from_image:
+        # Same shape as the solid-colour dip, but the "colour" is a flat
+        # field of the photograph's own average rather than a Background.
+        media_in = find_tool(comp, "MediaIn1")
+        if media_in is None:
+            raise RuntimeError("Composition has no 'MediaIn1' tool.")
+        average = add_image_average(comp, media_in, position=(0, 3))
+        built["average_down"] = average["down"]
+        built["average_up"] = average["up"]
+        built["average_color"] = average["tint"]
+        color_background = average["tint"]
+    elif spec.background_color is not None:
         color_background = add_background(
             comp,
             spec.background_color,
@@ -388,6 +408,10 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
             alpha=1.0,
             position=(0, 2),
         )
+    else:
+        color_background = None
+
+    if color_background is not None:
         color_merge = add_merge(
             comp,
             background=color_background,

@@ -22,6 +22,8 @@ visible underneath. They differ in how the two clips blend together:
   ``params["color"]`` and falls back to black; supported as an RGB
   triple ``(r, g, b)`` in ``[0, 1]`` or a ``"#rrggbb"`` / ``"#rgb"``
   hex string.
+* :class:`DipToImageColor` — the same dip, but the colour is sampled
+  from the incoming photograph instead of being fixed.
 """
 
 from __future__ import annotations
@@ -270,11 +272,65 @@ class DipToColor(Transition):
         )
 
 
+@register("dip_to_image_color")
+class DipToImageColor(Transition):
+    """Dip through the incoming photo's own colour rather than a fixed one.
+
+    Identical timing to :class:`DipToColor` — the difference is entirely in
+    what sits behind the clip. Instead of a solid Background, the applier
+    builds a flat field of the incoming picture's average colour with its
+    saturation pushed back up (see
+    :func:`~slideshow.fusion_comps.add_image_average`), so the frame washes
+    to the dominant hue of the photograph that is about to appear and then
+    resolves into it.
+
+    It is the *incoming* clip's colour rather than the outgoing one's
+    because that is the only one available: each clip carries its own
+    Fusion comp and cannot see its neighbour. Washing toward the arriving
+    photograph is the better half of that bargain anyway — the dip reads as
+    the new image blooming in rather than the old one draining away.
+
+    ``params["color"]`` is still honoured as the fallback colour for the
+    degenerate case where the overlap is too short to dip at all.
+    """
+
+    def plan(
+        self,
+        duration_frames: int,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        fps: float = 24.0,
+    ) -> TransitionPlan:
+        if duration_frames <= 0:
+            return _empty_plan(self.KIND)
+        base = DipToColor().plan(duration_frames, params=params, fps=fps)
+        if base.incoming.background_color is None:
+            # Too short to dip; DipToColor already degraded to a cross-fade
+            # and there is no colour to sample toward.
+            return TransitionPlan(
+                kind=self.KIND,
+                duration_frames=base.duration_frames,
+                incoming=base.incoming,
+            )
+        incoming = ClipPlan(
+            background_color=base.incoming.background_color,
+            background_from_image=True,
+            blend=base.incoming.blend,
+            color_blend=base.incoming.color_blend,
+        )
+        return TransitionPlan(
+            kind=self.KIND,
+            duration_frames=base.duration_frames,
+            incoming=incoming,
+        )
+
+
 __all__ = [
     "AdditiveDissolve",
     "BlurDissolve",
     "CrossFade",
     "DipToColor",
+    "DipToImageColor",
     "Dissolve",
     "NonAdditiveDissolve",
 ]

@@ -98,6 +98,12 @@ def main(argv=None) -> int:
              "every registered kind, and print where each one lands",
     )
     p.add_argument(
+        "--kinds",
+        default="",
+        help="Comma-separated transition kinds to sweep, in order, instead of "
+             "every registered kind. Implies --sweep",
+    )
+    p.add_argument(
         "--list-transitions",
         action="store_true",
         help="Print every available transition kind and exit",
@@ -115,7 +121,19 @@ def main(argv=None) -> int:
         print("Not a directory: {0}".format(args.folder), file=sys.stderr)
         return 2
 
+    if args.kinds:
+        args.sweep = True
+
     sweep_kinds = list(registered_kinds()) if args.sweep else []
+    if args.kinds:
+        sweep_kinds = [k.strip() for k in args.kinds.split(",") if k.strip()]
+        unknown = [k for k in sweep_kinds if k not in registered_kinds()]
+        if unknown:
+            print(
+                "Unknown transition kind(s): {0}".format(", ".join(unknown)),
+                file=sys.stderr,
+            )
+            return 2
     if args.sweep and args.flat:
         p.error("--sweep needs the overlapping layout, so it can't be used with --flat")
 
