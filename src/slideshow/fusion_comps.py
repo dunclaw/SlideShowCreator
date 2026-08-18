@@ -84,6 +84,22 @@ DEFAULT_CANVAS_NAME = "SlideShowCanvas"
 DEFAULT_CANVAS_MERGE_NAME = "SlideShowCanvasMerge"
 DEFAULT_FIT_NAME = "SlideShowFit"
 
+#: The blur-backdrop chain: a frame-filling copy of the photograph, blurred
+#: and held down, composited onto the canvas behind the photo itself.
+DEFAULT_BACKDROP_FIT_NAME = "SlideShowBackdropFit"
+DEFAULT_BACKDROP_BLUR_NAME = "SlideShowBackdropBlur"
+DEFAULT_BACKDROP_MERGE_NAME = "SlideShowBackdropMerge"
+
+#: Blur radius for the blur backdrop, as a fraction of the frame width.
+#: Fusion's blur size is in pixels, so a fixed value that looks right at HD
+#: is barely visible at UHD — it has to scale with the frame.
+BACKDROP_BLUR_FRACTION = 0.02
+
+#: Brightness the blurred backdrop is held down to, applied as the Blend of
+#: its Merge over the black canvas. At full brightness it competes with the
+#: photograph sitting on top of it.
+BACKDROP_BLUR_GAIN = 0.55
+
 #: Saturation and gamma applied to a photo's average colour before it is used
 #: as a dip background.
 #:
@@ -145,6 +161,10 @@ TOOL_IMAGE_INPUTS = {
 
 #: Recognised ways of sizing a photograph into the frame.
 FRAMING_MODES = ("fit", "fill")
+
+#: Recognised backdrops. Mirrors ``project_model.BACKDROP_KINDS``; kept
+#: here too so the Fusion layer does not import the model.
+BACKDROP_KINDS = ("none", "solid", "blur")
 
 
 def framed_size(
@@ -798,14 +818,15 @@ def add_canvas(
     frame_size: Tuple[int, int],
     source_size: Tuple[int, int],
     mode: str = "fit",
+    backdrop: str = "none",
     color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-    alpha: float = 0.0,
     position: Tuple[int, int] = (0, -2),
 ) -> Dict[str, Any]:
     """Resample *source* into the frame and lay it on a frame-sized canvas.
 
-    Returns the tools created, keyed ``fit``, ``canvas`` and ``merge``; the
-    ``merge`` is the new head of the chain.
+    Returns the tools created, keyed ``fit``, ``canvas`` and ``merge`` (plus
+    ``backdrop_fit``, ``backdrop_blur`` and ``backdrop_merge`` for the blur
+    backdrop); the ``merge`` is the new head of the chain.
 
     **Why this exists.** A Fusion comp attached to a Resolve timeline clip
     runs at the *clip's* resolution, not the timeline's: on a 3840x2160
@@ -826,11 +847,11 @@ def add_canvas(
 
     With the default transparent black canvas the output is indistinguishable
     from letting Resolve do the fitting, which is what makes this safe to
-    apply to every clip. Giving the canvas a colour and an alpha is then all
-    a solid backdrop needs.
+    apply to every clip.
     """
+    frame_w, frame_h = frame_size
     fit_w, fit_h = framed_size(
-        source_size[0], source_size[1], frame_size[0], frame_size[1], mode=mode
+        source_size[0], source_size[1], frame_w, frame_h, mode=mode
     )
     resize = find_or_add_tool(comp, RESIZE_TOOL, DEFAULT_FIT_NAME, position=position)
     if resize is None:
@@ -841,23 +862,83 @@ def add_canvas(
     resize.SetInput("Height", float(fit_h))
     connect(source, resize, primary_image_input(RESIZE_TOOL))
 
+    built: Dict[str, Any] = {"fit": resize}
+
     canvas = add_background(
         comp,
         color,
         name=DEFAULT_CANVAS_NAME,
-        alpha=alpha,
+        alpha=0.0 if backdrop == "none" else 1.0,
         position=(position[0], position[1] - 1),
         size=frame_size,
     )
+    built["canvas"] = canvas
+    base: Any = canvas
+
+    if backdrop == "blur":
+        # A blurred, frame-filling copy of the photograph itself. It has to
+        # be composited onto the opaque canvas rather than used as the merge
+        # background directly: a "fill" copy overhangs the frame on one axis,
+        # and a Merge takes its output size from its *background*, so using
+        # it raw would make the whole comp that oversized shape again.
+        backdrop_w, backdrop_h = framed_size(
+            source_size[0], source_size[1], frame_w, frame_h, mode="fill"
+        )
+        backdrop_fit = find_or_add_tool(
+            comp,
+            RESIZE_TOOL,
+            DEFAULT_BACKDROP_FIT_NAME,
+            position=(position[0], position[1] - 2),
+        )
+        if backdrop_fit is None:
+            raise RuntimeError(
+                "Could not create a {0!r} tool for the blur backdrop.".format(
+                    RESIZE_TOOL
+                )
+            )
+        backdrop_fit.SetInput("Width", float(backdrop_w))
+        backdrop_fit.SetInput("Height", float(backdrop_h))
+        connect(source, backdrop_fit, primary_image_input(RESIZE_TOOL))
+
+        blur = find_or_add_tool(
+            comp,
+            BLUR_TOOL,
+            DEFAULT_BACKDROP_BLUR_NAME,
+            position=(position[0] + 1, position[1] - 2),
+        )
+        # Blur size is in pixels, so it has to scale with the frame or the
+        # effect all but disappears at UHD.
+        blur.SetInput(BLUR_SIZE_INPUT, frame_w * BACKDROP_BLUR_FRACTION)
+        connect(backdrop_fit, blur, "Input")
+
+        base = add_merge(
+            comp,
+            background=canvas,
+            foreground=blur,
+            name=DEFAULT_BACKDROP_MERGE_NAME,
+            apply_mode="normal",
+            position=(position[0] + 3, position[1] - 2),
+        )
+        # Held down against the black canvas so the backdrop reads as a
+        # backdrop; at full brightness it competes with the photograph
+        # sitting on top of it. Merge.Blend is used rather than a ColorGain
+        # because ColorGain's Gain input is not reachable over the scripting
+        # API (see docs/api-notes.md).
+        base.SetInput("Blend", BACKDROP_BLUR_GAIN)
+        built["backdrop_fit"] = backdrop_fit
+        built["backdrop_blur"] = blur
+        built["backdrop_merge"] = base
+
     merge = add_merge(
         comp,
-        background=canvas,
+        background=base,
         foreground=resize,
         name=DEFAULT_CANVAS_MERGE_NAME,
         apply_mode="normal",
         position=(position[0] + 1, position[1] - 1),
     )
-    return {"fit": resize, "canvas": canvas, "merge": merge}
+    built["merge"] = merge
+    return built
 
 
 
@@ -1253,6 +1334,9 @@ def _safe_name(timeline_item: Any) -> str:
 
 
 __all__ = [
+    "BACKDROP_BLUR_FRACTION",
+    "BACKDROP_BLUR_GAIN",
+    "BACKDROP_KINDS",
     "add_background",
     "add_blur",
     "add_canvas",

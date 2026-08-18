@@ -52,6 +52,7 @@ from ..fusion_comps import (
     DEFAULT_MERGE_NAME,
     DEFAULT_PIXELATE_NAME,
     DEFAULT_TRANSFORM_NAME,
+    BACKDROP_KINDS,
     FRAMING_MODES,
     PIXELATE_SIZE_INPUT,
     PIXELATE_TOOL,
@@ -209,9 +210,9 @@ class Framing:
     the graph animates in — see :func:`~slideshow.fusion_comps.add_canvas`
     for why a clip comp does not get that for free.
 
-    ``backdrop`` is the colour painted where the photo does not reach, and
-    ``backdrop_alpha`` of ``0`` (the default) leaves those bars transparent,
-    which reproduces the behaviour we had before backdrops existed.
+    ``backdrop_kind`` says what fills the area the photo does not reach.
+    ``none`` (the default) leaves it transparent, reproducing the behaviour
+    from before backdrops existed.
     """
 
     frame_width: int
@@ -219,13 +220,19 @@ class Framing:
     source_width: int
     source_height: int
     mode: str = "fit"
-    backdrop: RgbColor = (0.0, 0.0, 0.0)
-    backdrop_alpha: float = 0.0
+    backdrop_kind: str = "none"
+    backdrop_color: RgbColor = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
         if self.mode not in FRAMING_MODES:
             raise ValueError(
                 "mode must be one of {0}, got {1!r}".format(FRAMING_MODES, self.mode)
+            )
+        if self.backdrop_kind not in BACKDROP_KINDS:
+            raise ValueError(
+                "backdrop_kind must be one of {0}, got {1!r}".format(
+                    BACKDROP_KINDS, self.backdrop_kind
+                )
             )
         for label, value in (
             ("frame_width", self.frame_width),
@@ -235,10 +242,11 @@ class Framing:
         ):
             if value <= 0:
                 raise ValueError("{0} must be > 0, got {1}".format(label, value))
-        if not 0.0 <= self.backdrop_alpha <= 1.0:
-            raise ValueError(
-                "backdrop_alpha must be in [0, 1], got {0}".format(self.backdrop_alpha)
-            )
+
+    @property
+    def backdrop_alpha(self) -> float:
+        """Opacity of the canvas Background beneath everything else."""
+        return 0.0 if self.backdrop_kind == "none" else 1.0
 
     def scaled_size(self) -> Tuple[int, int]:
         """Pixel size the photo is resampled to."""
@@ -250,6 +258,20 @@ class Framing:
             mode=self.mode,
         )
 
+    def backdrop_size(self) -> Tuple[int, int]:
+        """Pixel size the *backdrop* copy of the photo is resampled to.
+
+        Always ``fill``: a backdrop that did not cover the frame would defeat
+        the point of having one.
+        """
+        return framed_size(
+            self.source_width,
+            self.source_height,
+            self.frame_width,
+            self.frame_height,
+            mode="fill",
+        )
+
     def is_noop(self) -> bool:
         """True when building the canvas would change nothing on screen.
 
@@ -257,7 +279,7 @@ class Framing:
         ``scaleToFit`` already does, so a clip that needs nothing else can
         still skip having a comp attached.
         """
-        return self.mode == "fit" and self.backdrop_alpha <= 0.0
+        return self.mode == "fit" and self.backdrop_kind == "none"
 
 
 @dataclass
@@ -435,11 +457,18 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
             frame_size=(spec.framing.frame_width, spec.framing.frame_height),
             source_size=(spec.framing.source_width, spec.framing.source_height),
             mode=spec.framing.mode,
-            color=spec.framing.backdrop,
-            alpha=spec.framing.backdrop_alpha,
+            backdrop=spec.framing.backdrop_kind,
+            color=spec.framing.backdrop_color,
         )
-        built["fit"] = canvas["fit"]
-        built["canvas"] = canvas["canvas"]
+        for role in (
+            "fit",
+            "canvas",
+            "backdrop_fit",
+            "backdrop_blur",
+            "backdrop_merge",
+        ):
+            if role in canvas:
+                built[role] = canvas[role]
         built["canvas_merge"] = canvas["merge"]
         source = canvas["merge"]
 

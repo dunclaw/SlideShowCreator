@@ -685,6 +685,14 @@ class TestFramingForClip:
         # other half of the transition entirely.
         settings = FramingSettings(backdrop="solid")
         assert self._framing(settings, LOWER_TRACK + 1).backdrop_alpha == 0.0
+        assert self._framing(settings, LOWER_TRACK + 1).backdrop_kind == "none"
+
+    def test_blur_backdrop_is_suppressed_on_upper_tracks_too(self):
+        # A blur backdrop is just as opaque as a solid one, so it occludes
+        # the lower track in exactly the same way.
+        settings = FramingSettings(backdrop="blur")
+        assert self._framing(settings, LOWER_TRACK).backdrop_kind == "blur"
+        assert self._framing(settings, LOWER_TRACK + 1).backdrop_kind == "none"
 
     def test_upper_track_still_gets_a_frame_sized_canvas(self):
         # Suppressing the backdrop must not suppress the canvas: without it

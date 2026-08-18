@@ -616,8 +616,8 @@ class TimelineBuilder:
             source_width=source_size[0],
             source_height=source_size[1],
             mode=settings.mode,
-            backdrop=settings.backdrop_color,
-            backdrop_alpha=settings.backdrop_alpha if on_lower_track else 0.0,
+            backdrop_kind=settings.backdrop if on_lower_track else "none",
+            backdrop_color=settings.backdrop_color,
         )
 
     # -- entry point ------------------------------------------------------- #

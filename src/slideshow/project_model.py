@@ -419,10 +419,13 @@ FRAMING_MODES = ("fit", "fill")
 #: shows through — the behaviour from before backdrops existed. ``solid``
 #: paints :attr:`FramingSettings.backdrop_color`.
 #:
-#: The remaining options from issue #13 — ``blur``, ``dominant`` and
-#: ``accumulate`` — are deliberately *not* listed until they are implemented,
+#: ``blur`` fills it with a blurred, darkened, frame-filling copy of the
+#: photograph itself.
+#:
+#: The remaining options from issue #13 — ``dominant`` and ``accumulate`` —
+#: are deliberately *not* listed until they are implemented,
 #: so a project file can never ask for a backdrop that is silently ignored.
-BACKDROP_KINDS = ("none", "solid")
+BACKDROP_KINDS = ("none", "solid", "blur")
 
 DEFAULT_BACKDROP_COLOR = (0.0, 0.0, 0.0)
 

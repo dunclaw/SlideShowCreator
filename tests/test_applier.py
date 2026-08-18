@@ -27,6 +27,7 @@ from slideshow.transitions import plan_transition, registered_kinds
 from slideshow.transitions.applier import (
     TIMELINE_COMPOSITE_MODES,
     CompSpec,
+    Framing,
     apply_comp_spec,
     apply_composite_mode,
     build_comp_graph,
@@ -922,3 +923,50 @@ def test_page_turn_survives_the_merge_into_a_comp_spec():
     assert spec.page_turn is not None
     assert spec.page_turn.angle[0][0] == 0
     assert spec.page_turn.angle[-1] == (18, 0.0)
+
+
+class TestFraming:
+    def _framing(self, **kwargs):
+        base = dict(
+            frame_width=3840,
+            frame_height=2160,
+            source_width=1536,
+            source_height=2048,
+        )
+        base.update(kwargs)
+        return Framing(**base)
+
+    def test_scaled_size_follows_the_mode(self):
+        assert self._framing().scaled_size() == (1620, 2160)
+        assert self._framing(mode="fill").scaled_size() == (3840, 5120)
+
+    def test_backdrop_size_always_fills(self):
+        # A backdrop that did not cover the frame would defeat the point
+        # of having one, so it fills whatever the photo itself does.
+        assert self._framing().backdrop_size() == (3840, 5120)
+        assert self._framing(mode="fill").backdrop_size() == (3840, 5120)
+
+    def test_alpha_is_derived_from_the_kind(self):
+        assert self._framing().backdrop_alpha == 0.0
+        assert self._framing(backdrop_kind="solid").backdrop_alpha == 1.0
+        assert self._framing(backdrop_kind="blur").backdrop_alpha == 1.0
+
+    def test_only_a_transparent_fit_is_a_noop(self):
+        # A transparent fit canvas reproduces Resolve's own scaleToFit
+        # exactly, so such a clip can still skip having a comp at all.
+        assert self._framing().is_noop()
+        assert not self._framing(mode="fill").is_noop()
+        assert not self._framing(backdrop_kind="solid").is_noop()
+        assert not self._framing(backdrop_kind="blur").is_noop()
+
+    def test_rejects_an_unknown_backdrop_kind(self):
+        with pytest.raises(ValueError, match="backdrop_kind"):
+            self._framing(backdrop_kind="accumulate")
+
+    def test_rejects_an_unknown_mode(self):
+        with pytest.raises(ValueError, match="mode"):
+            self._framing(mode="stretch")
+
+    def test_rejects_a_zero_dimension(self):
+        with pytest.raises(ValueError, match="source_width"):
+            self._framing(source_width=0)

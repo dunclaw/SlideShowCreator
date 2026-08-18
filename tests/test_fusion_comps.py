@@ -1006,3 +1006,67 @@ class TestAddCanvas:
             source_size=(1536, 2048),
         )
         assert set(built) == {"fit", "canvas", "merge"}
+
+    def test_solid_backdrop_makes_the_canvas_opaque(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+            backdrop="solid",
+            color=(0.1, 0.2, 0.3),
+        )
+        calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        assert calls["TopLeftAlpha"] == 1.0
+        assert calls["TopLeftRed"] == 0.1
+        assert set(built) == {"fit", "canvas", "merge"}
+
+    def test_blur_backdrop_builds_its_own_chain(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+            backdrop="blur",
+        )
+        assert set(built) == {
+            "fit",
+            "canvas",
+            "merge",
+            "backdrop_fit",
+            "backdrop_blur",
+            "backdrop_merge",
+        }
+        # The backdrop copy always fills, whatever the photo itself does,
+        # or it would not cover the frame.
+        sized = dict(c.args for c in built["backdrop_fit"].SetInput.call_args_list)
+        assert (sized["Width"], sized["Height"]) == (3840.0, 5120.0)
+
+    def test_blur_size_scales_with_the_frame(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(1920, 1080),
+            source_size=(1536, 2048),
+            backdrop="blur",
+        )
+        calls = dict(c.args for c in built["backdrop_blur"].SetInput.call_args_list)
+        assert calls[fc.BLUR_SIZE_INPUT] == 1920 * fc.BACKDROP_BLUR_FRACTION
+
+    def test_blur_backdrop_is_darkened_by_the_merge_blend(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+            backdrop="blur",
+        )
+        calls = dict(c.args for c in built["backdrop_merge"].SetInput.call_args_list)
+        assert calls["Blend"] == fc.BACKDROP_BLUR_GAIN
+        # ...over an opaque canvas, or there would be nothing to darken against.
+        canvas_calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        assert canvas_calls["TopLeftAlpha"] == 1.0

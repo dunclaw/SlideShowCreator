@@ -647,3 +647,21 @@ of the transition and the slide appears to jump across a gap.
 whole timeline. Upper clips still get a frame-sized but *transparent* canvas
 — they need it for their animation to move in frame pixels, not for anything
 they paint.
+
+## `Tool.GetInputList()` hangs Resolve
+
+Calling `GetInputList()` on a tool inside a *timeline clip's* comp never
+returns. Resolve locks up with a spinner and has to be killed; the calling
+script hangs with it. Enumerating a tool's inputs is therefore not available
+to us — probe candidate input names one at a time with `GetInput`, which
+returns `None` for names that do not exist.
+
+## `ColorGain`'s `Gain` input is not reachable
+
+`comp.AddTool("ColorGain")` succeeds, but `SetInput("Gain", ...)` is
+silently ignored and `GetInput("Gain")` returns `None`. The master gain is
+evidently not exposed under that name, and `GetInputList` cannot be used to
+find the real one (above).
+
+To darken an image, composite it over a black `Background` with a `Merge`
+and set the **Merge's** `Blend`. That is what the blur backdrop does.
