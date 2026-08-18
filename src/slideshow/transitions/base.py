@@ -56,7 +56,15 @@ from ..fusion_comps import (
     ScalarKeyframe,
     TransformAnimation,
 )
-from ..project_model import TransitionChoice
+from ..project_model import (
+    DEFAULT_TRANSITION_DURATION_FRAMES,
+    TransitionChoice,
+)
+
+#: Slide length assumed when a transition has to be sized with no layout to
+#: measure against. Chosen so the default fraction reproduces
+#: :data:`~slideshow.project_model.DEFAULT_TRANSITION_DURATION_FRAMES`.
+NOMINAL_SLIDE_FRAMES = 80
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +301,24 @@ class Transition(abc.ABC):
     #: plan so the animation lands on the clip that is actually visible.
     PREFERS_OUTGOING_ON_TOP: ClassVar[bool] = False
 
+    #: How long this transition wants to be, as a fraction of the shorter of
+    #: the two slides it joins, when the project doesn't say. Fixed frame
+    #: counts don't survive a change of slide length: 30 frames is a quarter
+    #: of a 4-second slide and a twelfth of a 12-second one, so the same
+    #: transition goes from measured to perfunctory without anything about it
+    #: changing. Every plan is already written in fractions of
+    #: ``duration_frames``, so scaling the number is all that's needed.
+    DURATION_FRACTION: ClassVar[float] = 0.30
+
+    #: Floor and ceiling on the derived length. The floor stops a very short
+    #: slide producing a transition too brief to perceive; the ceiling stops a
+    #: long slide turning a dissolve into the main event. Kinds that need
+    #: room to read — anything with a hold, a bounce or an arc — raise the
+    #: ceiling rather than the fraction, so they grow with the slide but only
+    #: up to the point where they stop being a transition.
+    MIN_DURATION_FRAMES: ClassVar[int] = 8
+    MAX_DURATION_FRAMES: ClassVar[int] = 48
+
     @abc.abstractmethod
     def plan(
         self,
@@ -380,8 +406,55 @@ def wants_outgoing_on_top(choice: Optional[TransitionChoice]) -> bool:
     return bool(cls is not None and cls.PREFERS_OUTGOING_ON_TOP)
 
 
+def resolve_duration_frames(
+    choice: Optional[TransitionChoice],
+    slide_frames: Optional[int] = None,
+) -> int:
+    """How many frames *choice* should overlap, resolving ``None``.
+
+    An explicit ``duration_frames`` is returned untouched — the project
+    always wins. ``None`` means "derive it", and the length then comes from
+    the transition's own :attr:`~Transition.DURATION_FRACTION` applied to
+    *slide_frames*, clamped between its
+    :attr:`~Transition.MIN_DURATION_FRAMES` and
+    :attr:`~Transition.MAX_DURATION_FRAMES`.
+
+    *slide_frames* should be the shorter of the two slides the transition
+    joins, since that is the one that constrains it. Passing ``None`` falls
+    back to :data:`~slideshow.project_model.DEFAULT_TRANSITION_DURATION_FRAMES`
+    scaled as if for a nominal slide, which is only for callers planning a
+    transition outside a layout.
+
+    Unknown kinds and cuts resolve to 0, matching
+    :func:`wants_outgoing_on_top` in degrading rather than raising.
+    """
+    if choice is None or choice.kind == "none":
+        return 0
+    if choice.duration_frames is not None:
+        return max(0, int(choice.duration_frames))
+
+    cls = _REGISTRY.get(choice.kind)
+    if cls is None:
+        return DEFAULT_TRANSITION_DURATION_FRAMES
+    if slide_frames is None:
+        # No layout context. Derive against a nominal slide so the per-kind
+        # ratios still hold relative to each other.
+        slide_frames = NOMINAL_SLIDE_FRAMES
+    if slide_frames <= 0:
+        return 0
+
+    derived = int(round(cls.DURATION_FRACTION * slide_frames))
+    low = max(0, int(cls.MIN_DURATION_FRAMES))
+    high = max(low, int(cls.MAX_DURATION_FRAMES))
+    return max(low, min(high, derived))
+
+
 def plan_transition(
-    choice: TransitionChoice, *, fps: float = 24.0, incoming_on_top: bool = True
+    choice: TransitionChoice,
+    *,
+    fps: float = 24.0,
+    incoming_on_top: bool = True,
+    slide_frames: Optional[int] = None,
 ) -> TransitionPlan:
     """Resolve *choice* to a concrete :class:`TransitionPlan`.
 
@@ -392,15 +465,20 @@ def plan_transition(
     video track. When it doesn't, the plan is mirrored (see
     :meth:`Transition.mirror`) so the animation lands on the clip that is
     actually visible.
+
+    ``slide_frames`` sizes a ``duration_frames=None`` choice — see
+    :func:`resolve_duration_frames`. The builder normally hands over a
+    choice the layout has already resolved, so this rarely matters.
     """
-    if choice.duration_frames < 0:
+    if choice.duration_frames is not None and choice.duration_frames < 0:
         raise ValueError(
-            "TransitionChoice.duration_frames must be >= 0, got {0}".format(
+            "TransitionChoice.duration_frames must be >= 0 or None, got {0}".format(
                 choice.duration_frames
             )
         )
+    duration = resolve_duration_frames(choice, slide_frames)
     impl = get_transition(choice.kind)
-    plan = impl.plan(choice.duration_frames, params=dict(choice.params), fps=fps)
+    plan = impl.plan(duration, params=dict(choice.params), fps=fps)
     if not incoming_on_top:
         plan = impl.mirror(plan)
     return plan
@@ -415,10 +493,12 @@ __all__ = [
     "ScalarKeyframe",
     "Transition",
     "TransitionPlan",
+    "NOMINAL_SLIDE_FRAMES",
     "get_transition",
     "plan_transition",
     "register",
     "registered_kinds",
+    "resolve_duration_frames",
     "reverse_clip_plan",
     "reverse_keyframes",
     "reverse_page_turn",

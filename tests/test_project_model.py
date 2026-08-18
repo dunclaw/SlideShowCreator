@@ -10,7 +10,6 @@ import pytest
 
 from slideshow.project_model import (
     DEFAULT_MOTION_ZOOM_AMOUNT,
-    DEFAULT_TRANSITION_DURATION_FRAMES,
     PROJECT_SCHEMA_VERSION,
     AudioSettings,
     MediaItem,
@@ -29,7 +28,8 @@ class TestTransitionChoice:
     def test_defaults(self):
         t = TransitionChoice()
         assert t.kind == "dissolve"
-        assert t.duration_frames == DEFAULT_TRANSITION_DURATION_FRAMES
+        # None means "size it against the slide" — see issue #1.
+        assert t.duration_frames is None
         assert t.params == {}
         assert not t.is_cut()
 
@@ -92,12 +92,32 @@ class TestTransitionChoice:
     def test_from_dict_tolerates_missing_keys(self):
         t = TransitionChoice.from_dict({})
         assert t.kind == "dissolve"
-        assert t.duration_frames == DEFAULT_TRANSITION_DURATION_FRAMES
+        assert t.duration_frames is None
         assert t.params == {}
 
     def test_from_dict_tolerates_null_params(self):
         t = TransitionChoice.from_dict({"kind": "fade", "params": None})
         assert t.params == {}
+
+    def test_unresolved_duration_survives_json(self):
+        t = TransitionChoice(kind="dissolve")
+        payload = json.loads(json.dumps(t.to_dict()))
+        assert payload["duration_frames"] is None
+        assert TransitionChoice.from_dict(payload) == t
+
+    def test_a_saved_explicit_duration_is_not_reinterpreted(self):
+        # Projects written before durations could be derived carry a real
+        # number, and reloading one must not change how it plays.
+        t = TransitionChoice.from_dict({"kind": "dissolve", "duration_frames": 24})
+        assert t.duration_frames == 24
+
+    def test_unresolved_duration_is_not_a_cut(self):
+        # "Not decided yet" and "no transition" are different things.
+        assert not TransitionChoice(kind="dissolve").is_cut()
+
+    def test_negative_duration_still_rejected(self):
+        with pytest.raises(ValueError):
+            TransitionChoice(kind="dissolve", duration_frames=-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +357,7 @@ class TestSlideshowProjectDefaults:
         p1 = SlideshowProject()
         p2 = SlideshowProject()
         p1.default_transition.duration_frames = 99
-        assert p2.default_transition.duration_frames == DEFAULT_TRANSITION_DURATION_FRAMES
+        assert p2.default_transition.duration_frames is None
 
     def test_default_motion_is_per_instance(self):
         p1 = SlideshowProject()

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from .base import (
     COMPOSITE_MODES,
+    NOMINAL_SLIDE_FRAMES,
     ClipPlan,
     PointKeyframe,
     RgbColor,
@@ -38,6 +39,7 @@ from .base import (
     plan_transition,
     register,
     registered_kinds,
+    resolve_duration_frames,
     reverse_clip_plan,
     reverse_keyframes,
     reverse_transform,
@@ -66,6 +68,7 @@ from .applier import (  # noqa: E402  (must follow the registry imports)
 
 __all__ = [
     "COMPOSITE_MODES",
+    "NOMINAL_SLIDE_FRAMES",
     "ClipPlan",
     "CompSpec",
     "PointKeyframe",
@@ -82,6 +85,7 @@ __all__ = [
     "plan_transition",
     "register",
     "registered_kinds",
+    "resolve_duration_frames",
     "reverse_clip_plan",
     "reverse_keyframes",
     "reverse_transform",

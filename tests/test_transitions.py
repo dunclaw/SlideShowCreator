@@ -14,14 +14,20 @@ from __future__ import annotations
 
 import pytest
 
-from slideshow.project_model import TRANSITION_KINDS, TransitionChoice
+from slideshow.project_model import (
+    DEFAULT_TRANSITION_DURATION_FRAMES,
+    TRANSITION_KINDS,
+    TransitionChoice,
+)
 from slideshow.transitions import (
     COMPOSITE_MODES,
+    NOMINAL_SLIDE_FRAMES,
     ClipPlan,
     TransitionPlan,
     get_transition,
     plan_transition,
     registered_kinds,
+    resolve_duration_frames,
     reverse_keyframes,
     wants_outgoing_on_top,
 )
@@ -1128,3 +1134,110 @@ class TestPageTurnAway:
             )
         )
         assert plan.incoming.page_turn.hinge == "right"
+
+
+# --------------------------------------------------------------------------- #
+# Duration derivation (issue #1)
+# --------------------------------------------------------------------------- #
+
+class TestResolveDurationFrames:
+    """``duration_frames=None`` means "as long as suits this slide"."""
+
+    def test_explicit_duration_always_wins(self):
+        choice = TransitionChoice(kind="dissolve", duration_frames=11)
+        # Same answer whatever the slide is, because the project asked for it.
+        assert resolve_duration_frames(choice, 96) == 11
+        assert resolve_duration_frames(choice, 288) == 11
+        assert resolve_duration_frames(choice, None) == 11
+
+    def test_explicit_zero_is_a_cut(self):
+        choice = TransitionChoice(kind="dissolve", duration_frames=0)
+        assert resolve_duration_frames(choice, 288) == 0
+
+    def test_kind_none_is_zero_even_when_unresolved(self):
+        assert resolve_duration_frames(TransitionChoice(kind="none"), 96) == 0
+
+    def test_missing_choice_is_zero(self):
+        assert resolve_duration_frames(None, 96) == 0
+
+    def test_derives_from_the_slide_length(self):
+        choice = TransitionChoice(kind="dissolve")
+        cls = type(get_transition("dissolve"))
+        assert resolve_duration_frames(choice, 96) == round(cls.DURATION_FRACTION * 96)
+
+    def test_a_longer_slide_gets_a_longer_transition(self):
+        # The whole point of the issue: a fixed frame count reads as
+        # measured at 4s and perfunctory at 8s.
+        choice = TransitionChoice(kind="dissolve")
+        short = resolve_duration_frames(choice, 96)
+        longer = resolve_duration_frames(choice, 144)
+        assert longer > short
+
+    def test_ceiling_stops_a_dissolve_taking_over(self):
+        choice = TransitionChoice(kind="dissolve")
+        cls = type(get_transition("dissolve"))
+        # 12s at 24fps.
+        assert resolve_duration_frames(choice, 288) == cls.MAX_DURATION_FRAMES
+
+    def test_floor_keeps_a_short_slide_perceptible(self):
+        choice = TransitionChoice(kind="dissolve")
+        cls = type(get_transition("dissolve"))
+        assert resolve_duration_frames(choice, 4) == cls.MIN_DURATION_FRAMES
+
+    def test_zero_length_slide_gets_no_transition(self):
+        assert resolve_duration_frames(TransitionChoice(kind="dissolve"), 0) == 0
+
+    def test_no_slide_context_falls_back_to_the_nominal_slide(self):
+        choice = TransitionChoice(kind="dissolve")
+        assert resolve_duration_frames(choice, None) == resolve_duration_frames(
+            choice, NOMINAL_SLIDE_FRAMES
+        )
+
+    def test_nominal_slide_reproduces_the_documented_default(self):
+        # The old fixed default has to stay reachable, or every doc example
+        # and saved project silently changes pace.
+        choice = TransitionChoice(kind="dissolve")
+        assert (
+            resolve_duration_frames(choice, None) == DEFAULT_TRANSITION_DURATION_FRAMES
+        )
+
+    def test_unknown_kind_degrades_instead_of_raising(self):
+        choice = TransitionChoice(kind="dissolve")
+        object.__setattr__(choice, "kind", "not_a_real_kind")
+        assert resolve_duration_frames(choice, 96) == DEFAULT_TRANSITION_DURATION_FRAMES
+
+    def test_pixelate_and_drop_get_more_room_than_a_dissolve(self):
+        # Both were reviewed as "too short"; they must grow further on a
+        # long slide rather than hitting the dissolve ceiling.
+        long_slide = 288
+        base = resolve_duration_frames(TransitionChoice(kind="dissolve"), long_slide)
+        for kind in ("pixelate", "drop"):
+            derived = resolve_duration_frames(TransitionChoice(kind=kind), long_slide)
+            assert derived > base, kind
+
+    def test_smooth_cut_never_grows(self):
+        # A smooth cut that scaled up would carve out overlap frames its
+        # own plan then refuses to use.
+        derived = resolve_duration_frames(TransitionChoice(kind="smooth_cut"), 288)
+        assert derived == SMOOTH_CUT_MAX_FRAMES
+
+    def test_every_registered_kind_resolves_to_something_usable(self):
+        for kind in registered_kinds():
+            if kind == "none":
+                continue
+            derived = resolve_duration_frames(TransitionChoice(kind=kind), 96)
+            assert derived > 0, kind
+            plan = get_transition(kind).plan(derived)
+            assert plan.duration_frames > 0, kind
+
+
+class TestPlanTransitionDerivesDuration:
+    def test_plan_transition_sizes_an_unresolved_choice(self):
+        plan = plan_transition(TransitionChoice(kind="dissolve"), slide_frames=96)
+        assert plan.duration_frames == resolve_duration_frames(
+            TransitionChoice(kind="dissolve"), 96
+        )
+
+    def test_plan_transition_without_a_slide_still_builds(self):
+        plan = plan_transition(TransitionChoice(kind="dissolve"))
+        assert plan.duration_frames == DEFAULT_TRANSITION_DURATION_FRAMES

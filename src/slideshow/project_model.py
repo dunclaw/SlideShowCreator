@@ -99,7 +99,11 @@ TRANSITION_KINDS: frozenset = frozenset({
 })
 
 
-DEFAULT_TRANSITION_DURATION_FRAMES = 24  # 1s at 24fps; UI can override
+#: Fallback overlap length, in frames, for the rare caller that has to
+#: resolve a transition with no slide to size it against. Normal builds
+#: derive the length from the slide instead — see
+#: :func:`slideshow.transitions.resolve_duration_frames`.
+DEFAULT_TRANSITION_DURATION_FRAMES = 24  # 1s at 24fps
 
 
 @dataclass
@@ -109,7 +113,11 @@ class TransitionChoice:
     * ``kind``: one of :data:`TRANSITION_KINDS`. ``"none"`` is a hard cut;
       ``"auto"`` defers the choice to the auto-mix planner.
     * ``duration_frames``: how many frames the two clips overlap. Must be
-      ``>= 0`` (``0`` collapses to a hard cut).
+      ``>= 0`` (``0`` collapses to a hard cut). ``None`` — the default —
+      means "derive it from the slide length", which is what keeps the
+      pacing right across different slide durations; see
+      :func:`slideshow.transitions.resolve_duration_frames`. An explicit
+      value always wins.
     * ``params``: free-form ``dict[str, Any]`` for transition-specific
       tweaks (easing curve, motion-blur, drop-bounce factor, …). The
       transitions framework reads what it understands and ignores the
@@ -117,7 +125,7 @@ class TransitionChoice:
     """
 
     kind: str = "dissolve"
-    duration_frames: int = DEFAULT_TRANSITION_DURATION_FRAMES
+    duration_frames: Optional[int] = None
     params: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -127,31 +135,36 @@ class TransitionChoice:
                     self.kind, sorted(TRANSITION_KINDS)
                 )
             )
-        if self.duration_frames < 0:
+        if self.duration_frames is not None and self.duration_frames < 0:
             raise ValueError(
-                "TransitionChoice.duration_frames must be >= 0, got {0}".format(
+                "TransitionChoice.duration_frames must be >= 0 or None, got {0}".format(
                     self.duration_frames
                 )
             )
 
     def is_cut(self) -> bool:
-        """``True`` if this is effectively a hard cut (kind=none or 0 frames)."""
+        """``True`` if this is effectively a hard cut (kind=none or 0 frames).
+
+        A ``None`` duration is *not* a cut — it has simply not been resolved
+        to a frame count yet.
+        """
         return self.kind == "none" or self.duration_frames == 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "kind": self.kind,
-            "duration_frames": int(self.duration_frames),
+            "duration_frames": (
+                None if self.duration_frames is None else int(self.duration_frames)
+            ),
             "params": dict(self.params),
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TransitionChoice":
+        duration = data.get("duration_frames")
         return cls(
             kind=str(data.get("kind", "dissolve")),
-            duration_frames=int(
-                data.get("duration_frames", DEFAULT_TRANSITION_DURATION_FRAMES)
-            ),
+            duration_frames=None if duration is None else int(duration),
             params=dict(data.get("params", {}) or {}),
         )
 

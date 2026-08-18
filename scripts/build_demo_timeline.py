@@ -6,7 +6,8 @@ Usage (Resolve must be running and have an open project):
 Options of note:
     --transition KIND   transition between slides (default: dissolve).
                         Use ``--list-transitions`` to see them all.
-    --frames N          transition length in frames (default: 24).
+    --frames N          transition length in frames. Omit it and the length
+                        is derived from the slide length, which is normal.
     --sweep             build one timeline that uses a *different* transition
                         at every slide boundary, and print where each one
                         lands. The fastest way to eyeball the whole library.
@@ -78,7 +79,13 @@ def main(argv=None) -> int:
         "--transition", default="dissolve", help="Transition kind between slides"
     )
     p.add_argument(
-        "--frames", type=int, default=24, help="Transition length in frames"
+        "--frames",
+        type=int,
+        default=None,
+        help=(
+            "Transition length in frames. Omit to derive it from the slide "
+            "length, which is the normal path."
+        ),
     )
     p.add_argument(
         "--flat",

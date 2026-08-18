@@ -93,6 +93,10 @@ from .project_model import SlideshowProject, TransitionChoice
 #: rather than the incoming one.
 OutgoingOnTopPredicate = Callable[[TransitionChoice], bool]
 
+#: Asked to size a transition whose ``duration_frames`` is ``None``, given
+#: the length in frames of the shorter of the two slides it joins.
+DurationResolver = Callable[[TransitionChoice, int], int]
+
 
 #: Frame rate assumed when Resolve doesn't tell us otherwise.
 DEFAULT_FPS = 24.0
@@ -323,6 +327,7 @@ def plan_layout(
     fps: float = DEFAULT_FPS,
     source_frames: Optional[Sequence[Optional[int]]] = None,
     prefers_outgoing_on_top: Optional[OutgoingOnTopPredicate] = None,
+    resolve_duration: Optional[DurationResolver] = None,
 ) -> TimelineLayout:
     """Compute where every clip lands and how long each overlap really is.
 
@@ -337,6 +342,13 @@ def plan_layout(
       for every transition, which is the historic incoming-on-top layout.
       :func:`slideshow.transitions.wants_outgoing_on_top` is what the builder
       passes.
+    * ``resolve_duration`` — callback ``(choice, slide_frames) -> frames``
+      used to size a transition whose ``duration_frames`` is ``None``. This
+      is where it has to happen: only the layout knows both neighbouring
+      slide lengths. Defaults to treating ``None`` as 0 (a cut), so a caller
+      that doesn't pass one can't get a silently arbitrary overlap;
+      :func:`slideshow.transitions.resolve_duration_frames` is what the
+      builder passes.
 
     Raises :class:`ValueError` for an empty project.
     """
@@ -365,9 +377,24 @@ def plan_layout(
     # to write by accident, and honouring the 24 would carve out an overlap
     # window that nothing ever animates in — a hard cut placed 24 frames
     # early, with the slide silently losing that much screen time.
-    overlaps = _clamp_overlaps(
-        lengths, [0 if c.is_cut() else c.duration_frames for c in choices]
-    )
+    #
+    # A ``None`` duration means "as long as suits these two slides", and the
+    # slide that governs is the *shorter* of the pair: it's the one that runs
+    # out of frames first, and sizing against the longer one would just get
+    # clamped back down below.
+    requested: List[int] = []
+    for i, choice in enumerate(choices):
+        if choice.is_cut():
+            requested.append(0)
+        elif choice.duration_frames is not None:
+            requested.append(choice.duration_frames)
+        elif resolve_duration is None:
+            requested.append(0)
+        else:
+            requested.append(
+                int(resolve_duration(choice, min(lengths[i], lengths[i + 1])))
+            )
+    overlaps = _clamp_overlaps(lengths, requested)
 
     transitions = [
         replace(choice, duration_frames=d) if d != choice.duration_frames else choice
@@ -464,6 +491,7 @@ __all__ = [
     "SEGMENT_HEAD",
     "SEGMENT_TAIL",
     "SEGMENT_WHOLE",
+    "DurationResolver",
     "OutgoingOnTopPredicate",
     "PlacedClip",
     "TimelineLayout",

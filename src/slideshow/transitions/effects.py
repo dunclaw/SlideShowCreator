@@ -73,6 +73,12 @@ class Pixelate(Transition):
     ``params["hold"]`` the fraction of the overlap spent at that peak.
     """
 
+    # A third of this is spent held at peak blockiness, and the eye needs
+    # time on that hold to register what it's looking at — this was the one
+    # transition reviewed as "goes by too quickly". It's worth more of a long
+    # slide than a dissolve is.
+    MAX_DURATION_FRAMES = 72
+
     def plan(
         self,
         duration_frames: int,
@@ -122,6 +128,13 @@ class SmoothCut(Transition):
     didn't ask for. A future phase may replace this with a real
     optical-flow implementation backed by Resolve's native transition.
     """
+
+    # The point of a smooth cut is that it's barely there, so it must not
+    # grow with the slide. Matching :data:`SMOOTH_CUT_MAX_FRAMES` keeps the
+    # layout's carved-out overlap and the plan's real length in agreement —
+    # otherwise the slide would give up frames the transition never uses.
+    MIN_DURATION_FRAMES = 1
+    MAX_DURATION_FRAMES = SMOOTH_CUT_MAX_FRAMES
 
     def plan(
         self,

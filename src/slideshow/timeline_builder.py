@@ -39,6 +39,7 @@ from .transitions import (
     apply_comp_spec,
     comp_spec_for_clip,
     plan_transition,
+    resolve_duration_frames,
     wants_outgoing_on_top,
 )
 
@@ -283,6 +284,16 @@ def _prefers_outgoing_on_top(choice: TransitionChoice) -> bool:
     return wants_outgoing_on_top(_concrete_choice(choice))
 
 
+def _resolve_duration(choice: TransitionChoice, slide_frames: int) -> int:
+    """Layout hook: how long should this boundary's overlap be?
+
+    Resolves ``auto`` first for the same reason
+    :func:`_prefers_outgoing_on_top` does — the length has to come from the
+    kind that will actually run.
+    """
+    return resolve_duration_frames(_concrete_choice(choice), slide_frames)
+
+
 def _incoming_on_top(layout: TimelineLayout, transition_index: int) -> bool:
     """Is the incoming slide on a higher track than the outgoing one?
 
@@ -411,6 +422,7 @@ class TimelineBuilder:
             fps=fps,
             source_frames=source_frames,
             prefers_outgoing_on_top=_prefers_outgoing_on_top,
+            resolve_duration=_resolve_duration,
         )
 
         timeline = media_pool.CreateEmptyTimeline(self.project.name)

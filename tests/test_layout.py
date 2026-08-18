@@ -574,3 +574,90 @@ def test_clamped_overlap_still_leaves_a_visible_tail_body():
     _assert_tracks_are_sane(layout)
     bodies = [c for c in layout.segments_for_index(1) if c.track_index == LOWER_TRACK]
     assert len(bodies) == 1 and bodies[0].length_frames >= MIN_VISIBLE_FRAMES
+
+
+# --------------------------------------------------------------------------- #
+# Deriving overlap length from the slides (issue #1)
+# --------------------------------------------------------------------------- #
+
+def _derive(choice, slide_frames):
+    """Stand-in resolver: a flat quarter of the slide, so the arithmetic
+    under test is the layout's and not a transition class's."""
+    return max(1, slide_frames // 4)
+
+
+def _assert_lower_track_contiguous(layout):
+    lower = [c for c in layout.clips if c.track_index == LOWER_TRACK]
+    for previous, following in zip(lower, lower[1:]):
+        assert following.record_frame == previous.record_end_frame
+    assert lower[0].record_frame == 0
+    assert lower[-1].record_end_frame == layout.total_frames
+
+
+class TestDerivedOverlaps:
+    def test_unresolved_duration_is_sized_from_the_slide(self):
+        project = _project(count=2, duration=4.0, frames=None)
+        layout = plan_layout(project, fps=24.0, resolve_duration=_derive)
+        # 4s at 24fps = 96 frames; a quarter of that.
+        assert layout.transitions[0].duration_frames == 24
+
+    def test_a_longer_slide_gets_a_longer_overlap(self):
+        short = plan_layout(
+            _project(count=2, duration=4.0, frames=None),
+            fps=24.0,
+            resolve_duration=_derive,
+        )
+        longer = plan_layout(
+            _project(count=2, duration=8.0, frames=None),
+            fps=24.0,
+            resolve_duration=_derive,
+        )
+        assert (
+            longer.transitions[0].duration_frames
+            > short.transitions[0].duration_frames
+        )
+
+    def test_explicit_duration_is_left_alone(self):
+        project = _project(count=2, duration=4.0, frames=12)
+        layout = plan_layout(project, fps=24.0, resolve_duration=_derive)
+        assert layout.transitions[0].duration_frames == 12
+
+    def test_the_shorter_slide_governs(self):
+        # A boundary is constrained by whichever neighbour runs out of
+        # frames first, so that is what it must be sized against.
+        project = _project(count=2, duration=8.0, frames=None)
+        project.items[1].duration_seconds = 2.0
+        layout = plan_layout(project, fps=24.0, resolve_duration=_derive)
+        assert layout.transitions[0].duration_frames == 48 // 4
+
+    def test_a_cut_stays_a_cut(self):
+        project = _project(count=2, duration=4.0, transition="none", frames=None)
+        layout = plan_layout(project, fps=24.0, resolve_duration=_derive)
+        assert layout.transitions[0].duration_frames == 0
+        _assert_lower_track_contiguous(layout)
+
+    def test_no_resolver_means_no_overlap(self):
+        # A caller that never wired up a resolver must get hard cuts, not
+        # an overlap length invented out of nowhere.
+        project = _project(count=2, duration=4.0, frames=None)
+        layout = plan_layout(project, fps=24.0)
+        assert layout.transitions[0].duration_frames == 0
+
+    def test_downstream_only_ever_sees_concrete_frame_counts(self):
+        project = _project(count=4, duration=4.0, frames=None)
+        layout = plan_layout(project, fps=24.0, resolve_duration=_derive)
+        for choice in layout.transitions:
+            assert isinstance(choice.duration_frames, int)
+
+    def test_clamping_still_applies_on_top_of_derivation(self):
+        # A resolver that asks for more than the slides can give must still
+        # be cut back by the existing proportional shrink.
+        project = _project(count=3, duration=1.0, frames=None)
+        layout = plan_layout(
+            project, fps=24.0, resolve_duration=lambda c, n: 10_000
+        )
+        _assert_lower_track_contiguous(layout)
+        for index in range(layout.slide_count):
+            lead_in, lead_out = _slide_leads(layout, index)
+            body = _slide_lengths(layout)[index] - lead_in - lead_out
+            assert body >= MIN_VISIBLE_FRAMES, index

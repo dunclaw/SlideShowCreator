@@ -73,7 +73,15 @@ def _profile_keys(
 
 @register("drop")
 class Drop(Transition):
-    """Incoming clip accelerates in from above, lands and bounces twice."""
+    """Incoming clip accelerates in from above, lands and bounces twice.
+
+    The gravity curve spends most of its length in the first third of the
+    fall, and the two bounces are packed into the tail — so the same frame
+    count reads as much shorter here than it does for a dissolve. It gets a
+    higher ceiling for that reason.
+    """
+
+    MAX_DURATION_FRAMES = 72
 
     def plan(
         self,

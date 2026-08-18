@@ -113,6 +113,11 @@ class PageTurn(Transition):
     #: you are turning *to* dropping into place.
     DEFAULT_HINGE: ClassVar[str] = "right"
 
+    #: A physical page turn has a natural pace — too fast and the fold never
+    #: reads, too slow and it stops looking like a hand turning a page. It
+    #: gets a little more room than a dissolve, but not a lot.
+    MAX_DURATION_FRAMES = 60
+
     def plan(
         self,
         duration_frames: int,
