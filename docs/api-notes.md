@@ -17,6 +17,34 @@ PYTHONPATH        ;= %RESOLVE_SCRIPT_API%\Modules
 
 Sub-folders matter: place under `Edit/` to make the script appear when the Edit page is active.
 
+## Resolve does not bundle a Python interpreter
+
+Worth stating plainly, because assuming otherwise sends the whole design the
+wrong way. The scripting README lists under *Prerequisites*:
+
+> DaVinci Resolve scripting requires one of the following to be installed (for
+> all users): Lua 5.1, **Python >= 3.6 64-bit**, Python 2.7 64-bit
+
+There is no interpreter inside the install tree — confirmed by looking. So a
+script invoked from the Workspace → Scripts menu runs under whatever *system*
+Python Resolve discovered at startup, which is an environment we neither
+control nor should be installing packages into.
+
+The practical consequence is that **running in-process buys no environment
+stability — it loses it.** This machine is the proof: Python 3.12 crashes
+loading `fusionscript.dll`, while 3.14 works. Externally we pin a known-good
+interpreter; in-process we take whatever Resolve picked.
+
+The API is identical either way (that is the whole point of
+`RESOLVE_SCRIPT_API` / `RESOLVE_SCRIPT_LIB` above), so nothing is given up by
+driving Resolve from outside. Hence the architecture in issue #9: an external
+engine in a sidecar venv, plus a thin stdlib-only launcher in the Scripts
+folder that just hands off to it.
+
+A corollary worth keeping in mind: the version number alone does not tell you
+an interpreter is usable. Any setup routine has to *verify* a candidate can
+import the API and reach a running Resolve.
+
 ## Calls we'll rely on
 
 ### MediaPool
@@ -528,3 +556,65 @@ If you see exit code `-1073741819` immediately after the "import" step in
 `scripts/diagnose.py`, try a different Python build (3.10 or 3.14 are known
 good). The Resolve SDK README still officially lists Python 3.6 / 3.10 as
 preferred.
+
+## A clip's comp runs at the *photo's* resolution, not the timeline's
+
+Confirmed live on a 3840x2160 timeline holding a 1536x2048 portrait photo:
+
+```python
+mi = comp.FindTool("MediaIn1")
+mi.GetAttrs()["TOOLI_ImageWidth"]   # -> 1536   (not 3840)
+mi.GetAttrs()["TOOLI_ImageHeight"]  # -> 2048   (not 2160)
+```
+
+The letterboxing happens **downstream of the comp**, at the timeline level,
+governed by the project setting:
+
+```python
+proj.GetSetting("timelineInputResMismatchBehavior")   # -> 'scaleToFit'
+```
+
+Two consequences that are easy to get wrong:
+
+* A `Background` added inside the comp covers only the **photo's own box**,
+  not the frame. It gets letterboxed along with the photo, so the pillarbox
+  bars keep showing whatever is on the track underneath. Any real backdrop
+  feature (issue #13) therefore has to make the comp frame-sized first.
+* `Renderer3D` defaults its `Width`/`Height` to the *source* resolution for
+  the same reason, which is why `build_page_turn_graph` reads them back
+  instead of assuming 16:9 — and why a photo's own aspect currently decides
+  where the page-turn hinge lands.
+
+## `Loader` works inside Resolve and reports source dimensions
+
+`comp.AddTool("Loader")` succeeds in Resolve 20.3.3 and reads an arbitrary
+path off disk — the image does **not** have to be in the media pool or on the
+timeline:
+
+```python
+ld = comp.AddTool("Loader")
+ld.Clip[1] = r"D:\Temp\Pictures\...\DSCF0046.JPG"
+ld.GetAttrs()["TOOLIT_Clip_Width"]   # -> {1: 2048}
+ld.GetAttrs()["TOOLIT_Clip_Height"]  # -> {1: 1536}
+```
+
+Note the attribute names differ from `MediaIn`'s (`TOOLIT_Clip_*`, returning
+a dict keyed by 1, versus `TOOLI_Image*` returning a bare int).
+
+This is what makes the `Accumulate` backdrop in #13 practical: a slide's comp
+can rebuild the pile of previously-shown photos directly, one `Loader` each,
+instead of rendering stills to disk and re-importing them. Reading the source
+dimensions without decoding anything in Python is also what the fit/fill
+maths needs.
+
+## Tools that do not exist (probed by `AddTool`, which returns `None`)
+
+`GetRegList` returns opaque `PyRemoteObject`s, so the only reliable way to
+test for a tool is to try adding it.
+
+| Asked for | Result |
+| --------- | ------ |
+| `Resize` | **missing** — the registered ID is `BetterResize` |
+| `CustomTool` | **missing** |
+| `Loader`, `Transform3D`, `Merge3D`, `ImagePlane3D`, `Camera3D`, `Renderer3D` | OK |
+| `Background`, `Merge`, `Transform`, `BetterResize`, `ColorGain`, `Blur`, `Crop`, `DVE` | OK |
