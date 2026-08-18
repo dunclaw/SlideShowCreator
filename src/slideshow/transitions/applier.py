@@ -17,13 +17,20 @@ turned into a node graph.
 
 The graph built from a CompSpec is::
 
-    MediaIn1 ─► [Blur] ─► [Pixelate] ─► Transform ─┐
-                                                   ├─► [DipMerge] ─┐
-              Background(colour, opaque) ──────────┘               │
-                                                                   ├─► MediaOut1
-              Background(alpha 0) ─────────────────► [Merge] ──────┘
+    MediaIn1 ─► [Fit] ─┐
+                       ├─► [CanvasMerge] ─► [Blur] ─► [Pixelate] ─► Transform ─┐
+    Background(canvas) ┘                                                       │
+                                                                               │
+                                                     ├─► [DipMerge] ───────────┤
+                   Background(colour, opaque) ───────┘                         │
+                                                                               ├─► MediaOut1
+                   Background(alpha 0) ─────────────────► [Merge] ─────────────┘
 
-Both merges are optional. ``DipMerge`` only appears when the spec has a
+The canvas pair is what makes the comp render at the *timeline's* resolution
+rather than the photograph's; it is upstream of everything so that effects and
+animation work in frame pixels. See :func:`~slideshow.fusion_comps.add_canvas`.
+
+The other merges are optional. ``DipMerge`` only appears when the spec has a
 ``background_color`` (dip-to-colour); ``Merge`` only when it has ``blend``.
 Tools are only inserted when the spec needs them, and every tool has a
 stable name so re-running the builder over the same timeline rewires rather
@@ -45,6 +52,7 @@ from ..fusion_comps import (
     DEFAULT_MERGE_NAME,
     DEFAULT_PIXELATE_NAME,
     DEFAULT_TRANSFORM_NAME,
+    FRAMING_MODES,
     PIXELATE_SIZE_INPUT,
     PIXELATE_TOOL,
     PageTurnAnimation,
@@ -52,12 +60,14 @@ from ..fusion_comps import (
     ScalarKeyframe,
     TransformAnimation,
     add_background,
+    add_canvas,
     add_image_average,
     add_merge,
     apply_transform_animation,
     build_page_turn_graph,
     connect,
     find_tool,
+    framed_size,
     get_active_comp,
     insert_tool_chain,
     locked,
@@ -191,6 +201,65 @@ def _merge_page_turns(
 # CompSpec
 # --------------------------------------------------------------------------- #
 
+@dataclass(frozen=True)
+class Framing:
+    """How one photograph is sized onto the timeline frame.
+
+    Carried on the :class:`CompSpec` because it is the *canvas* the rest of
+    the graph animates in — see :func:`~slideshow.fusion_comps.add_canvas`
+    for why a clip comp does not get that for free.
+
+    ``backdrop`` is the colour painted where the photo does not reach, and
+    ``backdrop_alpha`` of ``0`` (the default) leaves those bars transparent,
+    which reproduces the behaviour we had before backdrops existed.
+    """
+
+    frame_width: int
+    frame_height: int
+    source_width: int
+    source_height: int
+    mode: str = "fit"
+    backdrop: RgbColor = (0.0, 0.0, 0.0)
+    backdrop_alpha: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.mode not in FRAMING_MODES:
+            raise ValueError(
+                "mode must be one of {0}, got {1!r}".format(FRAMING_MODES, self.mode)
+            )
+        for label, value in (
+            ("frame_width", self.frame_width),
+            ("frame_height", self.frame_height),
+            ("source_width", self.source_width),
+            ("source_height", self.source_height),
+        ):
+            if value <= 0:
+                raise ValueError("{0} must be > 0, got {1}".format(label, value))
+        if not 0.0 <= self.backdrop_alpha <= 1.0:
+            raise ValueError(
+                "backdrop_alpha must be in [0, 1], got {0}".format(self.backdrop_alpha)
+            )
+
+    def scaled_size(self) -> Tuple[int, int]:
+        """Pixel size the photo is resampled to."""
+        return framed_size(
+            self.source_width,
+            self.source_height,
+            self.frame_width,
+            self.frame_height,
+            mode=self.mode,
+        )
+
+    def is_noop(self) -> bool:
+        """True when building the canvas would change nothing on screen.
+
+        A transparent ``fit`` canvas produces exactly what Resolve's own
+        ``scaleToFit`` already does, so a clip that needs nothing else can
+        still skip having a comp attached.
+        """
+        return self.mode == "fit" and self.backdrop_alpha <= 0.0
+
+
 @dataclass
 class CompSpec:
     """Everything one clip's Fusion comp has to do, in clip-local frames.
@@ -210,6 +279,7 @@ class CompSpec:
     background_from_image: bool = False
     composite_mode: str = "normal"
     page_turn: Optional[PageTurnAnimation] = None
+    framing: Optional[Framing] = None
 
     def is_empty(self) -> bool:
         """True when this comp would be a no-op (so we skip building it)."""
@@ -223,6 +293,7 @@ class CompSpec:
             and not self.background_from_image
             and self.composite_mode == "normal"
             and (self.page_turn is None or self.page_turn.is_empty())
+            and (self.framing is None or self.framing.is_noop())
         )
 
 
@@ -313,6 +384,7 @@ def comp_spec_for_clip(
     *,
     lead_in_plan: Optional[TransitionPlan] = None,
     lead_out_plan: Optional[TransitionPlan] = None,
+    framing: Optional[Framing] = None,
 ) -> CompSpec:
     """Convenience wrapper: build a CompSpec from a :class:`PlacedClip`.
 
@@ -320,12 +392,14 @@ def comp_spec_for_clip(
     *incoming* half of the plan before the clip and the *outgoing* half of
     the plan after it.
     """
-    return merge_clip_plans(
+    spec = merge_clip_plans(
         length_frames=placed_clip.length_frames,
         lead_in=lead_in_plan.incoming if lead_in_plan is not None else None,
         lead_out=lead_out_plan.outgoing if lead_out_plan is not None else None,
         lead_out_frames=placed_clip.lead_out_frames,
     )
+    spec.framing = framing
+    return spec
 
 
 # --------------------------------------------------------------------------- #
@@ -345,6 +419,30 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
         # Transform off. ClipPlan rejects that combination at plan time.
         return build_page_turn_graph(comp, spec.page_turn)
 
+    built: Dict[str, Any] = {}
+
+    # The canvas comes first, before any effect, so that everything
+    # downstream animates in timeline pixels rather than in the
+    # photograph's own undersized space.
+    source: Any = None
+    if spec.framing is not None:
+        media_in = find_tool(comp, "MediaIn1")
+        if media_in is None:
+            raise RuntimeError("Composition has no 'MediaIn1' tool.")
+        canvas = add_canvas(
+            comp,
+            media_in,
+            frame_size=(spec.framing.frame_width, spec.framing.frame_height),
+            source_size=(spec.framing.source_width, spec.framing.source_height),
+            mode=spec.framing.mode,
+            color=spec.framing.backdrop,
+            alpha=spec.framing.backdrop_alpha,
+        )
+        built["fit"] = canvas["fit"]
+        built["canvas"] = canvas["canvas"]
+        built["canvas_merge"] = canvas["merge"]
+        source = canvas["merge"]
+
     chain: List[Tuple[str, str]] = []
     if spec.blur_size:
         chain.append((BLUR_TOOL, DEFAULT_BLUR_NAME))
@@ -352,8 +450,8 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
         chain.append((PIXELATE_TOOL, DEFAULT_PIXELATE_NAME))
     chain.append(("Transform", DEFAULT_TRANSFORM_NAME))
 
-    tools = insert_tool_chain(comp, chain)
-    built: Dict[str, Any] = {"transform": tools[-1]}
+    tools = insert_tool_chain(comp, chain, source=source)
+    built["transform"] = tools[-1]
     index = 0
     if spec.blur_size:
         built["blur"] = tools[index]
@@ -496,6 +594,7 @@ def apply_comp_spec(timeline_item: Any, spec: CompSpec) -> Optional[Any]:
 
 __all__ = [
     "CompSpec",
+    "Framing",
     "PageTurnAnimation",
     "PointKeyframe",
     "ScalarKeyframe",

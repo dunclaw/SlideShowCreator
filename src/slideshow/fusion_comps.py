@@ -78,6 +78,12 @@ PIXELATE_TOOL = "ofx.com.blackmagicdesign.resolvefx.MosaicBlur"
 #: registered as ``BetterResize``.
 RESIZE_TOOL = "BetterResize"
 
+#: The canvas pair: a frame-sized Background and the Merge that composites the
+#: fitted photograph onto it. See :func:`add_canvas`.
+DEFAULT_CANVAS_NAME = "SlideShowCanvas"
+DEFAULT_CANVAS_MERGE_NAME = "SlideShowCanvasMerge"
+DEFAULT_FIT_NAME = "SlideShowFit"
+
 #: Saturation and gamma applied to a photo's average colour before it is used
 #: as a dip background.
 #:
@@ -135,6 +141,53 @@ def pixel_size_to_frequency(
 TOOL_IMAGE_INPUTS = {
     PIXELATE_TOOL: "Source",
 }
+
+
+#: Recognised ways of sizing a photograph into the frame.
+FRAMING_MODES = ("fit", "fill")
+
+
+def framed_size(
+    source_width: int,
+    source_height: int,
+    frame_width: int,
+    frame_height: int,
+    mode: str = "fit",
+) -> Tuple[int, int]:
+    """Pixel size a photo is resampled to before being laid on the canvas.
+
+    ``fit`` scales until the photo is wholly inside the frame, leaving letter-
+    or pillar-box bars for the backdrop to fill. ``fill`` scales until the
+    frame is wholly covered, so the photo overhangs on one axis and gets
+    cropped by the canvas.
+
+    Note this returns the size of the *whole* photo in both modes — the crop
+    in ``fill`` is done by the canvas merge, not by shrinking the image, which
+    is what leaves room for a subject-aware offset later.
+    """
+    if mode not in FRAMING_MODES:
+        raise ValueError(
+            "mode must be one of {0}, got {1!r}".format(FRAMING_MODES, mode)
+        )
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError(
+            "source size must be positive, got {0}x{1}".format(
+                source_width, source_height
+            )
+        )
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError(
+            "frame size must be positive, got {0}x{1}".format(
+                frame_width, frame_height
+            )
+        )
+    sx = frame_width / float(source_width)
+    sy = frame_height / float(source_height)
+    scale = min(sx, sy) if mode == "fit" else max(sx, sy)
+    return (
+        max(1, int(round(source_width * scale))),
+        max(1, int(round(source_height * scale))),
+    )
 
 
 def primary_image_input(tool_type: str) -> str:
@@ -550,6 +603,7 @@ def insert_tool_chain(
     comp: Any,
     specs: Sequence[Tuple[str, str]],
     *,
+    source: Optional[Any] = None,
     media_in_name: str = "MediaIn1",
     media_out_name: str = "MediaOut1",
     first_position: Tuple[int, int] = (1, 0),
@@ -567,14 +621,16 @@ def insert_tool_chain(
 
     Passing an empty *specs* wires MediaIn1 straight to MediaOut1.
 
+    *source* substitutes a different tool for MediaIn1 at the head of the
+    chain, which is how the canvas gets spliced in ahead of every effect.
+
     Returns the tools in the same order as *specs*.
     """
-    media_in = _require_tool(comp, media_in_name)
+    upstream = source if source is not None else _require_tool(comp, media_in_name)
     media_out = _require_tool(comp, media_out_name)
 
     x, y = first_position
     tools: List[Any] = []
-    upstream = media_in
     for offset, (tool_type, tool_name) in enumerate(specs):
         tool = find_or_add_tool(
             comp, tool_type, tool_name, position=(x + offset, y)
@@ -618,12 +674,18 @@ def add_background(
     name: str = DEFAULT_BACKGROUND_NAME,
     alpha: float = 1.0,
     position: Tuple[int, int] = (0, 1),
+    size: Optional[Tuple[int, int]] = None,
 ) -> Any:
     """Find or create a solid-colour Background tool set to *color*.
 
     Fusion's Background tool exposes its colour as four separate scalar
     inputs (``TopLeftRed`` … ``TopLeftAlpha``) rather than one Point/RGBA
     input, so each channel is set individually.
+
+    *size* forces the tool's canvas to an explicit pixel size. Without it a
+    Background inherits the comp's frame format, and inside a Resolve
+    timeline-clip comp that is the **photograph's** resolution, not the
+    timeline's — see :func:`add_canvas`.
     """
     r, g, b = color
     tool = find_or_add_tool(comp, "Background", name, position=position)
@@ -631,6 +693,12 @@ def add_background(
     tool.SetInput("TopLeftGreen", float(g))
     tool.SetInput("TopLeftBlue", float(b))
     tool.SetInput("TopLeftAlpha", float(alpha))
+    if size is not None:
+        width, height = size
+        # Has to be cleared first, or Width/Height are ignored.
+        tool.SetInput("UseFrameFormatSettings", 0.0)
+        tool.SetInput("Width", float(width))
+        tool.SetInput("Height", float(height))
     return tool
 
 
@@ -721,6 +789,75 @@ def set_merge_apply_mode(merge: Any, mode: str) -> None:
     abort the whole build.
     """
     merge.SetInput("ApplyMode", MERGE_APPLY_MODES.get(mode, "Normal"))
+
+
+def add_canvas(
+    comp: Any,
+    source: Any,
+    *,
+    frame_size: Tuple[int, int],
+    source_size: Tuple[int, int],
+    mode: str = "fit",
+    color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    alpha: float = 0.0,
+    position: Tuple[int, int] = (0, -2),
+) -> Dict[str, Any]:
+    """Resample *source* into the frame and lay it on a frame-sized canvas.
+
+    Returns the tools created, keyed ``fit``, ``canvas`` and ``merge``; the
+    ``merge`` is the new head of the chain.
+
+    **Why this exists.** A Fusion comp attached to a Resolve timeline clip
+    runs at the *clip's* resolution, not the timeline's: on a 3840x2160
+    timeline a 1536x2048 photograph gives ``MediaIn1`` a 1536x2048 canvas,
+    and Resolve letterboxes the comp's output afterwards according to the
+    project's ``timelineInputResMismatchBehavior``. Two things follow, and
+    both are bugs we actually shipped:
+
+    * A Background added inside the comp covers only the photo's own box, so
+      it can never paint the letterbox bars — there is nothing for a backdrop
+      to be drawn on.
+    * A Transform animates in that same undersized space, so a slide moves
+      the photo across *its own* letterbox rather than across the frame, and
+      the bars keep showing whatever is on the track below.
+
+    So the canvas is established here, **upstream of every effect**, and from
+    this point on the whole graph works in real frame pixels.
+
+    With the default transparent black canvas the output is indistinguishable
+    from letting Resolve do the fitting, which is what makes this safe to
+    apply to every clip. Giving the canvas a colour and an alpha is then all
+    a solid backdrop needs.
+    """
+    fit_w, fit_h = framed_size(
+        source_size[0], source_size[1], frame_size[0], frame_size[1], mode=mode
+    )
+    resize = find_or_add_tool(comp, RESIZE_TOOL, DEFAULT_FIT_NAME, position=position)
+    if resize is None:
+        raise RuntimeError(
+            "Could not create a {0!r} tool for the canvas fit.".format(RESIZE_TOOL)
+        )
+    resize.SetInput("Width", float(fit_w))
+    resize.SetInput("Height", float(fit_h))
+    connect(source, resize, primary_image_input(RESIZE_TOOL))
+
+    canvas = add_background(
+        comp,
+        color,
+        name=DEFAULT_CANVAS_NAME,
+        alpha=alpha,
+        position=(position[0], position[1] - 1),
+        size=frame_size,
+    )
+    merge = add_merge(
+        comp,
+        background=canvas,
+        foreground=resize,
+        name=DEFAULT_CANVAS_MERGE_NAME,
+        apply_mode="normal",
+        position=(position[0] + 1, position[1] - 1),
+    )
+    return {"fit": resize, "canvas": canvas, "merge": merge}
 
 
 
@@ -1116,61 +1253,67 @@ def _safe_name(timeline_item: Any) -> str:
 
 
 __all__ = [
-    "BLUR_SIZE_INPUT",
-    "BLUR_TOOL",
-    "DEFAULT_BACKGROUND_NAME",
-    "DEFAULT_AVERAGE_COLOR_NAME",
-    "DEFAULT_AVERAGE_DOWN_NAME",
-    "DEFAULT_AVERAGE_UP_NAME",
-    "DEFAULT_COLOR_BACKGROUND_NAME",
-    "DEFAULT_COLOR_MERGE_NAME",
-    "DEFAULT_BLUR_NAME",
-    "DEFAULT_MERGE_NAME",
-    "DEFAULT_PIXELATE_NAME",
-    "DEFAULT_TRANSFORM_NAME",
-    "MERGE_APPLY_MODES",
-    "IMAGE_COLOR_GAMMA",
-    "IMAGE_COLOR_SATURATION",
-    "RESIZE_TOOL",
-    "PIXELATE_SIZE_INPUT",
-    "PIXELATE_TOOL",
-    "PIXELATE_REFERENCE_WIDTH",
-    "PIXELATE_MIN_FREQUENCY",
-    "PIXELATE_MAX_FREQUENCY",
-    "pixel_size_to_frequency",
-    "TOOL_IMAGE_INPUTS",
-    "PointKeyframe",
-    "ScalarKeyframe",
-    "TransformAnimation",
-    "add_background",
-    "add_blur",
-    "add_image_average",
-    "add_merge",
-    "add_pixelate",
-    "apply_transform_animation",
-    "attach_or_get_comp",
-    "attach_transform_animation",
-    "connect",
-    "find_or_add_tool",
-    "primary_image_input",
-    "find_tool",
-    "get_active_comp",
-    "insert_tool_chain",
-    "insert_transform_chain",
-    "list_tools",
-    "locked",
-    "mark_modified",
-    "set_constant",
-    "set_merge_apply_mode",
-    "set_point_keyframes",
-    "set_scalar_keyframes",
-    "DEFAULT_PAGE_FOCAL_LENGTH",
-    "PAGE_CAMERA_CLEARANCE",
-    "PAGE_HINGES",
-    "PageTurnAnimation",
-    "build_page_turn_graph",
-    "camera_distance",
-    "fit_angles_to_frame",
-    "page_entry_angle",
-    "page_focal_length_for_clearance",
+    "add_background",
+    "add_blur",
+    "add_canvas",
+    "add_image_average",
+    "add_merge",
+    "add_pixelate",
+    "apply_transform_animation",
+    "attach_or_get_comp",
+    "attach_transform_animation",
+    "BLUR_SIZE_INPUT",
+    "BLUR_TOOL",
+    "build_page_turn_graph",
+    "camera_distance",
+    "connect",
+    "DEFAULT_AVERAGE_COLOR_NAME",
+    "DEFAULT_AVERAGE_DOWN_NAME",
+    "DEFAULT_AVERAGE_UP_NAME",
+    "DEFAULT_BACKGROUND_NAME",
+    "DEFAULT_BLUR_NAME",
+    "DEFAULT_CANVAS_MERGE_NAME",
+    "DEFAULT_CANVAS_NAME",
+    "DEFAULT_COLOR_BACKGROUND_NAME",
+    "DEFAULT_COLOR_MERGE_NAME",
+    "DEFAULT_FIT_NAME",
+    "DEFAULT_MERGE_NAME",
+    "DEFAULT_PAGE_FOCAL_LENGTH",
+    "DEFAULT_PIXELATE_NAME",
+    "DEFAULT_TRANSFORM_NAME",
+    "find_or_add_tool",
+    "find_tool",
+    "fit_angles_to_frame",
+    "framed_size",
+    "FRAMING_MODES",
+    "get_active_comp",
+    "IMAGE_COLOR_GAMMA",
+    "IMAGE_COLOR_SATURATION",
+    "insert_tool_chain",
+    "insert_transform_chain",
+    "list_tools",
+    "locked",
+    "mark_modified",
+    "MERGE_APPLY_MODES",
+    "PAGE_CAMERA_CLEARANCE",
+    "page_entry_angle",
+    "page_focal_length_for_clearance",
+    "PAGE_HINGES",
+    "PageTurnAnimation",
+    "pixel_size_to_frequency",
+    "PIXELATE_MAX_FREQUENCY",
+    "PIXELATE_MIN_FREQUENCY",
+    "PIXELATE_REFERENCE_WIDTH",
+    "PIXELATE_SIZE_INPUT",
+    "PIXELATE_TOOL",
+    "PointKeyframe",
+    "primary_image_input",
+    "RESIZE_TOOL",
+    "ScalarKeyframe",
+    "set_constant",
+    "set_merge_apply_mode",
+    "set_point_keyframes",
+    "set_scalar_keyframes",
+    "TOOL_IMAGE_INPUTS",
+    "TransformAnimation",
 ]

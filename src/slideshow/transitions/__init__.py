@@ -58,6 +58,7 @@ from . import page_turn as _page_turn  # noqa: F401
 
 from .applier import (  # noqa: E402  (must follow the registry imports)
     CompSpec,
+    Framing,
     apply_comp_spec,
     apply_composite_mode,
     build_comp_graph,
@@ -71,6 +72,7 @@ __all__ = [
     "NOMINAL_SLIDE_FRAMES",
     "ClipPlan",
     "CompSpec",
+    "Framing",
     "PointKeyframe",
     "RgbColor",
     "ScalarKeyframe",

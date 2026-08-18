@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 from .layout import (
+    LOWER_TRACK,
     SEGMENT_BODY,
     SEGMENT_HEAD,
     SEGMENT_TAIL,
@@ -32,9 +33,15 @@ from .layout import (
     seconds_to_frames,
 )
 
-from .project_model import MediaItem, SlideshowProject, TransitionChoice
+from .project_model import (
+    FramingSettings,
+    MediaItem,
+    SlideshowProject,
+    TransitionChoice,
+)
 from .resolve_bridge import ResolveContext
 from .transitions import (
+    Framing,
     TransitionPlan,
     apply_comp_spec,
     comp_spec_for_clip,
@@ -62,6 +69,53 @@ def _timeline_fps(project: Any, fallback: float = DEFAULT_TIMELINE_FPS) -> float
     except (TypeError, ValueError):
         pass
     return fallback
+
+
+#: Frame size assumed when Resolve will not tell us — UHD, matching the
+#: project template the builder creates timelines from.
+DEFAULT_FRAME_SIZE = (3840, 2160)
+
+
+def _timeline_frame_size(
+    project: Any, fallback: Tuple[int, int] = DEFAULT_FRAME_SIZE
+) -> Tuple[int, int]:
+    """Pixel size of the timeline Resolve will render.
+
+    Needed because a clip's Fusion comp does *not* inherit it — see
+    :func:`~slideshow.fusion_comps.add_canvas`.
+    """
+    try:
+        width = int(project.GetSetting("timelineResolutionWidth"))
+        height = int(project.GetSetting("timelineResolutionHeight"))
+    except (TypeError, ValueError, AttributeError):
+        return fallback
+    if width > 0 and height > 0:
+        return (width, height)
+    return fallback
+
+
+def _source_size(media_pool_item: Any) -> Optional[Tuple[int, int]]:
+    """Native pixel size of a pool item, parsed from its ``Resolution``.
+
+    This is deliberately read from the media pool rather than from the comp:
+    ``MediaIn1.GetAttrs()["TOOLI_ImageWidth"]`` is ``None`` until the comp has
+    rendered at least once, so it is useless while we are still building.
+    """
+    if media_pool_item is None:
+        return None
+    try:
+        raw = media_pool_item.GetClipProperty("Resolution")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        width, height = (int(part) for part in str(raw).lower().split("x"))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (width, height)
 
 
 #: Frames-from-seconds lives in :mod:`slideshow.layout` now; re-exported here
@@ -487,6 +541,9 @@ class TimelineBuilder:
             )
         result.transition_plans = plans
 
+        framing = self.project.framing
+        frame_size = _timeline_frame_size(self.context.project)
+
         for position, placed in enumerate(clips):
             # A head carries the transition into its slide and a tail the one
             # out of it. A body carries whichever half the boundary did not
@@ -498,13 +555,70 @@ class TimelineBuilder:
             lead_out_plan = None
             if placed.lead_out_frames > 0 and placed.index < len(plans):
                 lead_out_plan = plans[placed.index]
-            if lead_in_plan is None and lead_out_plan is None:
+
+            timeline_item = result.timeline_items[position]
+            # Framing has to be applied to *every* segment of a slide, not
+            # just the ones carrying a transition: a head that fills and a
+            # body that fits would change size mid-slide, turning the
+            # split-track seam into a visible jump.
+            clip_framing = self._framing_for(
+                timeline_item, framing, frame_size, placed.track_index
+            )
+            if (
+                lead_in_plan is None
+                and lead_out_plan is None
+                and (clip_framing is None or clip_framing.is_noop())
+            ):
                 continue
             spec = comp_spec_for_clip(
-                placed, lead_in_plan=lead_in_plan, lead_out_plan=lead_out_plan
+                placed,
+                lead_in_plan=lead_in_plan,
+                lead_out_plan=lead_out_plan,
+                framing=clip_framing,
             )
-            if apply_comp_spec(result.timeline_items[position], spec) is not None:
+            if apply_comp_spec(timeline_item, spec) is not None:
                 result.comps_applied += 1
+
+    @staticmethod
+    def _framing_for(
+        timeline_item: Any,
+        settings: FramingSettings,
+        frame_size: Tuple[int, int],
+        track_index: int,
+    ) -> Optional[Framing]:
+        """Build the per-clip :class:`Framing`, or ``None`` if it can't be sized.
+
+        Returning ``None`` when the source resolution is unreadable is
+        deliberate: without it we cannot compute a fit, and guessing would
+        scale the photo wrongly. Falling back to Resolve's own letterboxing
+        loses the backdrop but keeps the picture correct.
+
+        **The backdrop is painted on the lower track only.** It is opaque and
+        fills the frame, so a copy of it in an upper clip's comp would hide
+        the clip underneath — during a transition that blacks out the other
+        half of the transition entirely. The lower track is contiguous by
+        construction (``plan_layout`` guarantees it spans the whole
+        timeline), so one backdrop down there is behind everything, always.
+        Upper clips still get a frame-sized *transparent* canvas, because
+        that is what makes their animation move in frame pixels.
+        """
+        try:
+            media_pool_item = timeline_item.GetMediaPoolItem()
+        except Exception:
+            return None
+        source_size = _source_size(media_pool_item)
+        if source_size is None:
+            return None
+        on_lower_track = track_index <= LOWER_TRACK
+        return Framing(
+            frame_width=frame_size[0],
+            frame_height=frame_size[1],
+            source_width=source_size[0],
+            source_height=source_size[1],
+            mode=settings.mode,
+            backdrop=settings.backdrop_color,
+            backdrop_alpha=settings.backdrop_alpha if on_lower_track else 0.0,
+        )
 
     # -- entry point ------------------------------------------------------- #
 

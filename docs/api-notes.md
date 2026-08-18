@@ -607,6 +607,21 @@ instead of rendering stills to disk and re-importing them. Reading the source
 dimensions without decoding anything in Python is also what the fit/fill
 maths needs.
 
+**But `AddTool("Loader")` pops a modal file-open dialog.** It is a plain
+Windows file browser, not a Resolve one, and it does not necessarily come to
+the front — so from the script's point of view Resolve simply stops
+responding: `GetCurrentPage()` starts returning `None`, `OpenPage()` does
+nothing, and `LoadFusionCompByName()` returns `None` while project- and
+timeline-level queries carry on working normally. Two of these queued up
+during a probe here and cancelling them crashed Resolve.
+
+So a scripted Loader has to be created without the browser ever opening.
+Untested options, in rough order of promise: build the tool from a serialised
+comp fragment (`comp.Paste`), or set `Clip` in the `AddTool` argument table
+rather than afterwards. **Verify this before the Accumulate work depends on
+it**, and treat any Resolve that has gone quiet as "look for a dialog behind
+the main window" rather than "the API is broken".
+
 ## Tools that do not exist (probed by `AddTool`, which returns `None`)
 
 `GetRegList` returns opaque `PyRemoteObject`s, so the only reliable way to
@@ -618,3 +633,17 @@ test for a tool is to try adding it.
 | `CustomTool` | **missing** |
 | `Loader`, `Transform3D`, `Merge3D`, `ImagePlane3D`, `Camera3D`, `Renderer3D` | OK |
 | `Background`, `Merge`, `Transform`, `BetterResize`, `ColorGain`, `Blur`, `Crop`, `DVE` | OK |
+
+## An opaque backdrop belongs on the lower track only
+
+A Fusion comp cannot see the track beneath it, so a frame-filling opaque
+Background inside an *upper* clip's comp hides the lower clip completely.
+During a transition that is fatal: the outgoing and incoming photos are on
+different tracks, so painting the backdrop in both comps blacks out one half
+of the transition and the slide appears to jump across a gap.
+
+`plan_layout` guarantees the lower track is contiguous from frame 0 to
+`total_frames`, so one backdrop down there sits behind everything for the
+whole timeline. Upper clips still get a frame-sized but *transparent* canvas
+— they need it for their animation to move in frame pixels, not for anything
+they paint.

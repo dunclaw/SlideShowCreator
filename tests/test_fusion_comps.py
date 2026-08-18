@@ -887,3 +887,122 @@ def test_set_merge_apply_mode(mode, expected):
     assert merge.inputs["ApplyMode"] == expected
 
 
+
+
+# --------------------------------------------------------------------------- #
+# framed_size()
+# --------------------------------------------------------------------------- #
+
+class TestFramedSize:
+    def test_fit_letterboxes_a_portrait(self):
+        # 1536x2048 into UHD: height is the binding axis, so the photo ends up
+        # frame-tall with pillarbox bars either side.
+        assert fc.framed_size(1536, 2048, 3840, 2160) == (1620, 2160)
+
+    def test_fill_overhangs_the_binding_axis(self):
+        # Same photo, filling: width is now binding and the extra height is
+        # left for the canvas to crop.
+        assert fc.framed_size(1536, 2048, 3840, 2160, mode="fill") == (3840, 5120)
+
+    def test_fit_and_fill_agree_when_aspects_match(self):
+        assert fc.framed_size(1920, 1080, 3840, 2160) == (3840, 2160)
+        assert fc.framed_size(1920, 1080, 3840, 2160, mode="fill") == (3840, 2160)
+
+    def test_landscape_fit_is_letterboxed_not_pillarboxed(self):
+        assert fc.framed_size(2048, 1536, 3840, 2160) == (2880, 2160)
+
+    def test_fill_never_leaves_a_gap(self):
+        for sw, sh in ((1536, 2048), (2048, 1536), (1000, 1000), (4000, 900)):
+            w, h = fc.framed_size(sw, sh, 3840, 2160, mode="fill")
+            assert w >= 3840 and h >= 2160
+
+    def test_fit_never_overflows(self):
+        for sw, sh in ((1536, 2048), (2048, 1536), (1000, 1000), (4000, 900)):
+            w, h = fc.framed_size(sw, sh, 3840, 2160)
+            assert w <= 3840 and h <= 2160
+
+    def test_aspect_ratio_is_preserved(self):
+        w, h = fc.framed_size(1536, 2048, 3840, 2160)
+        assert abs(w / h - 1536 / 2048) < 0.001
+
+    def test_result_is_never_degenerate(self):
+        assert fc.framed_size(1, 20000, 3840, 2160) == (1, 2160)
+
+    def test_rejects_unknown_mode(self):
+        with pytest.raises(ValueError, match="mode"):
+            fc.framed_size(100, 100, 200, 200, mode="stretch")
+
+    @pytest.mark.parametrize(
+        "args",
+        [(0, 100, 200, 200), (100, 0, 200, 200), (100, 100, 0, 200), (100, 100, 200, 0)],
+    )
+    def test_rejects_non_positive_sizes(self, args):
+        with pytest.raises(ValueError):
+            fc.framed_size(*args)
+
+
+# --------------------------------------------------------------------------- #
+# add_canvas()
+# --------------------------------------------------------------------------- #
+
+class TestAddCanvas:
+    def _comp(self):
+        comp = MagicMock()
+        comp.FindTool.return_value = None
+        tools = {}
+
+        def add_tool(tool_type, *args, **kwargs):
+            tool = MagicMock()
+            tool.GetInput.side_effect = fake_get_input(tool, tool_type)
+            tools[tool_type] = tool
+            return tool
+
+        comp.AddTool.side_effect = add_tool
+        return comp, tools
+
+    def test_background_is_forced_to_the_frame_size(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+        )
+        calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        # Clearing UseFrameFormatSettings is what stops the Background
+        # inheriting the *photo's* resolution.
+        assert calls["UseFrameFormatSettings"] == 0.0
+        assert calls["Width"] == 3840.0
+        assert calls["Height"] == 2160.0
+
+    def test_fit_tool_gets_the_scaled_size(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+        )
+        calls = dict(c.args for c in built["fit"].SetInput.call_args_list)
+        assert (calls["Width"], calls["Height"]) == (1620.0, 2160.0)
+
+    def test_canvas_alpha_defaults_to_transparent(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+        )
+        calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        assert calls["TopLeftAlpha"] == 0.0
+
+    def test_returns_the_merge_as_the_new_head(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+        )
+        assert set(built) == {"fit", "canvas", "merge"}

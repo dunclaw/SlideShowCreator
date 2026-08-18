@@ -8,6 +8,7 @@ import tempfile
 
 import pytest
 
+import slideshow.project_model as pm
 from slideshow.project_model import (
     DEFAULT_MOTION_ZOOM_AMOUNT,
     PROJECT_SCHEMA_VERSION,
@@ -635,3 +636,58 @@ class TestJsonRoundTrip:
         assert all(it.motion is None for it in loaded.items)
         assert loaded.items[0].title is not None
         assert loaded.items[0].title.text == "Hi"
+
+
+# --------------------------------------------------------------------------- #
+# FramingSettings
+# --------------------------------------------------------------------------- #
+
+class TestFramingSettings:
+    def test_defaults_reproduce_resolves_own_behaviour(self):
+        settings = pm.FramingSettings()
+        assert settings.mode == "fit"
+        assert settings.backdrop == "none"
+        assert settings.is_default()
+        assert settings.backdrop_alpha == 0.0
+
+    def test_a_backdrop_makes_it_non_default(self):
+        assert not pm.FramingSettings(backdrop="solid").is_default()
+        assert pm.FramingSettings(backdrop="solid").backdrop_alpha == 1.0
+
+    def test_fill_makes_it_non_default(self):
+        assert not pm.FramingSettings(mode="fill").is_default()
+
+    def test_rejects_unknown_mode(self):
+        with pytest.raises(ValueError, match="mode"):
+            pm.FramingSettings(mode="stretch")
+
+    def test_rejects_unimplemented_backdrop(self):
+        # Better to fail loudly than to silently ignore a backdrop the
+        # builder cannot draw yet.
+        with pytest.raises(ValueError, match="backdrop"):
+            pm.FramingSettings(backdrop="accumulate")
+
+    def test_rejects_out_of_range_colour(self):
+        with pytest.raises(ValueError, match="backdrop_color"):
+            pm.FramingSettings(backdrop="solid", backdrop_color=(1.5, 0.0, 0.0))
+
+    def test_colour_is_normalised_to_a_tuple_of_floats(self):
+        settings = pm.FramingSettings(backdrop="solid", backdrop_color=[0, 1, 0])
+        assert settings.backdrop_color == (0.0, 1.0, 0.0)
+
+    def test_round_trips_through_a_dict(self):
+        settings = pm.FramingSettings(
+            mode="fill", backdrop="solid", backdrop_color=(0.1, 0.2, 0.3)
+        )
+        assert pm.FramingSettings.from_dict(settings.to_dict()) == settings
+
+    def test_project_round_trips_framing(self):
+        project = pm.SlideshowProject(name="p")
+        project.framing = pm.FramingSettings(mode="fill", backdrop="solid")
+        restored = pm.SlideshowProject.from_json(project.to_json())
+        assert restored.framing == project.framing
+
+    def test_project_without_framing_gets_the_default(self):
+        # Files written before framing existed must still load.
+        restored = pm.SlideshowProject.from_dict({"name": "p", "items": []})
+        assert restored.framing == pm.FramingSettings()

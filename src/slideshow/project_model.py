@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 # --------------------------------------------------------------------------- #
@@ -404,6 +404,98 @@ class AudioSettings:
 
 
 # --------------------------------------------------------------------------- #
+# Framing and backdrop
+# --------------------------------------------------------------------------- #
+
+#: How a photograph is sized into the timeline frame.
+#:
+#: ``fit`` shows the whole picture and leaves bars; ``fill`` covers the frame
+#: and crops the overhang.
+FRAMING_MODES = ("fit", "fill")
+
+#: What gets painted where the photograph does not reach.
+#:
+#: ``none`` leaves the bars transparent, so whatever is on the track below
+#: shows through — the behaviour from before backdrops existed. ``solid``
+#: paints :attr:`FramingSettings.backdrop_color`.
+#:
+#: The remaining options from issue #13 — ``blur``, ``dominant`` and
+#: ``accumulate`` — are deliberately *not* listed until they are implemented,
+#: so a project file can never ask for a backdrop that is silently ignored.
+BACKDROP_KINDS = ("none", "solid")
+
+DEFAULT_BACKDROP_COLOR = (0.0, 0.0, 0.0)
+
+
+@dataclass
+class FramingSettings:
+    """How every slide is placed into the frame, and what fills the rest.
+
+    Project-wide rather than per-item on purpose: mixing fit and fill across
+    slides makes the picture jump size at every cut, and a backdrop that
+    changes between neighbouring slides reads as a flash. Per-item overrides
+    can be added later if a real need turns up.
+    """
+
+    mode: str = "fit"
+    backdrop: str = "none"
+    backdrop_color: Tuple[float, float, float] = DEFAULT_BACKDROP_COLOR
+
+    def __post_init__(self) -> None:
+        if self.mode not in FRAMING_MODES:
+            raise ValueError(
+                "FramingSettings.mode must be one of {0}, got {1!r}".format(
+                    sorted(FRAMING_MODES), self.mode
+                )
+            )
+        if self.backdrop not in BACKDROP_KINDS:
+            raise ValueError(
+                "FramingSettings.backdrop must be one of {0}, got {1!r}".format(
+                    sorted(BACKDROP_KINDS), self.backdrop
+                )
+            )
+        color = tuple(float(c) for c in self.backdrop_color)
+        if len(color) != 3:
+            raise ValueError(
+                "FramingSettings.backdrop_color must have 3 channels, got {0}".format(
+                    len(color)
+                )
+            )
+        for channel in color:
+            if not 0.0 <= channel <= 1.0:
+                raise ValueError(
+                    "FramingSettings.backdrop_color channels must be in "
+                    "[0, 1], got {0!r}".format(self.backdrop_color)
+                )
+        self.backdrop_color = color
+
+    @property
+    def backdrop_alpha(self) -> float:
+        """Opacity of the backdrop: ``0`` for ``none``, ``1`` otherwise."""
+        return 0.0 if self.backdrop == "none" else 1.0
+
+    def is_default(self) -> bool:
+        """True when these settings ask for exactly Resolve's own behaviour."""
+        return self.mode == "fit" and self.backdrop == "none"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "backdrop": self.backdrop,
+            "backdrop_color": list(self.backdrop_color),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FramingSettings":
+        color = data.get("backdrop_color") or DEFAULT_BACKDROP_COLOR
+        return cls(
+            mode=str(data.get("mode", "fit")),
+            backdrop=str(data.get("backdrop", "none")),
+            backdrop_color=tuple(float(c) for c in color),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Media items
 # --------------------------------------------------------------------------- #
 
@@ -524,6 +616,7 @@ class SlideshowProject:
         default_factory=lambda: MotionChoice(kind="none")
     )
     audio: Optional[AudioSettings] = None
+    framing: FramingSettings = field(default_factory=FramingSettings)
     target_total_duration_seconds: Optional[float] = None
 
     @property
@@ -649,6 +742,7 @@ class SlideshowProject:
             "default_transition": self.default_transition.to_dict(),
             "default_motion": self.default_motion.to_dict(),
             "audio": self.audio.to_dict() if self.audio is not None else None,
+            "framing": self.framing.to_dict(),
             "target_total_duration_seconds": self.target_total_duration_seconds,
             "items": [it.to_dict() for it in self.items],
         }
@@ -677,6 +771,11 @@ class SlideshowProject:
         audio = AudioSettings.from_dict(audio_data) if audio_data else None
         if audio is None and data.get("soundtrack_path"):
             audio = AudioSettings(soundtrack_path=str(data["soundtrack_path"]))
+        framing_data = data.get("framing")
+        framing = (
+            FramingSettings.from_dict(framing_data)
+            if framing_data else FramingSettings()
+        )
         items_data = data.get("items") or []
         return cls(
             name=str(data.get("name", "Slideshow")),
@@ -687,6 +786,7 @@ class SlideshowProject:
             default_transition=default_trans,
             default_motion=default_motion,
             audio=audio,
+            framing=framing,
             target_total_duration_seconds=_opt_float(
                 data.get("target_total_duration_seconds")
             ),
@@ -730,6 +830,10 @@ def _opt_str(value: Any) -> Optional[str]:
 
 
 __all__ = [
+    "FramingSettings",
+    "FRAMING_MODES",
+    "DEFAULT_BACKDROP_COLOR",
+    "BACKDROP_KINDS",
     "AudioSettings",
     "DEFAULT_MOTION_ZOOM_AMOUNT",
     "DEFAULT_TRANSITION_DURATION_FRAMES",

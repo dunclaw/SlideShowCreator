@@ -27,7 +27,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src")
 sys.path.insert(0, SRC)
 
-from slideshow.project_model import SlideshowProject, TransitionChoice  # noqa: E402
+from slideshow.project_model import (  # noqa: E402
+    BACKDROP_KINDS,
+    FRAMING_MODES,
+    FramingSettings,
+    SlideshowProject,
+    TransitionChoice,
+)
 from slideshow.resolve_bridge import ResolveNotRunningError  # noqa: E402
 from slideshow.timeline_builder import build_slideshow  # noqa: E402
 from slideshow.transitions import registered_kinds  # noqa: E402
@@ -74,6 +80,26 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("folder", nargs="?", help="Folder of images to add to the slideshow")
     p.add_argument("--seconds", type=float, default=4.0, help="Per-slide seconds")
+    p.add_argument(
+        "--fit",
+        choices=FRAMING_MODES,
+        default="fit",
+        help=(
+            "How each photo is sized into the frame: 'fit' shows all of it and "
+            "leaves bars, 'fill' covers the frame and crops the overhang"
+        ),
+    )
+    p.add_argument(
+        "--backdrop",
+        choices=BACKDROP_KINDS,
+        default="none",
+        help="What fills the bars in 'fit' mode (default: none, i.e. transparent)",
+    )
+    p.add_argument(
+        "--backdrop-color",
+        default="0,0,0",
+        help="Comma-separated R,G,B in 0..1 for --backdrop solid",
+    )
     p.add_argument("--name", default="SlideShowCreator Demo", help="Timeline name")
     p.add_argument(
         "--transition", default="dissolve", help="Transition kind between slides"
@@ -183,6 +209,11 @@ def main(argv=None) -> int:
     )
     project.default_transition = TransitionChoice(
         kind=args.transition, duration_frames=args.frames
+    )
+    project.framing = FramingSettings(
+        mode=args.fit,
+        backdrop=args.backdrop,
+        backdrop_color=tuple(float(c) for c in args.backdrop_color.split(",")),
     )
     if args.sweep:
         for item, kind in zip(project.items, sweep_kinds):

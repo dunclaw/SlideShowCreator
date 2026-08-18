@@ -19,7 +19,13 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from slideshow import timeline_builder as tb
-from slideshow.project_model import MediaItem, SlideshowProject, TransitionChoice
+from slideshow.layout import LOWER_TRACK
+from slideshow.project_model import (
+    FramingSettings,
+    MediaItem,
+    SlideshowProject,
+    TransitionChoice,
+)
 from slideshow.resolve_bridge import ResolveContext
 
 
@@ -650,3 +656,88 @@ def test_auto_is_resolved_before_the_layout_decides_which_side_to_lift():
 
     assert [c.segment for c in result.layout.clips].count(tb.SEGMENT_TAIL) == 0
     assert [c.segment for c in result.layout.clips].count(tb.SEGMENT_HEAD) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Framing / backdrop placement
+# --------------------------------------------------------------------------- #
+
+class TestFramingForClip:
+    def _item(self, resolution="1536x2048"):
+        mpi = MagicMock()
+        mpi.GetClipProperty.return_value = resolution
+        item = MagicMock()
+        item.GetMediaPoolItem.return_value = mpi
+        return item
+
+    def _framing(self, settings, track_index):
+        return tb.TimelineBuilder._framing_for(
+            self._item(), settings, (3840, 2160), track_index
+        )
+
+    def test_backdrop_is_painted_on_the_lower_track(self):
+        settings = FramingSettings(backdrop="solid")
+        assert self._framing(settings, LOWER_TRACK).backdrop_alpha == 1.0
+
+    def test_backdrop_is_suppressed_on_upper_tracks(self):
+        # An opaque backdrop in an upper clip's comp fills the frame and so
+        # hides the clip below it — during a transition that blacks out the
+        # other half of the transition entirely.
+        settings = FramingSettings(backdrop="solid")
+        assert self._framing(settings, LOWER_TRACK + 1).backdrop_alpha == 0.0
+
+    def test_upper_track_still_gets_a_frame_sized_canvas(self):
+        # Suppressing the backdrop must not suppress the canvas: without it
+        # the clip's animation moves in the photo's space, not the frame's.
+        framing = self._framing(FramingSettings(backdrop="solid"), LOWER_TRACK + 1)
+        assert (framing.frame_width, framing.frame_height) == (3840, 2160)
+
+    def test_fill_applies_on_every_track(self):
+        settings = FramingSettings(mode="fill")
+        for track in (LOWER_TRACK, LOWER_TRACK + 1):
+            assert self._framing(settings, track).mode == "fill"
+
+    def test_source_size_comes_from_the_pool_item(self):
+        framing = self._framing(FramingSettings(), LOWER_TRACK)
+        assert (framing.source_width, framing.source_height) == (1536, 2048)
+
+    def test_unreadable_resolution_disables_framing(self):
+        # Guessing a size would scale the photo wrongly; falling back to
+        # Resolve's own letterboxing loses the backdrop but stays correct.
+        item = self._item(resolution=None)
+        assert tb.TimelineBuilder._framing_for(
+            item, FramingSettings(), (3840, 2160), LOWER_TRACK
+        ) is None
+
+
+class TestSourceSize:
+    def test_parses_a_resolution_string(self):
+        mpi = MagicMock()
+        mpi.GetClipProperty.return_value = "1920x1080"
+        assert tb._source_size(mpi) == (1920, 1080)
+
+    @pytest.mark.parametrize("value", [None, "", "banana", "0x0", "1920", "-1x5"])
+    def test_rejects_unusable_values(self, value):
+        mpi = MagicMock()
+        mpi.GetClipProperty.return_value = value
+        assert tb._source_size(mpi) is None
+
+    def test_survives_a_raising_pool_item(self):
+        mpi = MagicMock()
+        mpi.GetClipProperty.side_effect = RuntimeError("boom")
+        assert tb._source_size(mpi) is None
+
+
+class TestTimelineFrameSize:
+    def test_reads_the_project_setting(self):
+        project = MagicMock()
+        project.GetSetting.side_effect = lambda key: {
+            "timelineResolutionWidth": "1920",
+            "timelineResolutionHeight": "1080",
+        }[key]
+        assert tb._timeline_frame_size(project) == (1920, 1080)
+
+    def test_falls_back_when_the_setting_is_unusable(self):
+        project = MagicMock()
+        project.GetSetting.return_value = None
+        assert tb._timeline_frame_size(project) == tb.DEFAULT_FRAME_SIZE
