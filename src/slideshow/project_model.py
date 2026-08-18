@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 # --------------------------------------------------------------------------- #
@@ -57,15 +57,22 @@ from typing import Any, Dict, List, Optional, Sequence
 #: * Dissolves    — ``dissolve`` and Resolve's native dissolve variants
 #:   (``additive_dissolve``, ``non_additive_dissolve``, ``blur_dissolve``,
 #:   ``dip_to_color`` — colour via ``params["color"] = "#RRGGBB"``,
-#:   defaults to black). ``cross_fade`` is the Movie-Maker name for the
-#:   standard dissolve and is kept as a distinct kind so saved projects
-#:   show the user's chosen label.
-#: * Fades        — ``fade`` (through black), ``fade_through_gray``.
+#:   defaults to black; ``dip_to_image_color`` — the same dip, but the
+#:   colour is sampled from the incoming photograph). ``cross_fade`` is
+#:   the Movie-Maker name for the standard dissolve and is kept as a
+#:   distinct kind so saved projects show the user's chosen label.
+#: * Fades        — ``fade`` (through black), ``fade_through_gray``,
+#:   ``fade_through_white``.
 #: * Effects      — ``blur_through_black``, ``pixelate``, ``smooth_cut``.
 #: * Geometry     — ``slide_*`` (new clip slides in over old),
 #:   ``push_*`` (both clips move together), ``zoom_in`` / ``zoom_out``
 #:   (zoom-blur transition — NOT to be confused with the per-clip motion
 #:   of the same name), ``flip``, ``drop``.
+#: * 3D           — ``page_turn``: the incoming photo rotates in about a
+#:   vertical edge like a page being laid down. ``page_turn_away``: the
+#:   outgoing photo lifts off instead, revealing the next one underneath —
+#:   the only kind that wants the outgoing clip on the upper track. These
+#:   build a Fusion 3D scene rather than a 2D image chain.
 TRANSITION_KINDS: frozenset = frozenset({
     "none",
     "auto",
@@ -75,8 +82,10 @@ TRANSITION_KINDS: frozenset = frozenset({
     "non_additive_dissolve",
     "blur_dissolve",
     "dip_to_color",
+    "dip_to_image_color",
     "fade",
     "fade_through_gray",
+    "fade_through_white",
     "blur_through_black",
     "pixelate",
     "smooth_cut",
@@ -85,10 +94,16 @@ TRANSITION_KINDS: frozenset = frozenset({
     "zoom_in",    "zoom_out",
     "flip",
     "drop",
+    "page_turn",
+    "page_turn_away",
 })
 
 
-DEFAULT_TRANSITION_DURATION_FRAMES = 24  # 1s at 24fps; UI can override
+#: Fallback overlap length, in frames, for the rare caller that has to
+#: resolve a transition with no slide to size it against. Normal builds
+#: derive the length from the slide instead — see
+#: :func:`slideshow.transitions.resolve_duration_frames`.
+DEFAULT_TRANSITION_DURATION_FRAMES = 24  # 1s at 24fps
 
 
 @dataclass
@@ -98,7 +113,11 @@ class TransitionChoice:
     * ``kind``: one of :data:`TRANSITION_KINDS`. ``"none"`` is a hard cut;
       ``"auto"`` defers the choice to the auto-mix planner.
     * ``duration_frames``: how many frames the two clips overlap. Must be
-      ``>= 0`` (``0`` collapses to a hard cut).
+      ``>= 0`` (``0`` collapses to a hard cut). ``None`` — the default —
+      means "derive it from the slide length", which is what keeps the
+      pacing right across different slide durations; see
+      :func:`slideshow.transitions.resolve_duration_frames`. An explicit
+      value always wins.
     * ``params``: free-form ``dict[str, Any]`` for transition-specific
       tweaks (easing curve, motion-blur, drop-bounce factor, …). The
       transitions framework reads what it understands and ignores the
@@ -106,7 +125,7 @@ class TransitionChoice:
     """
 
     kind: str = "dissolve"
-    duration_frames: int = DEFAULT_TRANSITION_DURATION_FRAMES
+    duration_frames: Optional[int] = None
     params: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -116,31 +135,36 @@ class TransitionChoice:
                     self.kind, sorted(TRANSITION_KINDS)
                 )
             )
-        if self.duration_frames < 0:
+        if self.duration_frames is not None and self.duration_frames < 0:
             raise ValueError(
-                "TransitionChoice.duration_frames must be >= 0, got {0}".format(
+                "TransitionChoice.duration_frames must be >= 0 or None, got {0}".format(
                     self.duration_frames
                 )
             )
 
     def is_cut(self) -> bool:
-        """``True`` if this is effectively a hard cut (kind=none or 0 frames)."""
+        """``True`` if this is effectively a hard cut (kind=none or 0 frames).
+
+        A ``None`` duration is *not* a cut — it has simply not been resolved
+        to a frame count yet.
+        """
         return self.kind == "none" or self.duration_frames == 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "kind": self.kind,
-            "duration_frames": int(self.duration_frames),
+            "duration_frames": (
+                None if self.duration_frames is None else int(self.duration_frames)
+            ),
             "params": dict(self.params),
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TransitionChoice":
+        duration = data.get("duration_frames")
         return cls(
             kind=str(data.get("kind", "dissolve")),
-            duration_frames=int(
-                data.get("duration_frames", DEFAULT_TRANSITION_DURATION_FRAMES)
-            ),
+            duration_frames=None if duration is None else int(duration),
             params=dict(data.get("params", {}) or {}),
         )
 
@@ -380,6 +404,101 @@ class AudioSettings:
 
 
 # --------------------------------------------------------------------------- #
+# Framing and backdrop
+# --------------------------------------------------------------------------- #
+
+#: How a photograph is sized into the timeline frame.
+#:
+#: ``fit`` shows the whole picture and leaves bars; ``fill`` covers the frame
+#: and crops the overhang.
+FRAMING_MODES = ("fit", "fill")
+
+#: What gets painted where the photograph does not reach.
+#:
+#: ``none`` leaves the bars transparent, so whatever is on the track below
+#: shows through — the behaviour from before backdrops existed. ``solid``
+#: paints :attr:`FramingSettings.backdrop_color`.
+#:
+#: ``blur`` fills it with a blurred, darkened, frame-filling copy of the
+#: photograph itself.
+#:
+#: The remaining options from issue #13 — ``dominant`` and ``accumulate`` —
+#: are deliberately *not* listed until they are implemented,
+#: so a project file can never ask for a backdrop that is silently ignored.
+BACKDROP_KINDS = ("none", "solid", "blur")
+
+DEFAULT_BACKDROP_COLOR = (0.0, 0.0, 0.0)
+
+
+@dataclass
+class FramingSettings:
+    """How every slide is placed into the frame, and what fills the rest.
+
+    Project-wide rather than per-item on purpose: mixing fit and fill across
+    slides makes the picture jump size at every cut, and a backdrop that
+    changes between neighbouring slides reads as a flash. Per-item overrides
+    can be added later if a real need turns up.
+    """
+
+    mode: str = "fit"
+    backdrop: str = "none"
+    backdrop_color: Tuple[float, float, float] = DEFAULT_BACKDROP_COLOR
+
+    def __post_init__(self) -> None:
+        if self.mode not in FRAMING_MODES:
+            raise ValueError(
+                "FramingSettings.mode must be one of {0}, got {1!r}".format(
+                    sorted(FRAMING_MODES), self.mode
+                )
+            )
+        if self.backdrop not in BACKDROP_KINDS:
+            raise ValueError(
+                "FramingSettings.backdrop must be one of {0}, got {1!r}".format(
+                    sorted(BACKDROP_KINDS), self.backdrop
+                )
+            )
+        color = tuple(float(c) for c in self.backdrop_color)
+        if len(color) != 3:
+            raise ValueError(
+                "FramingSettings.backdrop_color must have 3 channels, got {0}".format(
+                    len(color)
+                )
+            )
+        for channel in color:
+            if not 0.0 <= channel <= 1.0:
+                raise ValueError(
+                    "FramingSettings.backdrop_color channels must be in "
+                    "[0, 1], got {0!r}".format(self.backdrop_color)
+                )
+        self.backdrop_color = color
+
+    @property
+    def backdrop_alpha(self) -> float:
+        """Opacity of the backdrop: ``0`` for ``none``, ``1`` otherwise."""
+        return 0.0 if self.backdrop == "none" else 1.0
+
+    def is_default(self) -> bool:
+        """True when these settings ask for exactly Resolve's own behaviour."""
+        return self.mode == "fit" and self.backdrop == "none"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "backdrop": self.backdrop,
+            "backdrop_color": list(self.backdrop_color),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FramingSettings":
+        color = data.get("backdrop_color") or DEFAULT_BACKDROP_COLOR
+        return cls(
+            mode=str(data.get("mode", "fit")),
+            backdrop=str(data.get("backdrop", "none")),
+            backdrop_color=tuple(float(c) for c in color),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Media items
 # --------------------------------------------------------------------------- #
 
@@ -500,6 +619,7 @@ class SlideshowProject:
         default_factory=lambda: MotionChoice(kind="none")
     )
     audio: Optional[AudioSettings] = None
+    framing: FramingSettings = field(default_factory=FramingSettings)
     target_total_duration_seconds: Optional[float] = None
 
     @property
@@ -625,6 +745,7 @@ class SlideshowProject:
             "default_transition": self.default_transition.to_dict(),
             "default_motion": self.default_motion.to_dict(),
             "audio": self.audio.to_dict() if self.audio is not None else None,
+            "framing": self.framing.to_dict(),
             "target_total_duration_seconds": self.target_total_duration_seconds,
             "items": [it.to_dict() for it in self.items],
         }
@@ -653,6 +774,11 @@ class SlideshowProject:
         audio = AudioSettings.from_dict(audio_data) if audio_data else None
         if audio is None and data.get("soundtrack_path"):
             audio = AudioSettings(soundtrack_path=str(data["soundtrack_path"]))
+        framing_data = data.get("framing")
+        framing = (
+            FramingSettings.from_dict(framing_data)
+            if framing_data else FramingSettings()
+        )
         items_data = data.get("items") or []
         return cls(
             name=str(data.get("name", "Slideshow")),
@@ -663,6 +789,7 @@ class SlideshowProject:
             default_transition=default_trans,
             default_motion=default_motion,
             audio=audio,
+            framing=framing,
             target_total_duration_seconds=_opt_float(
                 data.get("target_total_duration_seconds")
             ),
@@ -706,6 +833,10 @@ def _opt_str(value: Any) -> Optional[str]:
 
 
 __all__ = [
+    "FramingSettings",
+    "FRAMING_MODES",
+    "DEFAULT_BACKDROP_COLOR",
+    "BACKDROP_KINDS",
     "AudioSettings",
     "DEFAULT_MOTION_ZOOM_AMOUNT",
     "DEFAULT_TRANSITION_DURATION_FRAMES",

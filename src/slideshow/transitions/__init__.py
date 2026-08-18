@@ -10,6 +10,9 @@ Entry points:
 * :func:`plan_transition` — high-level dispatcher; takes a
   ``TransitionChoice`` from the project model, returns a
   ``TransitionPlan``.
+* :func:`merge_clip_plans` / :func:`apply_comp_spec` — the applier side:
+  fold a clip's two neighbouring plans into one ``CompSpec`` and build the
+  Fusion node graph for it.
 * :func:`get_transition` — lower-level lookup of the
   :class:`Transition` impl for one kind name.
 * :func:`registered_kinds` — list every concrete kind that has an
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 from .base import (
     COMPOSITE_MODES,
+    NOMINAL_SLIDE_FRAMES,
     ClipPlan,
     PointKeyframe,
     RgbColor,
@@ -35,6 +39,11 @@ from .base import (
     plan_transition,
     register,
     registered_kinds,
+    resolve_duration_frames,
+    reverse_clip_plan,
+    reverse_keyframes,
+    reverse_transform,
+    wants_outgoing_on_top,
 )
 
 # Eagerly import every implementation module so their @register decorators
@@ -45,18 +54,42 @@ from . import effects as _effects  # noqa: F401
 from . import geometry as _geometry  # noqa: F401
 from . import flip as _flip  # noqa: F401
 from . import drop as _drop  # noqa: F401
+from . import page_turn as _page_turn  # noqa: F401
+
+from .applier import (  # noqa: E402  (must follow the registry imports)
+    CompSpec,
+    Framing,
+    apply_comp_spec,
+    apply_composite_mode,
+    build_comp_graph,
+    comp_spec_for_clip,
+    merge_clip_plans,
+)
 
 
 __all__ = [
     "COMPOSITE_MODES",
+    "NOMINAL_SLIDE_FRAMES",
     "ClipPlan",
+    "CompSpec",
+    "Framing",
     "PointKeyframe",
     "RgbColor",
     "ScalarKeyframe",
     "Transition",
     "TransitionPlan",
+    "apply_comp_spec",
+    "apply_composite_mode",
+    "build_comp_graph",
+    "comp_spec_for_clip",
     "get_transition",
+    "merge_clip_plans",
     "plan_transition",
     "register",
     "registered_kinds",
+    "resolve_duration_frames",
+    "reverse_clip_plan",
+    "reverse_keyframes",
+    "reverse_transform",
+    "wants_outgoing_on_top",
 ]

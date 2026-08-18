@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from slideshow import fusion_comps as fc
+from tests.fusion_fakes import FAKE_TOOL_DEFAULTS, fake_get_input
 
 
 # --------------------------------------------------------------------------- #
@@ -699,3 +700,373 @@ def test_list_tools_handles_empty():
     comp = MagicMock()
     comp.GetToolList.return_value = None
     assert fc.list_tools(comp) == []
+
+
+# --------------------------------------------------------------------------- #
+# insert_tool_chain + effect tool helpers
+# --------------------------------------------------------------------------- #
+
+class _FakeTool:
+    """Mock tool that records its wiring so a chain can be asserted on."""
+
+    def __init__(self, name):
+        self.name = name
+        self.Output = "{0}-out".format(name)
+        self.inputs = dict(FAKE_TOOL_DEFAULTS.get(name, {}))
+
+    def ConnectInput(self, input_name, source):
+        self.inputs[input_name] = source
+
+    def SetInput(self, input_name, value):
+        self.inputs[input_name] = value
+
+    def GetInput(self, input_name, frame=None):
+        return fake_get_input(self.inputs, input_name)
+
+    def SetAttrs(self, attrs):
+        self.name = attrs.get("TOOLS_Name", self.name)
+
+    def GetAttrs(self, key):
+        return self.name
+
+
+class _FakeComp:
+    """Comp that hands out :class:`_FakeTool`s and remembers what was added."""
+
+    def __init__(self, existing=("MediaIn1", "MediaOut1")):
+        self.tools = {name: _FakeTool(name) for name in existing}
+        self.added = []
+
+    def FindTool(self, name):
+        return self.tools.get(name)
+
+    def AddTool(self, tool_type, x=0, y=0):
+        tool = _FakeTool(tool_type)
+        self.added.append((tool_type, x, y))
+        # Fusion names the tool when SetAttrs runs; register under both so a
+        # later FindTool by our chosen name succeeds.
+        self.tools[tool_type] = tool
+        original_setattrs = tool.SetAttrs
+
+        def register(attrs):
+            original_setattrs(attrs)
+            self.tools[tool.name] = tool
+
+        tool.SetAttrs = register
+        return tool
+
+
+def test_insert_tool_chain_wires_tools_in_order():
+    comp = _FakeComp()
+
+    tools = fc.insert_tool_chain(
+        comp,
+        [("Blur", "B"), ("Pixelate", "P"), ("Transform", "X")],
+    )
+
+    assert [t.name for t in tools] == ["B", "P", "X"]
+    assert tools[0].inputs["Input"] == "MediaIn1-out"
+    assert tools[1].inputs["Input"] == "Blur-out"
+    assert tools[2].inputs["Input"] == "Pixelate-out"
+    assert comp.tools["MediaOut1"].inputs["Input"] == "Transform-out"
+    assert comp.added == [("Blur", 1, 0), ("Pixelate", 2, 0), ("Transform", 3, 0)]
+
+
+def test_insert_tool_chain_uses_source_input_for_ofx_tools():
+    """ResolveFX plugins expose ``Source``, not ``Input`` — wiring the wrong
+    one leaves the tool silently disconnected."""
+    comp = _FakeComp()
+
+    tools = fc.insert_tool_chain(
+        comp, [(fc.PIXELATE_TOOL, "P"), ("Transform", "X")]
+    )
+
+    assert "Input" not in tools[0].inputs
+    assert tools[0].inputs["Source"] == "MediaIn1-out"
+    assert tools[1].inputs["Input"] == "{0}-out".format(fc.PIXELATE_TOOL)
+
+
+def test_primary_image_input_defaults_to_input():
+    assert fc.primary_image_input("Blur") == "Input"
+    assert fc.primary_image_input("Transform") == "Input"
+    assert fc.primary_image_input(fc.PIXELATE_TOOL) == "Source"
+
+
+def test_pixel_size_to_frequency_is_inverse():
+    """PixelFrequency counts cells across the frame, so bigger blocks = lower value."""
+    clean = fc.pixel_size_to_frequency(1.0)
+    chunky = fc.pixel_size_to_frequency(60.0)
+    assert clean > chunky
+    assert chunky == pytest.approx(fc.PIXELATE_REFERENCE_WIDTH / 60.0)
+
+
+def test_pixel_size_to_frequency_never_collapses_the_frame():
+    """A frequency of 1 makes the whole image one flat cell — never emit it."""
+    for size in (0.0, -5.0, 1.0, 10.0, 1e6):
+        freq = fc.pixel_size_to_frequency(size)
+        assert fc.PIXELATE_MIN_FREQUENCY <= freq <= fc.PIXELATE_MAX_FREQUENCY
+
+
+def test_insert_tool_chain_with_no_specs_wires_media_in_to_media_out():
+    comp = _FakeComp()
+    assert fc.insert_tool_chain(comp, []) == []
+    assert comp.tools["MediaOut1"].inputs["Input"] == "MediaIn1-out"
+    assert comp.added == []
+
+
+def test_insert_tool_chain_reuses_existing_tools():
+    comp = _FakeComp(existing=("MediaIn1", "MediaOut1", "B"))
+    tools = fc.insert_tool_chain(comp, [("Blur", "B")])
+    assert tools[0] is comp.tools["B"]
+    assert comp.added == []
+    assert comp.tools["MediaOut1"].inputs["Input"] == "B-out"
+
+
+def test_insert_tool_chain_requires_media_io():
+    with pytest.raises(RuntimeError, match="MediaIn1"):
+        fc.insert_tool_chain(_FakeComp(existing=()), [])
+    with pytest.raises(RuntimeError, match="MediaOut1"):
+        fc.insert_tool_chain(_FakeComp(existing=("MediaIn1",)), [])
+
+
+def test_insert_transform_chain_still_returns_the_transform():
+    comp = _FakeComp()
+    xform = fc.insert_transform_chain(comp)
+    assert xform.name == fc.DEFAULT_TRANSFORM_NAME
+    assert xform.inputs["Input"] == "MediaIn1-out"
+    assert comp.tools["MediaOut1"].inputs["Input"] == "Transform-out"
+
+
+def test_add_background_sets_each_colour_channel():
+    comp = _FakeComp()
+    bg = fc.add_background(comp, (0.25, 0.5, 0.75))
+    assert bg.name == fc.DEFAULT_BACKGROUND_NAME
+    assert bg.inputs == {
+        "TopLeftRed": 0.25,
+        "TopLeftGreen": 0.5,
+        "TopLeftBlue": 0.75,
+        "TopLeftAlpha": 1.0,
+    }
+
+
+def test_add_blur_and_pixelate_use_stable_names():
+    comp = _FakeComp()
+    blur = fc.add_blur(comp)
+    pixelate = fc.add_pixelate(comp)
+    assert blur.name == fc.DEFAULT_BLUR_NAME
+    assert pixelate.name == fc.DEFAULT_PIXELATE_NAME
+    # Second call reuses rather than duplicating.
+    assert fc.add_blur(comp) is blur
+    assert comp.added == [("Blur", 0, 0), (fc.PIXELATE_TOOL, 0, 0)]
+
+
+def test_add_merge_wires_background_and_foreground():
+    comp = _FakeComp()
+    bg = fc.add_background(comp, (0.0, 0.0, 0.0))
+    fg = fc.add_blur(comp)
+
+    merge = fc.add_merge(comp, background=bg, foreground=fg, apply_mode="add")
+
+    assert merge.inputs["Background"] == "Background-out"
+    assert merge.inputs["Foreground"] == "Blur-out"
+    assert merge.inputs["ApplyMode"] == "Add"
+
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("normal", "Normal"),
+        ("add", "Add"),
+        ("non_add", "Maximum"),
+        ("nonsense", "Normal"),
+    ],
+)
+def test_set_merge_apply_mode(mode, expected):
+    merge = _FakeTool("Merge1")
+    fc.set_merge_apply_mode(merge, mode)
+    assert merge.inputs["ApplyMode"] == expected
+
+
+
+
+# --------------------------------------------------------------------------- #
+# framed_size()
+# --------------------------------------------------------------------------- #
+
+class TestFramedSize:
+    def test_fit_letterboxes_a_portrait(self):
+        # 1536x2048 into UHD: height is the binding axis, so the photo ends up
+        # frame-tall with pillarbox bars either side.
+        assert fc.framed_size(1536, 2048, 3840, 2160) == (1620, 2160)
+
+    def test_fill_overhangs_the_binding_axis(self):
+        # Same photo, filling: width is now binding and the extra height is
+        # left for the canvas to crop.
+        assert fc.framed_size(1536, 2048, 3840, 2160, mode="fill") == (3840, 5120)
+
+    def test_fit_and_fill_agree_when_aspects_match(self):
+        assert fc.framed_size(1920, 1080, 3840, 2160) == (3840, 2160)
+        assert fc.framed_size(1920, 1080, 3840, 2160, mode="fill") == (3840, 2160)
+
+    def test_landscape_fit_is_letterboxed_not_pillarboxed(self):
+        assert fc.framed_size(2048, 1536, 3840, 2160) == (2880, 2160)
+
+    def test_fill_never_leaves_a_gap(self):
+        for sw, sh in ((1536, 2048), (2048, 1536), (1000, 1000), (4000, 900)):
+            w, h = fc.framed_size(sw, sh, 3840, 2160, mode="fill")
+            assert w >= 3840 and h >= 2160
+
+    def test_fit_never_overflows(self):
+        for sw, sh in ((1536, 2048), (2048, 1536), (1000, 1000), (4000, 900)):
+            w, h = fc.framed_size(sw, sh, 3840, 2160)
+            assert w <= 3840 and h <= 2160
+
+    def test_aspect_ratio_is_preserved(self):
+        w, h = fc.framed_size(1536, 2048, 3840, 2160)
+        assert abs(w / h - 1536 / 2048) < 0.001
+
+    def test_result_is_never_degenerate(self):
+        assert fc.framed_size(1, 20000, 3840, 2160) == (1, 2160)
+
+    def test_rejects_unknown_mode(self):
+        with pytest.raises(ValueError, match="mode"):
+            fc.framed_size(100, 100, 200, 200, mode="stretch")
+
+    @pytest.mark.parametrize(
+        "args",
+        [(0, 100, 200, 200), (100, 0, 200, 200), (100, 100, 0, 200), (100, 100, 200, 0)],
+    )
+    def test_rejects_non_positive_sizes(self, args):
+        with pytest.raises(ValueError):
+            fc.framed_size(*args)
+
+
+# --------------------------------------------------------------------------- #
+# add_canvas()
+# --------------------------------------------------------------------------- #
+
+class TestAddCanvas:
+    def _comp(self):
+        comp = MagicMock()
+        comp.FindTool.return_value = None
+        tools = {}
+
+        def add_tool(tool_type, *args, **kwargs):
+            tool = MagicMock()
+            tool.GetInput.side_effect = fake_get_input(tool, tool_type)
+            tools[tool_type] = tool
+            return tool
+
+        comp.AddTool.side_effect = add_tool
+        return comp, tools
+
+    def test_background_is_forced_to_the_frame_size(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+        )
+        calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        # Clearing UseFrameFormatSettings is what stops the Background
+        # inheriting the *photo's* resolution.
+        assert calls["UseFrameFormatSettings"] == 0.0
+        assert calls["Width"] == 3840.0
+        assert calls["Height"] == 2160.0
+
+    def test_fit_tool_gets_the_scaled_size(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+        )
+        calls = dict(c.args for c in built["fit"].SetInput.call_args_list)
+        assert (calls["Width"], calls["Height"]) == (1620.0, 2160.0)
+
+    def test_canvas_alpha_defaults_to_transparent(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+        )
+        calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        assert calls["TopLeftAlpha"] == 0.0
+
+    def test_returns_the_merge_as_the_new_head(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+        )
+        assert set(built) == {"fit", "canvas", "merge"}
+
+    def test_solid_backdrop_makes_the_canvas_opaque(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+            backdrop="solid",
+            color=(0.1, 0.2, 0.3),
+        )
+        calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        assert calls["TopLeftAlpha"] == 1.0
+        assert calls["TopLeftRed"] == 0.1
+        assert set(built) == {"fit", "canvas", "merge"}
+
+    def test_blur_backdrop_builds_its_own_chain(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+            backdrop="blur",
+        )
+        assert set(built) == {
+            "fit",
+            "canvas",
+            "merge",
+            "backdrop_fit",
+            "backdrop_blur",
+            "backdrop_merge",
+        }
+        # The backdrop copy always fills, whatever the photo itself does,
+        # or it would not cover the frame.
+        sized = dict(c.args for c in built["backdrop_fit"].SetInput.call_args_list)
+        assert (sized["Width"], sized["Height"]) == (3840.0, 5120.0)
+
+    def test_blur_size_scales_with_the_frame(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(1920, 1080),
+            source_size=(1536, 2048),
+            backdrop="blur",
+        )
+        calls = dict(c.args for c in built["backdrop_blur"].SetInput.call_args_list)
+        assert calls[fc.BLUR_SIZE_INPUT] == 1920 * fc.BACKDROP_BLUR_FRACTION
+
+    def test_blur_backdrop_is_darkened_by_the_merge_blend(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+            backdrop="blur",
+        )
+        calls = dict(c.args for c in built["backdrop_merge"].SetInput.call_args_list)
+        assert calls["Blend"] == fc.BACKDROP_BLUR_GAIN
+        # ...over an opaque canvas, or there would be nothing to darken against.
+        canvas_calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        assert canvas_calls["TopLeftAlpha"] == 1.0

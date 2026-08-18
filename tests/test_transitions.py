@@ -14,14 +14,22 @@ from __future__ import annotations
 
 import pytest
 
-from slideshow.project_model import TRANSITION_KINDS, TransitionChoice
+from slideshow.project_model import (
+    DEFAULT_TRANSITION_DURATION_FRAMES,
+    TRANSITION_KINDS,
+    TransitionChoice,
+)
 from slideshow.transitions import (
     COMPOSITE_MODES,
+    NOMINAL_SLIDE_FRAMES,
     ClipPlan,
     TransitionPlan,
     get_transition,
     plan_transition,
     registered_kinds,
+    resolve_duration_frames,
+    reverse_keyframes,
+    wants_outgoing_on_top,
 )
 from slideshow.transitions.dissolves import (
     DEFAULT_BLUR_DISSOLVE_PEAK_SIZE,
@@ -35,6 +43,8 @@ from slideshow.transitions.geometry import (
     DEFAULT_ZOOM_IN_START_SIZE,
     DEFAULT_ZOOM_OUT_START_SIZE,
 )
+from slideshow.fusion_comps import DEFAULT_PAGE_FOCAL_LENGTH, PageTurnAnimation
+from slideshow.transitions.page_turn import PAGE_START_ANGLE, page_angle_keys
 
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +174,28 @@ class TestDissolve:
         )
         assert plan.incoming.composite_mode == "non_add"
 
+    @pytest.mark.parametrize(
+        "kind", ["additive_dissolve", "non_additive_dissolve"]
+    )
+    def test_non_normal_composites_fade_the_outgoing_clip_out(self, kind):
+        """Add and Lighten are only the identity over black.
+
+        Left composited against a fully opaque outgoing clip, the incoming
+        image stays blown out for the whole overlap and then snaps to the
+        real picture at the cut. Fading the outgoing clip out underneath —
+        it is on the bottom track, where transparent renders black — makes
+        the transition actually resolve.
+        """
+        plan = plan_transition(TransitionChoice(kind=kind, duration_frames=24))
+        assert plan.outgoing.blend == [(0, 1.0), (24, 0.0)]
+
+    @pytest.mark.parametrize("kind", ["dissolve", "cross_fade"])
+    def test_normal_composites_leave_the_outgoing_clip_alone(self, kind):
+        """A plain dissolve crossfades *over* an opaque clip; fading that
+        clip out too would dip through black."""
+        plan = plan_transition(TransitionChoice(kind=kind, duration_frames=24))
+        assert plan.outgoing.is_empty()
+
 
 class TestBlurDissolve:
     def test_blur_dissolve_has_blur_on_both_clips(self):
@@ -236,7 +268,8 @@ class TestDipToColor:
             TransitionChoice(kind="dip_to_color", duration_frames=24)
         )
         assert plan.incoming.background_color == (0.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (0.0, 0.0, 0.0)
+        # The whole dip rides on the upper (incoming) clip now.
+        assert plan.outgoing.is_empty()
 
     def test_dip_to_color_respects_param(self):
         plan = plan_transition(
@@ -247,18 +280,88 @@ class TestDipToColor:
             )
         )
         assert plan.incoming.background_color == (1.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (1.0, 0.0, 0.0)
+        assert plan.outgoing.is_empty()
 
     def test_dip_to_color_blend_envelope(self):
-        # Outgoing visible at start, gone by midpoint.
-        # Incoming starts at zero at midpoint, full by end.
+        # Overall opacity ramps up over the first half (fading the colour
+        # in over the clip below); the image only emerges from the colour
+        # over the second half.
         plan = plan_transition(
             TransitionChoice(kind="dip_to_color", duration_frames=24)
         )
-        assert plan.outgoing.blend[0] == (0, 1.0)
-        assert plan.outgoing.blend[-1] == (12, 0.0)
-        assert plan.incoming.blend[0] == (12, 0.0)
-        assert plan.incoming.blend[-1] == (24, 1.0)
+        assert plan.incoming.blend == [(0, 0.0), (12, 1.0)]
+        assert plan.incoming.color_blend == [(0, 0.0), (12, 0.0), (24, 1.0)]
+
+    def test_dip_to_color_mirrored_reveals_the_clip_below(self):
+        # When the incoming clip is on the lower track the outgoing clip has
+        # to do the work: opaque image, then opaque colour, then gone.
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_color", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert plan.incoming.is_empty()
+        assert plan.outgoing.background_color == (0.0, 0.0, 0.0)
+        assert plan.outgoing.blend == [(12, 1.0), (24, 0.0)]
+        assert plan.outgoing.color_blend == [(0, 1.0), (12, 0.0), (24, 0.0)]
+
+    def test_dip_to_color_too_short_to_dip_degrades_to_a_crossfade(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_color", duration_frames=1)
+        )
+        assert plan.incoming.background_color is None
+        assert plan.incoming.blend == [(0, 0.0), (1, 1.0)]
+
+
+class TestDipToImageColor:
+    def test_it_dips_through_the_picture_rather_than_a_fixed_colour(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_image_color", duration_frames=24)
+        )
+        assert plan.kind == "dip_to_image_color"
+        assert plan.incoming.background_from_image is True
+        assert plan.outgoing.is_empty()
+
+    def test_its_timing_is_identical_to_a_plain_dip(self):
+        image = plan_transition(
+            TransitionChoice(kind="dip_to_image_color", duration_frames=24)
+        )
+        fixed = plan_transition(
+            TransitionChoice(kind="dip_to_color", duration_frames=24)
+        )
+        assert image.incoming.blend == fixed.incoming.blend
+        assert image.incoming.color_blend == fixed.incoming.color_blend
+
+    def test_a_fixed_colour_is_carried_as_the_fallback(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="dip_to_image_color",
+                duration_frames=24,
+                params={"color": (1.0, 0.0, 0.0)},
+            )
+        )
+        assert plan.incoming.background_color == (1.0, 0.0, 0.0)
+
+    def test_the_plain_dip_does_not_sample_the_picture(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_color", duration_frames=24)
+        )
+        assert plan.incoming.background_from_image is False
+
+    def test_mirroring_carries_the_sampling_flag_onto_the_outgoing_clip(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_image_color", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert plan.incoming.is_empty()
+        assert plan.outgoing.background_from_image is True
+
+    def test_too_short_to_dip_degrades_to_a_crossfade_without_sampling(self):
+        plan = plan_transition(
+            TransitionChoice(kind="dip_to_image_color", duration_frames=1)
+        )
+        assert plan.incoming.background_from_image is False
+        assert plan.incoming.background_color is None
+        assert plan.incoming.blend == [(0, 0.0), (1, 1.0)]
 
 
 class TestFades:
@@ -266,7 +369,7 @@ class TestFades:
         plan = plan_transition(TransitionChoice(kind="fade", duration_frames=24))
         assert plan.kind == "fade"
         assert plan.incoming.background_color == (0.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (0.0, 0.0, 0.0)
+        assert plan.outgoing.is_empty()
 
     def test_fade_through_gray_dips_through_grey(self):
         plan = plan_transition(
@@ -274,7 +377,7 @@ class TestFades:
         )
         assert plan.kind == "fade_through_gray"
         assert plan.incoming.background_color == (0.5, 0.5, 0.5)
-        assert plan.outgoing.background_color == (0.5, 0.5, 0.5)
+        assert plan.outgoing.is_empty()
 
     def test_blur_through_black_has_blur_envelope(self):
         plan = plan_transition(
@@ -282,7 +385,9 @@ class TestFades:
         )
         assert plan.kind == "blur_through_black"
         assert plan.incoming.background_color == (0.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (0.0, 0.0, 0.0)
+        # The outgoing clip carries no dip — only its own blur, which is
+        # what sells the first half while it is still visible underneath.
+        assert plan.outgoing.background_color is None
         # Outgoing blurs into black: 0 → peak at midpoint.
         assert plan.outgoing.blur_size[0] == (0, 0.0)
         peak = plan.outgoing.blur_size[-1][1]
@@ -310,20 +415,62 @@ class TestPixelate:
         plan = plan_transition(
             TransitionChoice(kind="pixelate", duration_frames=24)
         )
-        assert plan.incoming.pixelate_size is not None
-        assert plan.outgoing.pixelate_size is not None
-        # Default peak at midpoint.
         peak = DEFAULT_PIXELATE_PEAK_SIZE
-        assert plan.outgoing.pixelate_size[0] == (0, 1.0)
-        assert plan.outgoing.pixelate_size[-1] == (12, peak)
-        assert plan.incoming.pixelate_size[0] == (12, peak)
-        assert plan.incoming.pixelate_size[-1] == (24, 1.0)
+        # Outgoing coarsens up to the peak and then holds there to the end
+        # of its window; incoming holds and then resolves.
+        assert plan.outgoing.pixelate_size == [(0, 1.0), (8, peak), (24, peak)]
+        assert plan.incoming.pixelate_size == [(0, peak), (16, peak), (24, 1.0)]
 
-    def test_pixelate_blends_incoming(self):
+    def test_pixelate_holds_the_peak_long_enough_to_see(self):
+        """The whole point: ramping straight through flashes past."""
         plan = plan_transition(
             TransitionChoice(kind="pixelate", duration_frames=24)
         )
-        assert plan.incoming.blend == [(0, 0.0), (24, 1.0)]
+        peak = DEFAULT_PIXELATE_PEAK_SIZE
+        out_hold = [f for f, v in plan.outgoing.pixelate_size if v == peak]
+        in_hold = [f for f, v in plan.incoming.pixelate_size if v == peak]
+        # Frames 8..24 on the outgoing, 0..16 on the incoming — and those
+        # are different clips, so the visible hold is 8 frames either side
+        # of the midpoint at frame 12.
+        assert out_hold[0] == 8
+        assert in_hold[-1] == 16
+        assert in_hold[-1] - out_hold[0] == 8
+
+    def test_pixelate_swaps_inside_the_hold(self):
+        """A long crossfade of two pixelated images is just mud."""
+        plan = plan_transition(
+            TransitionChoice(kind="pixelate", duration_frames=24)
+        )
+        assert plan.incoming.blend == [(0, 0.0), (8, 0.0), (16, 1.0)]
+
+    def test_pixelate_hold_param(self):
+        """``hold=0`` collapses to the old ramp-straight-through shape."""
+        plan = plan_transition(
+            TransitionChoice(
+                kind="pixelate", duration_frames=24, params={"hold": 0.0}
+            )
+        )
+        assert plan.incoming.blend == [(0, 0.0), (12, 1.0)]
+
+    def test_pixelate_hold_cannot_swallow_the_ramps(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="pixelate", duration_frames=24, params={"hold": 5.0}
+            )
+        )
+        frames = [f for f, _ in plan.outgoing.pixelate_size]
+        assert frames == sorted(set(frames))
+        assert frames[1] >= 1
+
+    def test_pixelate_short_duration_stays_valid(self):
+        for duration in (1, 2, 3, 4, 5):
+            plan = plan_transition(
+                TransitionChoice(kind="pixelate", duration_frames=duration)
+            )
+            for keys in (plan.outgoing.pixelate_size, plan.incoming.pixelate_size,
+                         plan.incoming.blend):
+                frames = [f for f, _ in keys]
+                assert frames == sorted(set(frames)), (duration, keys)
 
     def test_pixelate_peak_param(self):
         plan = plan_transition(
@@ -333,8 +480,8 @@ class TestPixelate:
                 params={"peak_size": 100.0},
             )
         )
-        assert plan.outgoing.pixelate_size[-1] == (12, 100.0)
-        assert plan.incoming.pixelate_size[0] == (12, 100.0)
+        assert plan.outgoing.pixelate_size[1] == (8, 100.0)
+        assert plan.incoming.pixelate_size[0] == (0, 100.0)
 
 
 class TestSmoothCut:
@@ -491,12 +638,25 @@ class TestFlip:
         assert angle[0] == (12, -90.0)
         assert angle[-1] == (24, 0.0)
 
-    def test_flip_blend_handoff_at_midpoint(self):
+    def test_flip_blend_handoff_is_a_short_crossfade(self):
+        """A single-frame swap reads as a glitch — the two images are at
+        different angles either side of it, so the cut is plainly visible."""
         plan = plan_transition(TransitionChoice(kind="flip", duration_frames=24))
-        # outgoing snaps off at midpoint
-        assert plan.outgoing.blend[-1] == (12, 0.0)
-        # incoming snaps on at midpoint
-        assert plan.incoming.blend[-1] == (12, 1.0)
+        assert plan.outgoing.blend == [(10, 1.0), (14, 0.0)]
+        assert plan.incoming.blend == [(10, 0.0), (14, 1.0)]
+        # Centred on the midpoint, and short enough to still be a flip.
+        assert (10 + 14) / 2 == 12
+        assert 14 - 10 < 24 // 2
+
+    def test_flip_swap_window_stays_inside_a_short_overlap(self):
+        for duration in (1, 2, 3, 4, 6, 8):
+            plan = plan_transition(
+                TransitionChoice(kind="flip", duration_frames=duration)
+            )
+            for keys in (plan.outgoing.blend, plan.incoming.blend):
+                frames = [f for f, _ in keys]
+                assert frames == sorted(set(frames)), (duration, keys)
+                assert frames[0] >= 0 and frames[-1] <= duration, (duration, keys)
 
     def test_flip_vertical_axis_inverts_rotation(self):
         plan = plan_transition(
@@ -526,15 +686,31 @@ class TestDrop:
         center = plan.incoming.transform.center
         assert center[-1] == (24, (0.5, 0.5))
 
-    def test_drop_includes_overshoot_and_bounce(self):
+    def test_drop_accelerates_then_bounces_up_from_centre(self):
         plan = plan_transition(TransitionChoice(kind="drop", duration_frames=24))
         center = plan.incoming.transform.center
-        # 4 keyframes: start, overshoot, bounce, settle.
-        assert len(center) == 4
-        # Frame indices are strictly increasing.
-        frames = [k[0] for k in center]
-        assert frames == sorted(frames)
-        assert len(set(frames)) == len(frames)
+        frames = [f for f, _ in center]
+        ys = [y for _, (_x, y) in center]
+
+        assert frames == sorted(set(frames))
+        assert all(x == 0.5 for _f, (x, _y) in center)
+
+        # Gravity: most of the fall happens in the back half of the descent.
+        impact = ys.index(min(ys[: len(ys) // 2 + 1]))
+        travelled_by_half = 1.5 - ys[impact // 2]
+        assert travelled_by_half < (1.5 - 0.5) / 2, "descent looks linear"
+
+        # It lands *at* centre and bounces back up, rather than overshooting
+        # below centre — overshooting below is a spring, not a falling object.
+        assert min(ys) >= 0.5
+        assert max(ys[impact:]) > 0.5
+
+    def test_drop_bounces_decay(self):
+        plan = plan_transition(TransitionChoice(kind="drop", duration_frames=24))
+        ys = [y for _f, (_x, y) in plan.incoming.transform.center]
+        peaks = [y for y in ys[ys.index(0.5):] if y > 0.5]
+        assert len(peaks) >= 2, "a single bounce reads as a glitch"
+        assert peaks[1] - 0.5 < (peaks[0] - 0.5) / 2
 
     def test_drop_does_not_animate_outgoing(self):
         plan = plan_transition(TransitionChoice(kind="drop", duration_frames=24))
@@ -542,10 +718,127 @@ class TestDrop:
 
     def test_drop_short_duration_still_has_monotonic_keyframes(self):
         # Forces the de-duplication path in drop.py to kick in.
-        plan = plan_transition(TransitionChoice(kind="drop", duration_frames=4))
-        frames = [k[0] for k in plan.incoming.transform.center]
+        for duration in (1, 2, 3, 4, 5, 8):
+            plan = plan_transition(
+                TransitionChoice(kind="drop", duration_frames=duration)
+            )
+            center = plan.incoming.transform.center
+            frames = [k[0] for k in center]
+            assert frames == sorted(set(frames)), duration
+            assert frames[-1] == duration, duration
+            # However little room there is, it must still end at rest.
+            assert center[-1] == (duration, (0.5, 0.5)), duration
+
+
+# --------------------------------------------------------------------------- #
+# Mirroring — adapting a plan when the incoming clip is on the lower track
+# --------------------------------------------------------------------------- #
+
+class TestMirroring:
+    def test_reverse_keyframes_flips_time_not_values(self):
+        assert reverse_keyframes([(0, 0.0), (10, 1.0)], 10) == [(0, 1.0), (10, 0.0)]
+        assert reverse_keyframes([(0, "a"), (4, "b"), (10, "c")], 10) == [
+            (0, "c"),
+            (6, "b"),
+            (10, "a"),
+        ]
+
+    def test_reverse_keyframes_of_nothing_is_none(self):
+        assert reverse_keyframes(None, 10) is None
+        assert reverse_keyframes([], 10) is None
+
+    @pytest.mark.parametrize("kind", sorted(registered_kinds()))
+    def test_every_kind_can_be_mirrored(self, kind):
+        choice = TransitionChoice(kind=kind, duration_frames=24)
+        mirrored = plan_transition(choice, incoming_on_top=False)
+        assert mirrored.kind == kind
+        upright = plan_transition(choice, incoming_on_top=True)
+        assert mirrored.duration_frames == upright.duration_frames
+
+    @pytest.mark.parametrize("kind", sorted(registered_kinds()))
+    def test_mirrored_plans_animate_the_upper_clip(self, kind):
+        """The outgoing clip is the visible one, so it must do the work.
+
+        Anything that only animates the incoming (lower) clip would be
+        hidden under the opaque outgoing clip and render as a hard cut.
+        """
+        choice = TransitionChoice(kind=kind, duration_frames=24)
+        upright = plan_transition(choice, incoming_on_top=True)
+        if upright.is_cut:
+            pytest.skip("{0} is a cut".format(kind))
+        mirrored = plan_transition(choice, incoming_on_top=False)
+        assert not mirrored.outgoing.is_empty()
+
+    def test_dissolve_mirrors_to_a_fade_out(self):
+        mirrored = plan_transition(
+            TransitionChoice(kind="dissolve", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert mirrored.incoming.is_empty()
+        assert mirrored.outgoing.blend == [(0, 1.0), (24, 0.0)]
+
+    def test_additive_dissolve_moves_its_composite_mode_to_the_top_clip(self):
+        mirrored = plan_transition(
+            TransitionChoice(kind="additive_dissolve", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert mirrored.outgoing.composite_mode == "add"
+
+    def test_slide_left_mirrors_by_exiting_left(self):
+        # Not the time-reverse, which would travel rightward and make the
+        # named direction meaningless on every other transition.
+        mirrored = plan_transition(
+            TransitionChoice(kind="slide_left", duration_frames=24),
+            incoming_on_top=False,
+        )
+        assert mirrored.incoming.is_empty()
+        assert mirrored.outgoing.transform.center == [
+            (0, (0.5, 0.5)),
+            (24, (-0.5, 0.5)),
+        ]
+
+    @pytest.mark.parametrize(
+        "kind,exit_point",
+        [
+            ("slide_left", (-0.5, 0.5)),
+            ("slide_right", (1.5, 0.5)),
+            ("slide_top", (0.5, 1.5)),
+            ("slide_bottom", (0.5, -0.5)),
+        ],
+    )
+    def test_every_slide_keeps_its_direction_when_mirrored(self, kind, exit_point):
+        mirrored = plan_transition(
+            TransitionChoice(kind=kind, duration_frames=24), incoming_on_top=False
+        )
+        assert mirrored.outgoing.transform.center[-1] == (24, exit_point)
+
+    @pytest.mark.parametrize(
+        "kind", ["push_left", "push_right", "push_top", "push_bottom"]
+    )
+    def test_pushes_are_unaffected_by_stacking_order(self, kind):
+        choice = TransitionChoice(kind=kind, duration_frames=24)
+        mirrored = plan_transition(choice, incoming_on_top=False)
+        upright = plan_transition(choice, incoming_on_top=True)
+        assert mirrored.incoming.transform.center == upright.incoming.transform.center
+        assert mirrored.outgoing.transform.center == upright.outgoing.transform.center
+
+    def test_drop_still_falls_downwards_when_mirrored(self):
+        mirrored = plan_transition(
+            TransitionChoice(kind="drop", duration_frames=24), incoming_on_top=False
+        )
+        assert mirrored.incoming.is_empty()
+        center = mirrored.outgoing.transform.center
+        assert center[0] == (0, (0.5, 0.5))
+        assert center[-1] == (24, (0.5, -0.5))
+        frames = [k[0] for k in center]
         assert frames == sorted(frames)
         assert len(set(frames)) == len(frames)
+
+    def test_a_cut_mirrors_to_itself(self):
+        choice = TransitionChoice(kind="none", duration_frames=24)
+        assert plan_transition(choice, incoming_on_top=False) == plan_transition(
+            choice, incoming_on_top=True
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -562,7 +855,7 @@ class TestRoundTrip:
         plan = plan_transition(choice)
         assert plan.duration_frames == 30
         assert plan.incoming.background_color == (1.0, 0.0, 0.0)
-        assert plan.outgoing.background_color == (1.0, 0.0, 0.0)
+        assert plan.outgoing.is_empty()
 
     def test_plan_does_not_mutate_choice_params(self):
         choice = TransitionChoice(
@@ -582,3 +875,369 @@ class TestRoundTrip:
                 params={"unrecognised_key": 999},
             )
             plan_transition(choice)
+
+
+
+# --------------------------------------------------------------------------- #
+# Page turn
+# --------------------------------------------------------------------------- #
+
+class TestPageTurn:
+    def test_only_the_incoming_page_moves(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=36)
+        )
+
+        assert plan.incoming.page_turn is not None
+        # The photo being covered up does nothing, exactly like the page under
+        # the one being turned.
+        assert plan.outgoing.is_empty()
+
+    def test_the_page_comes_to_rest_exactly_flat(self):
+        # Any residual angle on the last frame shows up as a visible jump,
+        # because the next frame is the body segment showing the plain photo.
+        for duration in (2, 5, 12, 24, 36, 120):
+            plan = plan_transition(
+                TransitionChoice(kind="page_turn", duration_frames=duration)
+            )
+            angle = plan.incoming.page_turn.angle
+            assert angle[-1] == (duration, 0.0)
+            assert angle[0][0] == 0
+            assert angle[0][1] == pytest.approx(PAGE_START_ANGLE)
+
+    def test_keyframes_are_strictly_increasing_at_any_length(self):
+        for duration in range(1, 60):
+            keys = page_angle_keys(duration, PAGE_START_ANGLE)
+            frames = [frame for frame, _ in keys]
+            assert frames == sorted(set(frames)), duration
+            assert frames[-1] == duration
+
+    def test_the_arc_is_front_loaded(self):
+        keys = page_angle_keys(100, 100.0)
+        midpoint = [value for frame, value in keys if frame == 55][0]
+        # Past halfway in time the page should be most of the way down, not
+        # halfway -- a linear sweep reads mechanical.
+        assert midpoint < 50.0
+
+    def test_hinge_defaults_to_right_and_can_be_overridden(self):
+        default = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=24)
+        )
+        left = plan_transition(
+            TransitionChoice(
+                kind="page_turn", duration_frames=24, params={"hinge": "left"}
+            )
+        )
+
+        assert default.incoming.page_turn.hinge == "right"
+        assert left.incoming.page_turn.hinge == "left"
+
+    def test_a_left_hinge_mirrors_the_sign_of_the_angle(self):
+        # The free edge has to lift *toward* the camera either way. Rotating
+        # about Y sends pivot-relative x to z' = -x*sin(angle), and the two
+        # hinges put the free edge on opposite sides of the pivot, so the raw
+        # angle has to flip with them.
+        right = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=24)
+        )
+        left = plan_transition(
+            TransitionChoice(
+                kind="page_turn", duration_frames=24, params={"hinge": "left"}
+            )
+        )
+
+        assert right.incoming.page_turn.angle[0][1] == pytest.approx(PAGE_START_ANGLE)
+        assert left.incoming.page_turn.angle[0][1] == pytest.approx(-PAGE_START_ANGLE)
+        # Mirrored, not merely negative somewhere: every key is the negation
+        # of its counterpart, and both still rest at exactly flat.
+        for (rf, rv), (lf, lv) in zip(
+            right.incoming.page_turn.angle, left.incoming.page_turn.angle
+        ):
+            assert rf == lf
+            assert lv == pytest.approx(-rv)
+        assert left.incoming.page_turn.angle[-1][1] == pytest.approx(0.0)
+
+    def test_an_explicit_angle_is_mirrored_by_the_hinge_too(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn",
+                duration_frames=24,
+                params={"hinge": "left", "angle": 60.0},
+            )
+        )
+        assert plan.incoming.page_turn.angle[0][1] == pytest.approx(-60.0)
+
+    def test_nonsense_params_fall_back_to_the_defaults(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn",
+                duration_frames=24,
+                params={"hinge": "sideways", "focal_length": "wide", "angle": None},
+            )
+        )
+
+        page = plan.incoming.page_turn
+        assert page.hinge == "right"
+        assert page.focal_length == DEFAULT_PAGE_FOCAL_LENGTH
+        assert page.angle[0][1] == pytest.approx(PAGE_START_ANGLE)
+
+    def test_a_negative_focal_length_is_ignored(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn", duration_frames=24, params={"focal_length": -5}
+            )
+        )
+
+        assert plan.incoming.page_turn.focal_length == DEFAULT_PAGE_FOCAL_LENGTH
+
+    def test_zero_duration_is_a_cut(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=0)
+        )
+
+        assert plan.is_cut
+        assert plan.incoming.page_turn is None
+
+    def test_mirroring_makes_the_page_leave_instead_of_arrive(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=24),
+            incoming_on_top=False,
+        )
+
+        # Mirrored, the clip on top is the outgoing one and its page swings
+        # back out the way it came.
+        page = plan.outgoing.page_turn
+        assert page is not None
+        assert page.angle[0] == (0, 0.0)
+        assert page.angle[-1][0] == 24
+        assert page.angle[-1][1] == pytest.approx(PAGE_START_ANGLE)
+        # The hinge is a property of the page, not of the direction of travel.
+        assert page.hinge == "right"
+
+    def test_page_turn_cannot_be_stacked_on_the_2d_chain(self):
+        # They are different pipelines -- silently dropping one would be worse.
+        with pytest.raises(ValueError):
+            ClipPlan(
+                page_turn=PageTurnAnimation(angle=[(0, 90.0), (10, 0.0)]),
+                blur_size=[(0, 10.0), (10, 0.0)],
+            )
+
+    def test_an_empty_page_turn_does_not_block_the_2d_chain(self):
+        plan = ClipPlan(
+            page_turn=PageTurnAnimation(), blur_size=[(0, 10.0), (10, 0.0)]
+        )
+
+        assert plan.page_turn.is_empty()
+        assert not plan.is_empty()
+
+    def test_hinge_and_focal_length_are_validated(self):
+        with pytest.raises(ValueError):
+            PageTurnAnimation(hinge="middle")
+        with pytest.raises(ValueError):
+            PageTurnAnimation(focal_length=0)
+
+
+# --------------------------------------------------------------------------- #
+# Which side goes on the upper track
+# --------------------------------------------------------------------------- #
+
+
+class TestWantsOutgoingOnTop:
+    def test_ordinary_transitions_want_the_incoming_on_top(self):
+        for kind in ("dissolve", "fade", "slide_left", "flip", "page_turn"):
+            choice = TransitionChoice(kind=kind, duration_frames=12)
+            assert wants_outgoing_on_top(choice) is False
+
+    def test_page_turn_away_wants_the_outgoing_on_top(self):
+        choice = TransitionChoice(kind="page_turn_away", duration_frames=12)
+        assert wants_outgoing_on_top(choice) is True
+
+    def test_cuts_and_missing_choices_answer_no(self):
+        assert wants_outgoing_on_top(None) is False
+        assert wants_outgoing_on_top(TransitionChoice(kind="none")) is False
+        assert (
+            wants_outgoing_on_top(
+                TransitionChoice(kind="dissolve", duration_frames=0)
+            )
+            is False
+        )
+
+    def test_unresolved_auto_answers_no(self):
+        # "auto" has no implementation registered, so it must degrade to the
+        # ordinary layout rather than raise. The builder resolves it first.
+        assert wants_outgoing_on_top(TransitionChoice(kind="auto")) is False
+
+
+class TestPageTurnAway:
+    def test_it_asks_for_the_outgoing_slide_on_top(self):
+        assert get_transition("page_turn_away").PREFERS_OUTGOING_ON_TOP is True
+        assert get_transition("page_turn").PREFERS_OUTGOING_ON_TOP is False
+
+    def test_it_hinges_on_the_opposite_edge_to_page_turn(self):
+        away = plan_transition(
+            TransitionChoice(kind="page_turn_away", duration_frames=36)
+        )
+        assert away.incoming.page_turn.hinge == "left"
+        toward = plan_transition(
+            TransitionChoice(kind="page_turn", duration_frames=36)
+        )
+        assert toward.incoming.page_turn.hinge == "right"
+
+    def test_mirroring_moves_the_rotation_onto_the_outgoing_clip(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn_away", duration_frames=36),
+            incoming_on_top=False,
+        )
+        assert plan.incoming.page_turn is None
+        assert plan.outgoing.page_turn is not None
+
+    def test_the_mirrored_page_starts_flat_and_swings_out(self):
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn_away", duration_frames=36),
+            incoming_on_top=False,
+        )
+        angles = plan.outgoing.page_turn.angle
+        assert angles[0][0] == 0
+        assert angles[0][1] == pytest.approx(0.0)
+        assert angles[-1][0] == 36
+        # Negative because it hinges left: that is what lifts the free right
+        # edge off the screen towards the viewer instead of sinking it in.
+        assert angles[-1][1] == pytest.approx(-PAGE_START_ANGLE)
+
+    def test_it_lifts_off_the_screen_rather_than_into_it(self):
+        # Regression: the away variant used to reuse page_turn's positive
+        # angle with a left hinge, which rotated the page away from the
+        # camera -- it read as the photo sinking into the screen.
+        plan = plan_transition(
+            TransitionChoice(kind="page_turn_away", duration_frames=36),
+            incoming_on_top=False,
+        )
+        assert all(value <= 0.0 for _, value in plan.outgoing.page_turn.angle)
+
+    def test_overriding_the_hinge_flips_the_angle_back(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn_away",
+                duration_frames=36,
+                params={"hinge": "right"},
+            ),
+            incoming_on_top=False,
+        )
+        assert plan.outgoing.page_turn.angle[-1][1] == pytest.approx(PAGE_START_ANGLE)
+
+    def test_hinge_is_still_overridable(self):
+        plan = plan_transition(
+            TransitionChoice(
+                kind="page_turn_away",
+                duration_frames=24,
+                params={"hinge": "right"},
+            )
+        )
+        assert plan.incoming.page_turn.hinge == "right"
+
+
+# --------------------------------------------------------------------------- #
+# Duration derivation (issue #1)
+# --------------------------------------------------------------------------- #
+
+class TestResolveDurationFrames:
+    """``duration_frames=None`` means "as long as suits this slide"."""
+
+    def test_explicit_duration_always_wins(self):
+        choice = TransitionChoice(kind="dissolve", duration_frames=11)
+        # Same answer whatever the slide is, because the project asked for it.
+        assert resolve_duration_frames(choice, 96) == 11
+        assert resolve_duration_frames(choice, 288) == 11
+        assert resolve_duration_frames(choice, None) == 11
+
+    def test_explicit_zero_is_a_cut(self):
+        choice = TransitionChoice(kind="dissolve", duration_frames=0)
+        assert resolve_duration_frames(choice, 288) == 0
+
+    def test_kind_none_is_zero_even_when_unresolved(self):
+        assert resolve_duration_frames(TransitionChoice(kind="none"), 96) == 0
+
+    def test_missing_choice_is_zero(self):
+        assert resolve_duration_frames(None, 96) == 0
+
+    def test_derives_from_the_slide_length(self):
+        choice = TransitionChoice(kind="dissolve")
+        cls = type(get_transition("dissolve"))
+        assert resolve_duration_frames(choice, 96) == round(cls.DURATION_FRACTION * 96)
+
+    def test_a_longer_slide_gets_a_longer_transition(self):
+        # The whole point of the issue: a fixed frame count reads as
+        # measured at 4s and perfunctory at 8s.
+        choice = TransitionChoice(kind="dissolve")
+        short = resolve_duration_frames(choice, 96)
+        longer = resolve_duration_frames(choice, 144)
+        assert longer > short
+
+    def test_ceiling_stops_a_dissolve_taking_over(self):
+        choice = TransitionChoice(kind="dissolve")
+        cls = type(get_transition("dissolve"))
+        # 12s at 24fps.
+        assert resolve_duration_frames(choice, 288) == cls.MAX_DURATION_FRAMES
+
+    def test_floor_keeps_a_short_slide_perceptible(self):
+        choice = TransitionChoice(kind="dissolve")
+        cls = type(get_transition("dissolve"))
+        assert resolve_duration_frames(choice, 4) == cls.MIN_DURATION_FRAMES
+
+    def test_zero_length_slide_gets_no_transition(self):
+        assert resolve_duration_frames(TransitionChoice(kind="dissolve"), 0) == 0
+
+    def test_no_slide_context_falls_back_to_the_nominal_slide(self):
+        choice = TransitionChoice(kind="dissolve")
+        assert resolve_duration_frames(choice, None) == resolve_duration_frames(
+            choice, NOMINAL_SLIDE_FRAMES
+        )
+
+    def test_nominal_slide_reproduces_the_documented_default(self):
+        # The old fixed default has to stay reachable, or every doc example
+        # and saved project silently changes pace.
+        choice = TransitionChoice(kind="dissolve")
+        assert (
+            resolve_duration_frames(choice, None) == DEFAULT_TRANSITION_DURATION_FRAMES
+        )
+
+    def test_unknown_kind_degrades_instead_of_raising(self):
+        choice = TransitionChoice(kind="dissolve")
+        object.__setattr__(choice, "kind", "not_a_real_kind")
+        assert resolve_duration_frames(choice, 96) == DEFAULT_TRANSITION_DURATION_FRAMES
+
+    def test_pixelate_and_drop_get_more_room_than_a_dissolve(self):
+        # Both were reviewed as "too short"; they must grow further on a
+        # long slide rather than hitting the dissolve ceiling.
+        long_slide = 288
+        base = resolve_duration_frames(TransitionChoice(kind="dissolve"), long_slide)
+        for kind in ("pixelate", "drop"):
+            derived = resolve_duration_frames(TransitionChoice(kind=kind), long_slide)
+            assert derived > base, kind
+
+    def test_smooth_cut_never_grows(self):
+        # A smooth cut that scaled up would carve out overlap frames its
+        # own plan then refuses to use.
+        derived = resolve_duration_frames(TransitionChoice(kind="smooth_cut"), 288)
+        assert derived == SMOOTH_CUT_MAX_FRAMES
+
+    def test_every_registered_kind_resolves_to_something_usable(self):
+        for kind in registered_kinds():
+            if kind == "none":
+                continue
+            derived = resolve_duration_frames(TransitionChoice(kind=kind), 96)
+            assert derived > 0, kind
+            plan = get_transition(kind).plan(derived)
+            assert plan.duration_frames > 0, kind
+
+
+class TestPlanTransitionDerivesDuration:
+    def test_plan_transition_sizes_an_unresolved_choice(self):
+        plan = plan_transition(TransitionChoice(kind="dissolve"), slide_frames=96)
+        assert plan.duration_frames == resolve_duration_frames(
+            TransitionChoice(kind="dissolve"), 96
+        )
+
+    def test_plan_transition_without_a_slide_still_builds(self):
+        plan = plan_transition(TransitionChoice(kind="dissolve"))
+        assert plan.duration_frames == DEFAULT_TRANSITION_DURATION_FRAMES

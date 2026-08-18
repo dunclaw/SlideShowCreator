@@ -9,8 +9,12 @@ visible underneath. They differ in how the two clips blend together:
   both kinds so the UI can preserve the user's chosen name.)
 * :class:`AdditiveDissolve` — additive blend; bright areas of each
   clip add together, briefly producing a "hot" mid-transition look.
+  The outgoing clip fades to black underneath, because Add is only the
+  identity over black — without that the transition never resolves to
+  the plain incoming picture.
 * :class:`NonAdditiveDissolve` — max-blend; takes the brighter pixel
-  of the two clips, creating a softer crossover with less bloom.
+  of the two clips, creating a softer crossover with less bloom. Fades
+  the outgoing clip out for the same reason.
 * :class:`BlurDissolve` — straight dissolve plus animated blur on
   both clips that peaks at mid-transition and drops back to 0.
 * :class:`DipToColor` — both clips fade to a solid colour at
@@ -18,13 +22,14 @@ visible underneath. They differ in how the two clips blend together:
   ``params["color"]`` and falls back to black; supported as an RGB
   triple ``(r, g, b)`` in ``[0, 1]`` or a ``"#rrggbb"`` / ``"#rgb"``
   hex string.
+* :class:`DipToImageColor` — the same dip, but the colour is sampled
+  from the incoming photograph instead of being fixed.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from ..fusion_comps import ScalarKeyframe
 from .base import ClipPlan, RgbColor, Transition, TransitionPlan, register
 
 
@@ -44,6 +49,19 @@ def _empty_plan(kind: str) -> TransitionPlan:
 def _fade_in_keys(duration_frames: int) -> list:
     """Standard 0→1 ramp over the full overlap."""
     return [(0, 0.0), (duration_frames, 1.0)]
+
+
+def dip_midpoint(duration_frames: int) -> int:
+    """Frame at which a dip-through-colour transition is pure colour.
+
+    Clamped to ``[1, duration_frames - 1]`` when the overlap is long
+    enough, so the two halves never collapse onto the same frame and
+    produce duplicate keyframes. For a 1-frame overlap there is no room
+    for a midpoint and the caller gets frame 0.
+    """
+    if duration_frames < 2:
+        return 0
+    return max(1, min(duration_frames - 1, duration_frames // 2))
 
 
 def _parse_color(value: Any) -> RgbColor:
@@ -108,10 +126,24 @@ class _BasicDissolve(Transition):
             blend=_fade_in_keys(duration_frames),
             composite_mode=self.COMPOSITE,
         )
+        outgoing = ClipPlan()
+        if self.COMPOSITE != "normal":
+            # A non-normal composite mode has to end on something it is
+            # the identity over, or the transition never resolves to the
+            # plain picture. Add and Lighten are both the identity over
+            # black, so fade the outgoing clip out underneath: it is on
+            # the bottom track, where transparent renders as black.
+            #
+            # Without this the incoming clip stays composited against a
+            # fully opaque outgoing clip right up to the end of its
+            # overlap, looking blown-out or hard-light the whole way, and
+            # then snapping to the real picture at the cut.
+            outgoing = ClipPlan(blend=[(0, 1.0), (duration_frames, 0.0)])
         return TransitionPlan(
             kind=self.KIND,
             duration_frames=duration_frames,
             incoming=incoming,
+            outgoing=outgoing,
         )
 
 
@@ -190,12 +222,19 @@ class BlurDissolve(Transition):
 
 @register("dip_to_color")
 class DipToColor(Transition):
-    """Both clips fade to a solid colour at the midpoint.
+    """The transition dips through a solid colour at the midpoint.
 
-    First half: outgoing fades to ``color`` (its blend ramps ``1 → 0``
-    over a colour Background). Second half: incoming fades from
-    ``color`` to fully visible. The colour fully covers the frame at
-    the exact midpoint.
+    All of the work happens on the clip that ends up on the **upper**
+    track, because only that clip can both cover the one below (with the
+    colour) and then get out of its way. Two blends drive it:
+
+    * ``color_blend`` — the clip's image over the solid colour. Held at
+      ``0`` (pure colour) for the first half, then ramping to ``1``.
+    * ``blend``       — the whole thing's opacity over the clip below.
+      Ramps ``0 → 1`` across the first half, then holds.
+
+    Together: transparent at frame 0 (the outgoing clip shows through),
+    opaque colour at the midpoint, the incoming image by the end.
 
     ``params["color"]`` accepts an RGB triple in ``[0, 1]`` or a
     ``"#rrggbb"`` hex string. Defaults to black.
@@ -212,23 +251,77 @@ class DipToColor(Transition):
             return _empty_plan(self.KIND)
         params = params or {}
         color = _parse_color(params.get("color"))
-        mid = duration_frames // 2
+        mid = dip_midpoint(duration_frames)
+        if mid <= 0:
+            # Too short to dip through anything; degrade to a cross-fade.
+            return TransitionPlan(
+                kind=self.KIND,
+                duration_frames=duration_frames,
+                incoming=ClipPlan(blend=_fade_in_keys(duration_frames)),
+            )
 
-        # Outgoing: visible at frame 0, fully replaced by colour at midpoint.
-        outgoing = ClipPlan(
-            background_color=color,
-            blend=[(0, 1.0), (mid, 0.0)],
-        )
-        # Incoming: starts as pure colour at the midpoint, fades up after.
         incoming = ClipPlan(
             background_color=color,
-            blend=[(mid, 0.0), (duration_frames, 1.0)],
+            blend=[(0, 0.0), (mid, 1.0)],
+            color_blend=[(0, 0.0), (mid, 0.0), (duration_frames, 1.0)],
         )
         return TransitionPlan(
             kind=self.KIND,
             duration_frames=duration_frames,
             incoming=incoming,
-            outgoing=outgoing,
+        )
+
+
+@register("dip_to_image_color")
+class DipToImageColor(Transition):
+    """Dip through the incoming photo's own colour rather than a fixed one.
+
+    Identical timing to :class:`DipToColor` — the difference is entirely in
+    what sits behind the clip. Instead of a solid Background, the applier
+    builds a flat field of the incoming picture's average colour with its
+    saturation pushed back up (see
+    :func:`~slideshow.fusion_comps.add_image_average`), so the frame washes
+    to the dominant hue of the photograph that is about to appear and then
+    resolves into it.
+
+    It is the *incoming* clip's colour rather than the outgoing one's
+    because that is the only one available: each clip carries its own
+    Fusion comp and cannot see its neighbour. Washing toward the arriving
+    photograph is the better half of that bargain anyway — the dip reads as
+    the new image blooming in rather than the old one draining away.
+
+    ``params["color"]`` is still honoured as the fallback colour for the
+    degenerate case where the overlap is too short to dip at all.
+    """
+
+    def plan(
+        self,
+        duration_frames: int,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        fps: float = 24.0,
+    ) -> TransitionPlan:
+        if duration_frames <= 0:
+            return _empty_plan(self.KIND)
+        base = DipToColor().plan(duration_frames, params=params, fps=fps)
+        if base.incoming.background_color is None:
+            # Too short to dip; DipToColor already degraded to a cross-fade
+            # and there is no colour to sample toward.
+            return TransitionPlan(
+                kind=self.KIND,
+                duration_frames=base.duration_frames,
+                incoming=base.incoming,
+            )
+        incoming = ClipPlan(
+            background_color=base.incoming.background_color,
+            background_from_image=True,
+            blend=base.incoming.blend,
+            color_blend=base.incoming.color_blend,
+        )
+        return TransitionPlan(
+            kind=self.KIND,
+            duration_frames=base.duration_frames,
+            incoming=incoming,
         )
 
 
@@ -237,6 +330,7 @@ __all__ = [
     "BlurDissolve",
     "CrossFade",
     "DipToColor",
+    "DipToImageColor",
     "Dissolve",
     "NonAdditiveDissolve",
 ]

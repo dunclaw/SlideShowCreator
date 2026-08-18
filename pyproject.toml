@@ -15,16 +15,36 @@ classifiers = [
     "Environment :: Plugins",
     "Topic :: Multimedia :: Video :: Non-Linear Editor",
 ]
-# Runtime deps are intentionally empty: the in-Resolve script must run under
-# Resolve's bundled Python 3.6 with stdlib only. Optional audio analysis runs
-# in a sidecar venv (see [project.optional-dependencies] below).
+# Runtime deps are intentionally empty, but not for the reason you might
+# expect: Resolve does not bundle a Python at all. Its scripting README lists
+# "Python >= 3.6 64-bit" as a *prerequisite to install*, so a menu-invoked
+# script runs under whatever system interpreter Resolve discovered — one we
+# neither control nor should install into.
+#
+# So the plug-in is an external engine driven by a thin in-Resolve launcher
+# (see issue #9). Keeping the core import-free means the launcher and the
+# timeline builder run anywhere, including that unknown interpreter, and it
+# is what lets the test suite run with no Resolve and no dependencies. All
+# heavy work is *analysis*, which happens ahead of the build in a sidecar
+# venv and reaches the builder as plain numbers in the project JSON.
 dependencies = []
 
 [project.optional-dependencies]
+# Beat detection for music-synced transitions (issue #8).
 audio = [
     "librosa>=0.10",
     "numpy>=1.23",
     "soundfile>=0.12",
+]
+# Subject-aware fill cropping (issue #13): choose a crop that doesn't cut
+# people's heads off. opencv-contrib supplies the YuNet face detector, whose
+# weights are NOT bundled in the wheel and are fetched by setup (issue #14).
+# smartcrop handles photos with no detectable face.
+vision = [
+    "numpy>=1.23",
+    "opencv-contrib-python>=4.10",
+    "pillow>=9",
+    "smartcrop>=0.5",
 ]
 dev = [
     "pytest>=7",

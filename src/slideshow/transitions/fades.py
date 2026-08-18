@@ -6,10 +6,13 @@ directly:
 * :class:`Fade` — Movie Maker's plain fade; equivalent to dipping
   through black.
 * :class:`FadeThroughGray` — same shape, mid-grey instead of black.
+* :class:`FadeThroughWhite` — same shape, white. Reads as a camera
+  flash or a lightbox rather than a fade-out, and generally sits better
+  against bright holiday photographs than grey does.
 * :class:`BlurThroughBlack` — fades through black while also blurring
   the outgoing clip out of focus and the incoming clip into focus.
 
-All three are layered on top of :class:`~slideshow.transitions.dissolves.DipToColor`
+All four are layered on top of :class:`~slideshow.transitions.dissolves.DipToColor`
 so any improvements to dip-to-colour timing flow into the fades for free.
 """
 
@@ -22,12 +25,14 @@ from .dissolves import (
     DEFAULT_BLUR_DISSOLVE_PEAK_SIZE,
     DipToColor,
     _empty_plan,
+    dip_midpoint,
 )
 
 
-@register("fade")
-class Fade(Transition):
-    """Movie Maker "Fade" — dip through black."""
+class _DipPreset(Transition):
+    """A dip-to-colour with the colour fixed by the subclass."""
+
+    COLOR = (0.0, 0.0, 0.0)
 
     def plan(
         self,
@@ -40,7 +45,7 @@ class Fade(Transition):
             return _empty_plan(self.KIND)
         plan = DipToColor().plan(
             duration_frames,
-            params={"color": (0.0, 0.0, 0.0)},
+            params={"color": self.COLOR},
             fps=fps,
         )
         # Preserve our own kind label on the returned plan.
@@ -52,30 +57,25 @@ class Fade(Transition):
         )
 
 
+@register("fade")
+class Fade(_DipPreset):
+    """Movie Maker "Fade" — dip through black."""
+
+    COLOR = (0.0, 0.0, 0.0)
+
+
 @register("fade_through_gray")
-class FadeThroughGray(Transition):
+class FadeThroughGray(_DipPreset):
     """Movie Maker "Fade through gray" — dip through 50% grey."""
 
-    def plan(
-        self,
-        duration_frames: int,
-        *,
-        params: Optional[Dict[str, Any]] = None,
-        fps: float = 24.0,
-    ) -> TransitionPlan:
-        if duration_frames <= 0:
-            return _empty_plan(self.KIND)
-        plan = DipToColor().plan(
-            duration_frames,
-            params={"color": (0.5, 0.5, 0.5)},
-            fps=fps,
-        )
-        return TransitionPlan(
-            kind=self.KIND,
-            duration_frames=plan.duration_frames,
-            incoming=plan.incoming,
-            outgoing=plan.outgoing,
-        )
+    COLOR = (0.5, 0.5, 0.5)
+
+
+@register("fade_through_white")
+class FadeThroughWhite(_DipPreset):
+    """Dip through white — a flash rather than a fade."""
+
+    COLOR = (1.0, 1.0, 1.0)
 
 
 @register("blur_through_black")
@@ -99,7 +99,7 @@ class BlurThroughBlack(Transition):
             return _empty_plan(self.KIND)
         params = params or {}
         peak = float(params.get("peak_size", DEFAULT_BLUR_DISSOLVE_PEAK_SIZE))
-        mid = duration_frames // 2
+        mid = dip_midpoint(duration_frames)
 
         base = DipToColor().plan(
             duration_frames,
@@ -107,15 +107,17 @@ class BlurThroughBlack(Transition):
             fps=fps,
         )
 
-        outgoing = ClipPlan(
-            background_color=base.outgoing.background_color,
-            blend=base.outgoing.blend,
-            blur_size=[(0, 0.0), (mid, peak)],
-        )
+        # The dip itself rides entirely on the incoming (upper) clip; the
+        # outgoing clip is still visible through the first half, so its
+        # blur is what sells the "blur into black" half of the move.
         incoming = ClipPlan(
             background_color=base.incoming.background_color,
             blend=base.incoming.blend,
+            color_blend=base.incoming.color_blend,
             blur_size=[(mid, peak), (duration_frames, 0.0)],
+        )
+        outgoing = ClipPlan(
+            blur_size=[(0, 0.0), (mid, peak)],
         )
         return TransitionPlan(
             kind=self.KIND,
@@ -125,4 +127,4 @@ class BlurThroughBlack(Transition):
         )
 
 
-__all__ = ["BlurThroughBlack", "Fade", "FadeThroughGray"]
+__all__ = ["BlurThroughBlack", "Fade", "FadeThroughGray", "FadeThroughWhite"]
