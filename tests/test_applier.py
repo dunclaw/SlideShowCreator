@@ -871,6 +871,32 @@ def test_page_plane_is_unit_height_and_matches_the_render_aspect():
     assert built["plane_size"] == (pytest.approx(16.0 / 9.0), 1.0)
 
 
+def test_page_turn_uses_the_same_frame_sized_canvas_as_2d_segments():
+    """The page-turn shortcut must not fall back to the photo's native canvas.
+
+    Otherwise the transition segment is cropped/rescaled in source pixels,
+    then visibly snaps when the adjoining 2D body segment resumes in timeline
+    pixels.
+    """
+    comp = _FakeComp()
+    spec = _page_spec()
+    spec.framing = Framing(
+        frame_width=3840,
+        frame_height=2160,
+        source_width=1536,
+        source_height=2048,
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    assert built["plane"].connections["MaterialInput"] == "Merge-out"
+    assert built["renderer"].inputs["UseFrameFormatSettings"] == 0.0
+    assert built["renderer"].inputs["Width"] == 3840.0
+    assert built["renderer"].inputs["Height"] == 2160.0
+    assert built["render_size"] == (3840.0, 2160.0)
+    assert built["plane_size"] == (pytest.approx(16.0 / 9.0), 1.0)
+
+
 def test_camera_is_fitted_so_a_flat_page_fills_the_frame():
     comp = _FakeComp()
 
@@ -1071,11 +1097,11 @@ def test_page_motion_keyframes_convert_center_size_and_angle():
 
     assert keys["size"] == [(0, 1.0), (10, 1.2)]
     assert keys["angle"] == [(0, 5.0), (10, 0.0)]
-    # center.x=0.6 -> offset +0.1 -> Translate.X = -0.1 * plane_width(2.0) = -0.2
-    assert keys["center_x"][0] == (0, pytest.approx(-0.2))
+    # center.x=0.6 -> output offset +0.1 -> Translate.X = +0.1 * plane_width(2.0)
+    assert keys["center_x"][0] == (0, pytest.approx(0.2))
     assert keys["center_x"][1] == (10, pytest.approx(0.0))
-    # center.y=0.4 -> offset -0.1 -> Translate.Y = -(-0.1) * plane_height(1.0) = 0.1
-    assert keys["center_y"][0] == (0, pytest.approx(0.1))
+    # center.y=0.4 -> output offset -0.1 -> Translate.Y = -0.1 * plane_height(1.0)
+    assert keys["center_y"][0] == (0, pytest.approx(-0.1))
     assert keys["center_y"][1] == (10, pytest.approx(0.0))
 
 
@@ -1109,7 +1135,7 @@ def test_page_turn_survives_the_merge_into_a_comp_spec():
 
     assert spec.page_turn is not None
     assert spec.page_turn.angle[0][0] == 0
-    assert spec.page_turn.angle[-1] == (18, 0.0)
+    assert spec.page_turn.angle[-1] == (17, 0.0)
 
 
 class TestFraming:

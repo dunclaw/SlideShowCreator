@@ -80,27 +80,33 @@ PAGE_PROFILE = (
 
 
 def page_angle_keys(duration_frames: int, start_angle: float) -> List[ScalarKeyframe]:
-    """Keyframes sweeping from *start_angle* to flat over *duration_frames*.
+    """Keyframes sweeping from *start_angle* to flat over visible frames.
 
     Fractions are snapped to strictly increasing integer frames; points that
     collide after rounding are dropped so a very short overlap degenerates
     gracefully to a straight sweep rather than emitting duplicate keys.
-    The final key is always exactly ``(duration_frames, 0.0)`` — the page has
-    to come to rest *precisely* flat, because the next frame is the body
-    segment showing the untouched photo and any residual angle shows up as a
-    visible jump at the cut.
+    A clip of length ``duration_frames`` renders local frames
+    ``0..duration_frames - 1``. The final key therefore lands on that last
+    visible frame, not at ``duration_frames`` (which is already the first
+    frame of the adjoining body segment). The page has to come to rest
+    precisely flat while it is still visible, or its residual angle produces
+    a crop-and-position snap at the cut.
     """
+    last_frame = max(0, duration_frames - 1)
+    if last_frame == 0:
+        return [(0, 0.0)]
+
     keys: List[ScalarKeyframe] = []
     for fraction, scale in PAGE_PROFILE:
-        frame = int(round(fraction * duration_frames))
+        frame = int(round(fraction * last_frame))
         if keys and frame <= keys[-1][0]:
             continue
-        if frame >= duration_frames:
+        if frame >= last_frame:
             break
         keys.append((frame, start_angle * scale))
     if not keys:
         keys.append((0, start_angle))
-    keys.append((duration_frames, 0.0))
+    keys.append((last_frame, 0.0))
     return keys
 
 

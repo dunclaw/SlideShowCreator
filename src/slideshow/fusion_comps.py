@@ -1100,11 +1100,12 @@ class PageTurnAnimation:
         return not self.angle
 
     def reversed_angle(self, duration_frames: int) -> List[ScalarKeyframe]:
-        """``angle`` played backwards within a ``duration_frames`` window."""
+        """``angle`` played backwards across the clip's visible frames."""
         if not self.angle:
             return []
+        last_frame = max(0, duration_frames - 1)
         flipped = [
-            (duration_frames - int(frame), value) for frame, value in self.angle
+            (last_frame - int(frame), value) for frame, value in self.angle
         ]
         flipped.sort(key=lambda item: item[0])
         return flipped
@@ -1244,11 +1245,8 @@ def _page_motion_keyframes(
       in a 2D Transform.
     * ``center`` (normalized offset from ``(0.5, 0.5)``) → ``Translate.X`` /
       ``Translate.Y``, scaled from a frame fraction to world units via the
-      plane's own size. The sign is negated because a 2D Transform's
-      ``Center`` moving right shifts the *sampled* window right, which
-      makes the visible image appear to slide left — a literal 3D
-      translate has the opposite relationship (moving the plane right
-      slides the image right), so the offset must be flipped to match.
+      plane's own size. Fusion's 2D ``Center`` is the output position of the
+      image, so its sign matches a literal 3D translation.
     * ``angle`` (degrees, counter-clockwise) → ``Rotate.Z``: rotating a
       plane that already faces the camera dead-on about the camera's own
       view axis is exactly an in-plane 2D rotation.
@@ -1262,10 +1260,10 @@ def _page_motion_keyframes(
         out["size"] = list(animation.size)
     if animation.center:
         out["center_x"] = [
-            (frame, -(x - 0.5) * plane_width) for frame, (x, _y) in animation.center
+            (frame, (x - 0.5) * plane_width) for frame, (x, _y) in animation.center
         ]
         out["center_y"] = [
-            (frame, -(y - 0.5) * plane_height) for frame, (_x, y) in animation.center
+            (frame, (y - 0.5) * plane_height) for frame, (_x, y) in animation.center
         ]
     if animation.angle:
         out["angle"] = list(animation.angle)
@@ -1279,6 +1277,8 @@ def build_page_turn_graph(
     media_in_name: str = "MediaIn1",
     media_out_name: str = "MediaOut1",
     motion: Optional["TransformAnimation"] = None,
+    source: Any = None,
+    render_size: Optional[Tuple[int, int]] = None,
 ) -> dict:
     """Replace *comp*'s image chain with a 3D page rotating about one edge.
 
@@ -1325,7 +1325,7 @@ def build_page_turn_graph(
     merge = find_or_add_tool(comp, MERGE3D_TOOL, PAGE_MERGE_NAME, position=(3, 0))
     renderer = find_or_add_tool(comp, RENDERER3D_TOOL, PAGE_RENDERER_NAME, position=(4, 0))
 
-    connect(media_in, plane, PLANE_MATERIAL_INPUT)
+    connect(source or media_in, plane, PLANE_MATERIAL_INPUT)
     # Ken Burns motion (if any) is baked into the plane before the hinge
     # rotation, in the plane's own local space — see _page_motion_keyframes.
     connect(plane, motion_xform, SCENE_INPUT)
@@ -1335,6 +1335,10 @@ def build_page_turn_graph(
     connect(merge, renderer, SCENE_INPUT)
     connect(renderer, media_out, "Input")
 
+    if render_size is not None:
+        renderer.SetInput("UseFrameFormatSettings", 0.0)
+        renderer.SetInput("Width", float(render_size[0]))
+        renderer.SetInput("Height", float(render_size[1]))
     width = float(renderer.GetInput("Width") or 1920.0)
     height = float(renderer.GetInput("Height") or 1080.0)
     plane_height = 1.0

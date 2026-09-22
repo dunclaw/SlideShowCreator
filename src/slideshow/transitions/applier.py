@@ -542,7 +542,43 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
         # A page turn is a whole different pipeline: the image becomes a
         # texture on a 3D plane, so there is no 2D chain to hang a Blur or a
         # Transform off. ClipPlan rejects that combination at plan time.
-        return build_page_turn_graph(comp, spec.page_turn, motion=spec.motion)
+        source = None
+        render_size = None
+        canvas = None
+        if spec.framing is not None:
+            media_in = find_tool(comp, "MediaIn1")
+            if media_in is None:
+                raise RuntimeError("Composition has no 'MediaIn1' tool.")
+            canvas = add_canvas(
+                comp,
+                media_in,
+                frame_size=(spec.framing.frame_width, spec.framing.frame_height),
+                source_size=(spec.framing.source_width, spec.framing.source_height),
+                mode=spec.framing.mode,
+                backdrop=spec.framing.backdrop_kind,
+                color=spec.framing.backdrop_color,
+            )
+            source = canvas["merge"]
+            render_size = (spec.framing.frame_width, spec.framing.frame_height)
+        built = build_page_turn_graph(
+            comp,
+            spec.page_turn,
+            motion=spec.motion,
+            source=source,
+            render_size=render_size,
+        )
+        if canvas is not None:
+            for role in (
+                "fit",
+                "canvas",
+                "backdrop_fit",
+                "backdrop_blur",
+                "backdrop_merge",
+            ):
+                if role in canvas:
+                    built[role] = canvas[role]
+            built["canvas_merge"] = canvas["merge"]
+        return built
 
     built: Dict[str, Any] = {}
 
