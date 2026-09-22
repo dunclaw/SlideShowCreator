@@ -542,7 +542,7 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
         # A page turn is a whole different pipeline: the image becomes a
         # texture on a 3D plane, so there is no 2D chain to hang a Blur or a
         # Transform off. ClipPlan rejects that combination at plan time.
-        return build_page_turn_graph(comp, spec.page_turn)
+        return build_page_turn_graph(comp, spec.page_turn, motion=spec.motion)
 
     built: Dict[str, Any] = {}
 

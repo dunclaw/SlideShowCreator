@@ -243,6 +243,7 @@ MERGE3D_TOOL = "Merge3D"
 RENDERER3D_TOOL = "Renderer3D"
 
 PAGE_PLANE_NAME = "SlideShowPage"
+PAGE_MOTION_TRANSFORM_NAME = "SlideShowPageMotion"
 PAGE_TRANSFORM_NAME = "SlideShowPageXf"
 PAGE_CAMERA_NAME = "SlideShowPageCam"
 PAGE_MERGE_NAME = "SlideShowPageScene"
@@ -255,8 +256,13 @@ MERGE3D_SCENE_INPUT_1 = "SceneInput1"
 MERGE3D_SCENE_INPUT_2 = "SceneInput2"
 PLANE_MATERIAL_INPUT = "MaterialInput"
 TRANSFORM3D_ROTATE_Y = "Transform3DOp.Rotate.Y"
+TRANSFORM3D_ROTATE_Z = "Transform3DOp.Rotate.Z"
 TRANSFORM3D_PIVOT_X = "Transform3DOp.Pivot.X"
+TRANSFORM3D_TRANSLATE_X = "Transform3DOp.Translate.X"
+TRANSFORM3D_TRANSLATE_Y = "Transform3DOp.Translate.Y"
 TRANSFORM3D_TRANSLATE_Z = "Transform3DOp.Translate.Z"
+TRANSFORM3D_SCALE_X = "Transform3DOp.Scale.X"
+TRANSFORM3D_SCALE_Y = "Transform3DOp.Scale.Y"
 PLANE_SIZE_LOCK = "SurfacePlaneInputs.SizeLock"
 PLANE_WIDTH = "SurfacePlaneInputs.Width"
 PLANE_HEIGHT = "SurfacePlaneInputs.Height"
@@ -1217,20 +1223,76 @@ def fit_angles_to_frame(
     return [(frame, value * scale) for frame, value in angle]
 
 
+def _page_motion_keyframes(
+    animation: "TransformAnimation",
+    plane_width: float,
+    plane_height: float,
+) -> Dict[str, List[ScalarKeyframe]]:
+    """Convert a 2D-style :class:`TransformAnimation` to Transform3D scalars.
+
+    The page-turn plane sits centred at the origin, one world unit tall,
+    facing the camera before any hinge rotation is applied — geometrically
+    the same as a flat photo behind a 2D Transform. That lets Ken Burns
+    motion be expressed with the same normalized ``center``/``size``/
+    ``angle`` semantics used everywhere else, just re-projected onto the
+    plane's local Scale/Translate/Rotate instead of a 2D Transform's
+    Center/Size/Angle:
+
+    * ``size``   (uniform zoom factor) → ``Scale.X`` / ``Scale.Y``: the
+      plane growing in its own local space covers more of the camera's
+      view, which reads as zooming in — the same relationship ``Size`` has
+      in a 2D Transform.
+    * ``center`` (normalized offset from ``(0.5, 0.5)``) → ``Translate.X`` /
+      ``Translate.Y``, scaled from a frame fraction to world units via the
+      plane's own size. The sign is negated because a 2D Transform's
+      ``Center`` moving right shifts the *sampled* window right, which
+      makes the visible image appear to slide left — a literal 3D
+      translate has the opposite relationship (moving the plane right
+      slides the image right), so the offset must be flipped to match.
+    * ``angle`` (degrees, counter-clockwise) → ``Rotate.Z``: rotating a
+      plane that already faces the camera dead-on about the camera's own
+      view axis is exactly an in-plane 2D rotation.
+
+    Returns a dict of role -> keyframe list, keyed by the same role names
+    used for the 2D case (``size``/``center_x``/``center_y``/``angle``),
+    omitting any role the animation doesn't drive.
+    """
+    out: Dict[str, List[ScalarKeyframe]] = {}
+    if animation.size:
+        out["size"] = list(animation.size)
+    if animation.center:
+        out["center_x"] = [
+            (frame, -(x - 0.5) * plane_width) for frame, (x, _y) in animation.center
+        ]
+        out["center_y"] = [
+            (frame, -(y - 0.5) * plane_height) for frame, (_x, y) in animation.center
+        ]
+    if animation.angle:
+        out["angle"] = list(animation.angle)
+    return out
+
+
 def build_page_turn_graph(
     comp: Any,
     animation: PageTurnAnimation,
     *,
     media_in_name: str = "MediaIn1",
     media_out_name: str = "MediaOut1",
+    motion: Optional["TransformAnimation"] = None,
 ) -> dict:
     """Replace *comp*'s image chain with a 3D page rotating about one edge.
 
     The graph is::
 
-        MediaIn1 ─► Shape3D ─► Transform3D ─► Merge3D ─► Renderer3D ─► MediaOut1
-                   (material)   (rotate Y)      ▲
-                                            Camera3D
+        MediaIn1 ─► Shape3D ─► [Transform3D] ─► Transform3D ─► Merge3D ─► Renderer3D ─► MediaOut1
+                   (material)   (Ken Burns)      (rotate Y)      ▲
+                                                             Camera3D
+
+    The optional Ken Burns stage sits *before* the hinge rotation, in the
+    plane's own local space, so a pan/zoom is baked into the plane exactly
+    as it would be for a flat 2D clip, and the hinge then rotates that
+    already-panned-and-zoomed plane — the motion and the page turn compose
+    instead of one clobbering the other.
 
     Assumes the caller holds the comp lock.
 
@@ -1255,13 +1317,19 @@ def build_page_turn_graph(
     media_out = _require_tool(comp, media_out_name)
 
     plane = find_or_add_tool(comp, SHAPE3D_TOOL, PAGE_PLANE_NAME, position=(1, 0))
+    motion_xform = find_or_add_tool(
+        comp, TRANSFORM3D_TOOL, PAGE_MOTION_TRANSFORM_NAME, position=(2, -1)
+    )
     xform = find_or_add_tool(comp, TRANSFORM3D_TOOL, PAGE_TRANSFORM_NAME, position=(2, 0))
     camera = find_or_add_tool(comp, CAMERA3D_TOOL, PAGE_CAMERA_NAME, position=(2, 2))
     merge = find_or_add_tool(comp, MERGE3D_TOOL, PAGE_MERGE_NAME, position=(3, 0))
     renderer = find_or_add_tool(comp, RENDERER3D_TOOL, PAGE_RENDERER_NAME, position=(4, 0))
 
     connect(media_in, plane, PLANE_MATERIAL_INPUT)
-    connect(plane, xform, SCENE_INPUT)
+    # Ken Burns motion (if any) is baked into the plane before the hinge
+    # rotation, in the plane's own local space — see _page_motion_keyframes.
+    connect(plane, motion_xform, SCENE_INPUT)
+    connect(motion_xform, xform, SCENE_INPUT)
     connect(xform, merge, MERGE3D_SCENE_INPUT_1)
     connect(camera, merge, MERGE3D_SCENE_INPUT_2)
     connect(merge, renderer, SCENE_INPUT)
@@ -1279,6 +1347,25 @@ def build_page_turn_graph(
     # renderer fall back to its default lighting and darken the photo.
     plane.SetInput(PLANE_LIT, 0.0)
     plane.SetInput(PLANE_CULL_BACKFACE, 1.0 if animation.cull_backface else 0.0)
+
+    motion_keys = (
+        _page_motion_keyframes(motion, plane_width, plane_height)
+        if motion is not None and not motion.is_empty()
+        else {}
+    )
+    if motion_keys.get("size"):
+        set_scalar_keyframes(comp, motion_xform, TRANSFORM3D_SCALE_X, motion_keys["size"])
+        set_scalar_keyframes(comp, motion_xform, TRANSFORM3D_SCALE_Y, motion_keys["size"])
+    if motion_keys.get("center_x"):
+        set_scalar_keyframes(
+            comp, motion_xform, TRANSFORM3D_TRANSLATE_X, motion_keys["center_x"]
+        )
+    if motion_keys.get("center_y"):
+        set_scalar_keyframes(
+            comp, motion_xform, TRANSFORM3D_TRANSLATE_Y, motion_keys["center_y"]
+        )
+    if motion_keys.get("angle"):
+        set_scalar_keyframes(comp, motion_xform, TRANSFORM3D_ROTATE_Z, motion_keys["angle"])
 
     camera.SetInput(CAMERA_FOCAL_LENGTH, animation.focal_length)
     aov = float(camera.GetInput(CAMERA_AOV) or 0.0)
@@ -1304,6 +1391,7 @@ def build_page_turn_graph(
 
     return {
         "plane": plane,
+        "motion_transform": motion_xform,
         "transform": xform,
         "camera": camera,
         "merge": merge,

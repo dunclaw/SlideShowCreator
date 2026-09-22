@@ -11,6 +11,7 @@ Top-level shape::
     ├── default_item_duration_seconds      # used by items without an override
     ├── default_transition: TransitionChoice
     ├── default_motion: MotionChoice
+    ├── motion_intensity: float              # global motion strength multiplier
     ├── audio: AudioSettings | None
     ├── target_total_duration_seconds: float | None  # bulk-duration target
     └── items: list[MediaItem]
@@ -43,7 +44,8 @@ position/style.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .fusion_comps import TransformAnimation
@@ -717,6 +719,13 @@ class SlideshowProject:
     audio: Optional[AudioSettings] = None
     framing: FramingSettings = field(default_factory=FramingSettings)
     target_total_duration_seconds: Optional[float] = None
+    #: Global Ken Burns strength multiplier applied on top of every clip's
+    #: ``MotionChoice`` (default or per-item). ``1.0`` = use each motion's
+    #: own ``zoom_amount``/``rotation_degrees`` unchanged; ``0.5`` halves
+    #: the zoom/pan/rotation range for a gentler show; ``2.0`` doubles it.
+    #: Scaling happens once, in :meth:`motion_for`, so every caller (the
+    #: timeline builder, tests, previews) sees the already-scaled motion.
+    motion_intensity: float = 1.0
 
     @property
     def soundtrack_path(self) -> Optional[str]:
@@ -740,6 +749,7 @@ class SlideshowProject:
         default_item_duration_seconds: float = 4.0,
         default_transition: Optional[TransitionChoice] = None,
         default_motion: Optional[MotionChoice] = None,
+        motion_intensity: float = 1.0,
     ) -> "SlideshowProject":
         return cls(
             name=name,
@@ -755,6 +765,7 @@ class SlideshowProject:
                 if default_motion is not None
                 else MotionChoice(kind="none")
             ),
+            motion_intensity=motion_intensity,
         )
 
     def effective_duration(self, item: MediaItem) -> float:
@@ -796,9 +807,16 @@ class SlideshowProject:
                 )
             )
         item = self.items[index]
-        if item.motion is not None:
-            return item.motion
-        return self.default_motion
+        motion = item.motion if item.motion is not None else self.default_motion
+        if self.motion_intensity == 1.0 or motion.is_static():
+            return motion
+        if self.motion_intensity == 0.0:
+            return replace(motion, kind="none")
+        return replace(
+            motion,
+            zoom_amount=motion.zoom_amount * self.motion_intensity,
+            rotation_degrees=motion.rotation_degrees * self.motion_intensity,
+        )
 
     def total_default_duration_seconds(self) -> float:
         """Sum of all items' effective durations (ignoring transition overlap)."""
@@ -826,6 +844,12 @@ class SlideshowProject:
                     self.target_total_duration_seconds
                 )
             )
+        if not math.isfinite(self.motion_intensity) or self.motion_intensity < 0:
+            problems.append(
+                "motion_intensity must be a finite value >= 0 (got {0})".format(
+                    self.motion_intensity
+                )
+            )
         for i, item in enumerate(self.items):
             if not item.path:
                 problems.append("items[{0}] has empty path".format(i))
@@ -840,6 +864,7 @@ class SlideshowProject:
             ),
             "default_transition": self.default_transition.to_dict(),
             "default_motion": self.default_motion.to_dict(),
+            "motion_intensity": float(self.motion_intensity),
             "audio": self.audio.to_dict() if self.audio is not None else None,
             "framing": self.framing.to_dict(),
             "target_total_duration_seconds": self.target_total_duration_seconds,
@@ -884,6 +909,7 @@ class SlideshowProject:
             ),
             default_transition=default_trans,
             default_motion=default_motion,
+            motion_intensity=float(data.get("motion_intensity", 1.0)),
             audio=audio,
             framing=framing,
             target_total_duration_seconds=_opt_float(

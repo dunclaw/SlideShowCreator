@@ -827,9 +827,11 @@ def test_every_kind_can_be_planned_merged_and_applied(kind):
 # 3D page turn
 # --------------------------------------------------------------------------- #
 
-def _page_spec(**kwargs):
+def _page_spec(*, motion=None, **kwargs):
     kwargs.setdefault("angle", [(0, 100.0), (24, 0.0)])
-    return CompSpec(length_frames=60, page_turn=fc.PageTurnAnimation(**kwargs))
+    return CompSpec(
+        length_frames=60, page_turn=fc.PageTurnAnimation(**kwargs), motion=motion
+    )
 
 
 def test_page_turn_builds_a_3d_scene_instead_of_the_2d_chain():
@@ -844,7 +846,10 @@ def test_page_turn_builds_a_3d_scene_instead_of_the_2d_chain():
     assert "Transform" not in comp.added
     # MediaIn textures the plane; the renderer is what MediaOut sees.
     assert built["plane"].connections["MaterialInput"] == "MediaIn1-out"
-    assert built["transform"].connections["SceneInput"] == "Shape3D-out"
+    # Ken Burns motion (none here) sits between the plane and the hinge
+    # rotation, in its own Transform3D.
+    assert built["motion_transform"].connections["SceneInput"] == "Shape3D-out"
+    assert built["transform"].connections["SceneInput"] == "Transform3D-out"
     assert built["merge"].connections["SceneInput1"] == "Transform3D-out"
     assert built["merge"].connections["SceneInput2"] == "Camera3D-out"
     assert built["renderer"].connections["SceneInput"] == "Merge3D-out"
@@ -1025,6 +1030,65 @@ def test_page_turn_graph_is_rebuilt_not_duplicated():
 
     assert comp.added.count("Shape3D") == 1
     assert comp.added.count("Renderer3D") == 1
+
+
+def test_page_turn_composes_with_ken_burns_motion():
+    """Regression test: motion used to be silently dropped for a page turn.
+
+    build_comp_graph shortcuts straight to build_page_turn_graph whenever a
+    page turn is present, bypassing the 2D Transform entirely — so motion
+    has to be threaded through to drive a Transform3D instead, or the
+    segment freezes for the whole page-turn transition and then jumps back
+    into motion the instant it lands, which is exactly the kind of visible
+    discontinuity this issue is about.
+    """
+    comp = _FakeComp()
+    motion = TransformAnimation(
+        center=[(0, (0.6, 0.5)), (24, (0.5, 0.5))],
+        size=[(0, 1.0), (24, 1.1)],
+    )
+    spec = _page_spec(motion=motion)
+
+    built = build_comp_graph(comp, spec)
+
+    motion_xform = built["motion_transform"]
+    # Two keyframes each → animated via a spline, connected rather than a
+    # plain constant on the input.
+    assert fc.TRANSFORM3D_SCALE_X in motion_xform.connections
+    assert fc.TRANSFORM3D_SCALE_Y in motion_xform.connections
+    assert fc.TRANSFORM3D_TRANSLATE_X in motion_xform.connections
+    assert fc.TRANSFORM3D_TRANSLATE_Y in motion_xform.connections
+
+
+def test_page_motion_keyframes_convert_center_size_and_angle():
+    """Unit-level check of the normalized-to-Transform3D conversion math."""
+    animation = TransformAnimation(
+        center=[(0, (0.6, 0.4)), (10, (0.5, 0.5))],
+        size=[(0, 1.0), (10, 1.2)],
+        angle=[(0, 5.0), (10, 0.0)],
+    )
+    keys = fc._page_motion_keyframes(animation, plane_width=2.0, plane_height=1.0)
+
+    assert keys["size"] == [(0, 1.0), (10, 1.2)]
+    assert keys["angle"] == [(0, 5.0), (10, 0.0)]
+    # center.x=0.6 -> offset +0.1 -> Translate.X = -0.1 * plane_width(2.0) = -0.2
+    assert keys["center_x"][0] == (0, pytest.approx(-0.2))
+    assert keys["center_x"][1] == (10, pytest.approx(0.0))
+    # center.y=0.4 -> offset -0.1 -> Translate.Y = -(-0.1) * plane_height(1.0) = 0.1
+    assert keys["center_y"][0] == (0, pytest.approx(0.1))
+    assert keys["center_y"][1] == (10, pytest.approx(0.0))
+
+
+def test_no_motion_leaves_the_page_turn_graph_unchanged():
+    """A page turn with no motion still gets an (identity) motion Transform3D
+    inserted for graph-shape consistency, but nothing is keyframed on it."""
+    comp = _FakeComp()
+    built = build_comp_graph(comp, _page_spec())
+
+    motion_xform = built["motion_transform"]
+    assert fc.TRANSFORM3D_SCALE_X not in motion_xform.inputs
+    assert fc.TRANSFORM3D_TRANSLATE_X not in motion_xform.inputs
+    assert fc.TRANSFORM3D_ROTATE_Z not in motion_xform.inputs
 
 
 def test_camera_distance_rejects_nonsense():
