@@ -46,6 +46,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .fusion_comps import TransformAnimation
+
 
 # --------------------------------------------------------------------------- #
 # Transitions
@@ -316,6 +318,100 @@ class MotionChoice:
     def is_static(self) -> bool:
         """``True`` if this motion produces no animation."""
         return self.kind == "none"
+
+    def _direction_offset(self, travel: float = 0.2) -> Tuple[float, float]:
+        """Offset from the frame centre for a directional pan / drift."""
+        if self.direction == "center":
+            return (0.0, 0.0)
+        deltas = {
+            "left": (travel, 0.0),
+            "right": (-travel, 0.0),
+            "up": (0.0, travel),
+            "down": (0.0, -travel),
+            "up_left": (travel, travel),
+            "up_right": (-travel, travel),
+            "down_left": (travel, -travel),
+            "down_right": (-travel, -travel),
+        }
+        return deltas.get(self.direction, (0.0, 0.0))
+
+    def plan_transform(
+        self,
+        duration_frames: int,
+        *,
+        fps: float = 24.0,
+    ) -> TransformAnimation:
+        """Build the full-slide transform this motion implies.
+
+        The resulting animation is expressed in *clip-local* frame numbers,
+        so a split slide can slice it up later without re-planning.
+        """
+        if duration_frames <= 0 or self.kind == "none":
+            return TransformAnimation()
+
+        kind = "zoom_in" if self.kind == "auto" else self.kind
+        duration = max(1, int(duration_frames))
+        center = None
+        size = None
+        angle = None
+
+        # A directional offset must never ask for more drift than the crop
+        # margin a given zoom level actually provides — Size=1.1 only has
+        # 5% of overscan on each side, so a 10% offset would slide the
+        # image clean off one edge and expose the transparent canvas
+        # underneath. That gap is invisible while a transition still has
+        # something composited beneath it, then suddenly appears (or the
+        # picture appears to "snap") the instant the neighbouring segment
+        # goes away. Clamping offset to the margin keeps the frame fully
+        # covered for the whole motion, with no gap to reveal.
+        def margin_of(crop_size: float) -> float:
+            return max(0.0, (crop_size - 1.0) / 2.0)
+
+        if kind == "pan":
+            pan_amount = max(0.05, min(0.5, self.zoom_amount or 0.1))
+            crop_size = 1.0 + pan_amount
+            dx, dy = self._direction_offset(margin_of(crop_size))
+            start = (0.5 + dx, 0.5 + dy)
+            end = (0.5, 0.5)
+            center = [(0, start), (duration, end)]
+            size = [(0, crop_size), (duration, crop_size)]
+        else:
+            zoom = max(0.0, self.zoom_amount)
+            if kind == "zoom_in":
+                # Starts at a plain, uncropped fit and zooms in toward
+                # ``direction`` — the crop (and therefore the pan margin)
+                # only exists at the end, so that's where the offset goes.
+                start_size, end_size = 1.0, 1.0 + zoom
+            elif kind == "zoom_out":
+                # The inverse: starts cropped in on ``direction`` and
+                # settles back to a plain, centred fit.
+                start_size, end_size = 1.0 + zoom, 1.0
+            else:
+                start_size = end_size = 1.0
+            size = [(0, start_size), (duration, end_size)]
+            if self.direction != "center":
+                if end_size >= start_size:
+                    dx, dy = self._direction_offset(margin_of(end_size))
+                    center = [(0, (0.5, 0.5)), (duration, (0.5 + dx, 0.5 + dy))]
+                else:
+                    dx, dy = self._direction_offset(margin_of(start_size))
+                    center = [(0, (0.5 + dx, 0.5 + dy)), (duration, (0.5, 0.5))]
+
+        if self.rotation_degrees:
+            angle = [(0, float(self.rotation_degrees)), (duration, 0.0)]
+
+        return TransformAnimation(center=center, size=size, angle=angle)
+
+    def to_transform(
+        self,
+        duration_frames: int,
+        *,
+        fps: float = 24.0,
+    ) -> TransformAnimation:
+        """Back-compat alias: :meth:`plan_transform`."""
+        return self.plan_transform(duration_frames, fps=fps)
+
+    as_transform = to_transform
 
     def to_dict(self) -> Dict[str, Any]:
         return {

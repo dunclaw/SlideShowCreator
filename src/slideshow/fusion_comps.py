@@ -729,6 +729,7 @@ def add_image_average(
     saturation: float = IMAGE_COLOR_SATURATION,
     gamma: float = IMAGE_COLOR_GAMMA,
     position: Tuple[int, int] = (0, 3),
+    frame_size: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """Build a full-frame flat field of *source*'s average colour.
 
@@ -768,10 +769,22 @@ def add_image_average(
     up = find_or_add_tool(
         comp, RESIZE_TOOL, DEFAULT_AVERAGE_UP_NAME, position=(x + 1, y)
     )
-    # Back to the comp's own frame format, so the Merge below gets a
-    # background the same size as the foreground it has to cover.
     up.SetInput("KeepAspect", 0.0)
-    up.SetInput("UseFrameFormatSettings", 1.0)
+    if frame_size is not None:
+        # Explicit dimensions, not the comp's own frame format: inside a
+        # Resolve clip comp that format is the *photograph's* resolution,
+        # not the timeline's (see add_canvas). A Merge takes its output size
+        # from its background, so an undersized flat field here would clip
+        # the foreground it is meant to cover down to the photo's own pixel
+        # dimensions.
+        width, height = frame_size
+        up.SetInput("UseFrameFormatSettings", 0.0)
+        up.SetInput("Width", float(width))
+        up.SetInput("Height", float(height))
+    else:
+        # Back to the comp's own frame format, so the Merge below gets a
+        # background the same size as the foreground it has to cover.
+        up.SetInput("UseFrameFormatSettings", 1.0)
     connect(down, up, "Input")
 
     tint = find_or_add_tool(

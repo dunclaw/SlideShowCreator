@@ -229,6 +229,65 @@ class TestMotionChoice:
         assert m.zoom_amount == DEFAULT_MOTION_ZOOM_AMOUNT
         assert m.params == {}
 
+    def test_plan_transform_tracks_a_full_slide_motion(self):
+        m = MotionChoice(kind="pan", direction="left", zoom_amount=0.15)
+        motion = m.plan_transform(48)
+
+        assert motion.center[0][1][0] > 0.5
+        assert motion.center[-1][1] == (0.5, 0.5)
+        assert motion.size[0][1] == pytest.approx(1.15)
+        assert motion.size[-1][1] == pytest.approx(1.15)
+
+    @pytest.mark.parametrize(
+        "kind, direction",
+        [
+            ("pan", "left"),
+            ("pan", "up_right"),
+            ("zoom_in", "down_right"),
+            ("zoom_out", "up_left"),
+        ],
+    )
+    @pytest.mark.parametrize("zoom_amount", [0.05, 0.15, 0.3, 0.45])
+    def test_directional_offset_never_exceeds_the_crop_margin(
+        self, kind, direction, zoom_amount
+    ):
+        # The pan/zoom must never drift the image further than its own
+        # zoom covers, or a transparent gap opens up at the frame edge
+        # (visible as a sudden "crop" that snaps once neighbouring
+        # segments stop masking it).
+        m = MotionChoice(kind=kind, direction=direction, zoom_amount=zoom_amount)
+        motion = m.plan_transform(48)
+
+        for frame, center in motion.center:
+            size_at_frame = next(s for f, s in motion.size if f == frame)
+            margin = (size_at_frame - 1.0) / 2.0
+            assert abs(center[0] - 0.5) <= margin + 1e-9
+            assert abs(center[1] - 0.5) <= margin + 1e-9
+
+    def test_zoom_in_lands_on_direction_as_it_crops_in(self):
+        # zoom_in has no crop margin at the start (it's a plain fit), so
+        # the pan must be applied where the crop actually is: the end.
+        m = MotionChoice(kind="zoom_in", direction="down_right", zoom_amount=0.2)
+        motion = m.plan_transform(48)
+
+        assert motion.center[0][1] == (0.5, 0.5)
+        assert motion.center[-1][1][0] < 0.5
+        assert motion.center[-1][1][1] < 0.5
+        assert motion.size[0][1] == pytest.approx(1.0)
+        assert motion.size[-1][1] == pytest.approx(1.2)
+
+    def test_zoom_out_lands_on_center_as_it_settles(self):
+        # zoom_out is the mirror image: crop margin exists at the start,
+        # so that's where the pan lives; it settles to plain centre.
+        m = MotionChoice(kind="zoom_out", direction="up_left", zoom_amount=0.2)
+        motion = m.plan_transform(48)
+
+        assert motion.center[0][1][0] > 0.5
+        assert motion.center[0][1][1] > 0.5
+        assert motion.center[-1][1] == (0.5, 0.5)
+        assert motion.size[0][1] == pytest.approx(1.2)
+        assert motion.size[-1][1] == pytest.approx(1.0)
+
 
 # --------------------------------------------------------------------------- #
 # AudioSettings

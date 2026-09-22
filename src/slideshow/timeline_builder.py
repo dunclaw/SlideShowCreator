@@ -523,6 +523,101 @@ class TimelineBuilder:
             self._apply_transitions(result, fps)
         return result
 
+    @staticmethod
+    def _motion_for_segment(
+        project: SlideshowProject,
+        layout: TimelineLayout,
+        placed: PlacedClip,
+        *,
+        fps: float,
+    ):
+        """Return the segment-local motion transform for a placed clip."""
+        motion = project.motion_for(placed.index)
+        if motion.is_static():
+            return None
+        slide_frames = seconds_to_frames(
+            project.effective_duration(project.items[placed.index]),
+            fps,
+        )
+        if slide_frames <= 0:
+            return None
+        full_motion = motion.plan_transform(slide_frames, fps=fps)
+        if full_motion.is_empty():
+            return None
+
+        lead_in = 0
+        if placed.index > 0 and placed.index - 1 < len(layout.transitions):
+            lead_in = layout.transitions[placed.index - 1].duration_frames or 0
+        lead_out = 0
+        if placed.index < len(layout.transitions):
+            lead_out = layout.transitions[placed.index].duration_frames or 0
+
+        outgoing_on_top = [
+            bool(choice.duration_frames and _prefers_outgoing_on_top(choice))
+            for choice in layout.transitions
+        ]
+        head_frames = 0 if placed.index == 0 or outgoing_on_top[placed.index - 1] else lead_in
+        tail_frames = lead_out if (
+            placed.index < len(layout.transitions) and outgoing_on_top[placed.index]
+        ) else 0
+
+        if placed.segment == SEGMENT_HEAD:
+            segment_start = 0
+        elif placed.segment == SEGMENT_TAIL:
+            segment_start = slide_frames - tail_frames
+        else:
+            segment_start = head_frames
+
+        if segment_start < 0:
+            segment_start = 0
+
+        def sample(channel, frame):
+            """Sample a full-slide channel at an integer frame."""
+            if not channel:
+                return None
+            keyframes = sorted(channel, key=lambda item: int(item[0]))
+            if frame <= int(keyframes[0][0]):
+                return keyframes[0][1]
+            if frame >= int(keyframes[-1][0]):
+                return keyframes[-1][1]
+            for before, after in zip(keyframes, keyframes[1:]):
+                before_frame, before_value = int(before[0]), before[1]
+                after_frame, after_value = int(after[0]), after[1]
+                if before_frame <= frame <= after_frame:
+                    fraction = (frame - before_frame) / float(after_frame - before_frame)
+                    if isinstance(before_value, tuple):
+                        return tuple(
+                            left + (right - left) * fraction
+                            for left, right in zip(before_value, after_value)
+                        )
+                    return before_value + (after_value - before_value) * fraction
+            return keyframes[-1][1]
+
+        def shrink(channel):
+            if not channel:
+                return None
+            segment_end = min(
+                slide_frames,
+                segment_start + max(0, placed.length_frames),
+            )
+            local_end = max(0, segment_end - segment_start)
+            result = [(0, sample(channel, segment_start))]
+            result.extend(
+                (int(frame) - segment_start, value)
+                for frame, value in channel
+                if segment_start < int(frame) < segment_end
+            )
+            if local_end > 0:
+                result.append((local_end, sample(channel, segment_end)))
+            return result
+
+        return full_motion.__class__(
+            center=shrink(full_motion.center),
+            size=shrink(full_motion.size),
+            angle=shrink(full_motion.angle),
+            pivot=shrink(full_motion.pivot),
+        )
+
     def _apply_transitions(self, result: BuildResult, fps: float) -> None:
         """Plan every transition and push the merged result into each comp."""
         layout = result.layout
@@ -556,6 +651,8 @@ class TimelineBuilder:
             if placed.lead_out_frames > 0 and placed.index < len(plans):
                 lead_out_plan = plans[placed.index]
 
+            motion = self._motion_for_segment(self.project, layout, placed, fps=fps)
+
             timeline_item = result.timeline_items[position]
             # Framing has to be applied to *every* segment of a slide, not
             # just the ones carrying a transition: a head that fills and a
@@ -567,6 +664,7 @@ class TimelineBuilder:
             if (
                 lead_in_plan is None
                 and lead_out_plan is None
+                and motion is None
                 and (clip_framing is None or clip_framing.is_noop())
             ):
                 continue
@@ -575,6 +673,7 @@ class TimelineBuilder:
                 lead_in_plan=lead_in_plan,
                 lead_out_plan=lead_out_plan,
                 framing=clip_framing,
+                motion=motion,
             )
             if apply_comp_spec(timeline_item, spec) is not None:
                 result.comps_applied += 1

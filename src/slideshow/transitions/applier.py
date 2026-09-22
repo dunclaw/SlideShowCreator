@@ -143,21 +143,116 @@ def _merge_keyframes(
     return [(frame, merged[frame]) for frame in sorted(merged)]
 
 
+def _sample_at(keyframes: Sequence[Any], frame: int) -> Any:
+    """Hold-clamped linear interpolation of *keyframes* at *frame*.
+
+    Frames before the first or after the last keyframe hold that
+    keyframe's value rather than extrapolating — every curve this is
+    used on (transition halves and per-segment motion) is built to reach
+    its neutral pose by its own last keyframe, so holding is equivalent
+    to "this source is inactive outside its own time range".
+    """
+    ordered = sorted(keyframes, key=lambda kv: int(kv[0]))
+    if frame <= int(ordered[0][0]):
+        return ordered[0][1]
+    if frame >= int(ordered[-1][0]):
+        return ordered[-1][1]
+    for (f0, v0), (f1, v1) in zip(ordered, ordered[1:]):
+        f0, f1 = int(f0), int(f1)
+        if f0 <= frame <= f1:
+            if f1 == f0:
+                return v1
+            t = (frame - f0) / float(f1 - f0)
+            if isinstance(v0, tuple):
+                return tuple(a + (b - a) * t for a, b in zip(v0, v1))
+            return v0 + (v1 - v0) * t
+    return ordered[-1][1]
+
+
+#: Neutral ("no effect") pose for each Transform channel, used to compose
+#: multiple animated sources of the same channel — see :func:`_compose_channel`.
+_CHANNEL_NEUTRAL: Dict[str, Any] = {
+    "center": (0.5, 0.5),
+    "pivot": (0.5, 0.5),
+    "size": 1.0,
+    "angle": 0.0,
+}
+
+
+def _compose_channel(
+    name: str, sources: Sequence[Optional[Sequence[Any]]]
+) -> Optional[List[Any]]:
+    """Compose several animated curves for one Transform input into one.
+
+    A transition's lead-in/lead-out and a clip's own motion can all
+    animate the *same* channel (e.g. ``center`` for a ``slide_left``
+    transition sharing a clip with a ``pan``) across overlapping time
+    ranges. Splicing their keyframes together (picking whichever curve
+    happens to own a given frame number) silently discards whichever
+    curve loses the collision — in particular it was clobbering a
+    transition's own entry keyframe at frame 0 with the motion's value,
+    destroying the "enters from off-screen" animation entirely.
+
+    Instead, every source is resampled at the union of all keyframe
+    times and combined the way two independent transforms actually stack
+    on the same image: translations (``center``/``pivot``/``angle``) add
+    as offsets from the neutral pose, and scale (``size``) multiplies.
+    """
+    present = [list(source) for source in sources if source]
+    if not present:
+        return None
+    if len(present) == 1:
+        return present[0]
+
+    neutral = _CHANNEL_NEUTRAL[name]
+    frames = sorted({int(frame) for source in present for frame, _ in source})
+    result: List[Any] = []
+    for frame in frames:
+        samples = [_sample_at(source, frame) for source in present]
+        if name == "size":
+            combined: Any = 1.0
+            for value in samples:
+                combined *= value
+        elif isinstance(neutral, tuple):
+            combined = list(neutral)
+            for value in samples:
+                combined = [c + (v - n) for c, v, n in zip(combined, value, neutral)]
+            combined = tuple(combined)
+        else:
+            combined = neutral + sum(value - neutral for value in samples)
+        result.append((frame, combined))
+    return result
+
+
 def _merge_transforms(
     lead_in: Optional[TransformAnimation],
     lead_out: Optional[TransformAnimation],
     lead_out_offset: int,
+    *,
+    motion: Optional[TransformAnimation] = None,
 ) -> Optional[TransformAnimation]:
-    """Merge the four animated channels of two :class:`TransformAnimation`s."""
-    if lead_in is None and lead_out is None:
+    """Merge the four animated channels of a clip's motion + transition transforms.
+
+    The transition's own lead-in and lead-out never overlap in time (they
+    sit at opposite ends of the clip with a static gap between), so those
+    two are combined by straightforward concatenation via
+    :func:`_merge_keyframes`. Motion, however, animates across the clip's
+    *entire* length and so can be active at the same time as either
+    transition half — that overlap has to be composed
+    (:func:`_compose_channel`), not spliced, or one of the two curves gets
+    silently overwritten wherever their keyframes collide.
+    """
+    if lead_in is None and lead_out is None and motion is None:
         return None
 
     def channel(name):
-        return _merge_keyframes(
+        transition_channel = _merge_keyframes(
             getattr(lead_in, name, None) if lead_in else None,
             getattr(lead_out, name, None) if lead_out else None,
             lead_out_offset,
         )
+        motion_channel = getattr(motion, name, None) if motion else None
+        return _compose_channel(name, (transition_channel, motion_channel))
 
     merged = TransformAnimation(
         center=channel("center"),
@@ -293,6 +388,7 @@ class CompSpec:
 
     length_frames: int = 0
     transform: Optional[TransformAnimation] = None
+    motion: Optional[TransformAnimation] = None
     blend: Optional[List[ScalarKeyframe]] = None
     blur_size: Optional[List[ScalarKeyframe]] = None
     pixelate_size: Optional[List[ScalarKeyframe]] = None
@@ -307,6 +403,7 @@ class CompSpec:
         """True when this comp would be a no-op (so we skip building it)."""
         return (
             (self.transform is None or self.transform.is_empty())
+            and (self.motion is None or self.motion.is_empty())
             and not self.blend
             and not self.blur_size
             and not self.pixelate_size
@@ -325,6 +422,7 @@ def merge_clip_plans(
     lead_in: Optional[ClipPlan] = None,
     lead_out: Optional[ClipPlan] = None,
     lead_out_frames: int = 0,
+    motion: Optional[TransformAnimation] = None,
 ) -> CompSpec:
     """Merge a clip's incoming and outgoing halves into one :class:`CompSpec`.
 
@@ -383,13 +481,16 @@ def merge_clip_plans(
         offset,
     )
 
+    merged_transform = _merge_transforms(
+        lead_in.transform if lead_in else None,
+        lead_out.transform if lead_out else None,
+        offset,
+        motion=motion,
+    )
     return CompSpec(
         length_frames=length_frames,
-        transform=_merge_transforms(
-            lead_in.transform if lead_in else None,
-            lead_out.transform if lead_out else None,
-            offset,
-        ),
+        transform=merged_transform,
+        motion=motion,
         blend=scalar("blend"),
         blur_size=scalar("blur_size"),
         pixelate_size=scalar("pixelate_size"),
@@ -407,6 +508,7 @@ def comp_spec_for_clip(
     lead_in_plan: Optional[TransitionPlan] = None,
     lead_out_plan: Optional[TransitionPlan] = None,
     framing: Optional[Framing] = None,
+    motion: Optional[TransformAnimation] = None,
 ) -> CompSpec:
     """Convenience wrapper: build a CompSpec from a :class:`PlacedClip`.
 
@@ -419,6 +521,7 @@ def comp_spec_for_clip(
         lead_in=lead_in_plan.incoming if lead_in_plan is not None else None,
         lead_out=lead_out_plan.outgoing if lead_out_plan is not None else None,
         lead_out_frames=placed_clip.lead_out_frames,
+        motion=motion,
     )
     spec.framing = framing
     return spec
@@ -515,6 +618,21 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
     # colour); the outer pair blends that result against transparency (so it
     # can get out of the way of the clip on the track below). One merge could
     # only do one of those two things.
+    #
+    # Both Backgrounds below need an explicit size: without one they inherit
+    # the comp's own frame format, which — per add_canvas's docstring — is
+    # the photograph's native resolution inside a Resolve clip comp, not the
+    # timeline's. A Merge takes its output size from its *background*, so an
+    # undersized one here silently clips everything upstream (the
+    # frame-sized canvas, the Transform's pan/zoom) down to the photo's own
+    # pixel dimensions for as long as this clip is blending — then the next
+    # clip's simpler graph (no such Merge) snaps back to the full, unclipped
+    # frame the instant the transition ends.
+    frame_size = (
+        (spec.framing.frame_width, spec.framing.frame_height)
+        if spec.framing is not None
+        else None
+    )
     head = transform
     if spec.background_from_image:
         # Same shape as the solid-colour dip, but the "colour" is a flat
@@ -522,7 +640,9 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
         media_in = find_tool(comp, "MediaIn1")
         if media_in is None:
             raise RuntimeError("Composition has no 'MediaIn1' tool.")
-        average = add_image_average(comp, media_in, position=(0, 3))
+        average = add_image_average(
+            comp, media_in, position=(0, 3), frame_size=frame_size
+        )
         built["average_down"] = average["down"]
         built["average_up"] = average["up"]
         built["average_color"] = average["tint"]
@@ -534,6 +654,7 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
             name=DEFAULT_COLOR_BACKGROUND_NAME,
             alpha=1.0,
             position=(0, 2),
+            size=frame_size,
         )
     else:
         color_background = None
@@ -559,6 +680,7 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
             (0.0, 0.0, 0.0),
             name=DEFAULT_BACKGROUND_NAME,
             alpha=0.0,
+            size=frame_size,
         )
         merge = add_merge(
             comp,
