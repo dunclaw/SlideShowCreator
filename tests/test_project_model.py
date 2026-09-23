@@ -229,6 +229,65 @@ class TestMotionChoice:
         assert m.zoom_amount == DEFAULT_MOTION_ZOOM_AMOUNT
         assert m.params == {}
 
+    def test_plan_transform_tracks_a_full_slide_motion(self):
+        m = MotionChoice(kind="pan", direction="left", zoom_amount=0.15)
+        motion = m.plan_transform(48)
+
+        assert motion.center[0][1][0] > 0.5
+        assert motion.center[-1][1] == (0.5, 0.5)
+        assert motion.size[0][1] == pytest.approx(1.15)
+        assert motion.size[-1][1] == pytest.approx(1.15)
+
+    @pytest.mark.parametrize(
+        "kind, direction",
+        [
+            ("pan", "left"),
+            ("pan", "up_right"),
+            ("zoom_in", "down_right"),
+            ("zoom_out", "up_left"),
+        ],
+    )
+    @pytest.mark.parametrize("zoom_amount", [0.05, 0.15, 0.3, 0.45])
+    def test_directional_offset_never_exceeds_the_crop_margin(
+        self, kind, direction, zoom_amount
+    ):
+        # The pan/zoom must never drift the image further than its own
+        # zoom covers, or a transparent gap opens up at the frame edge
+        # (visible as a sudden "crop" that snaps once neighbouring
+        # segments stop masking it).
+        m = MotionChoice(kind=kind, direction=direction, zoom_amount=zoom_amount)
+        motion = m.plan_transform(48)
+
+        for frame, center in motion.center:
+            size_at_frame = next(s for f, s in motion.size if f == frame)
+            margin = (size_at_frame - 1.0) / 2.0
+            assert abs(center[0] - 0.5) <= margin + 1e-9
+            assert abs(center[1] - 0.5) <= margin + 1e-9
+
+    def test_zoom_in_lands_on_direction_as_it_crops_in(self):
+        # zoom_in has no crop margin at the start (it's a plain fit), so
+        # the pan must be applied where the crop actually is: the end.
+        m = MotionChoice(kind="zoom_in", direction="down_right", zoom_amount=0.2)
+        motion = m.plan_transform(48)
+
+        assert motion.center[0][1] == (0.5, 0.5)
+        assert motion.center[-1][1][0] < 0.5
+        assert motion.center[-1][1][1] < 0.5
+        assert motion.size[0][1] == pytest.approx(1.0)
+        assert motion.size[-1][1] == pytest.approx(1.2)
+
+    def test_zoom_out_lands_on_center_as_it_settles(self):
+        # zoom_out is the mirror image: crop margin exists at the start,
+        # so that's where the pan lives; it settles to plain centre.
+        m = MotionChoice(kind="zoom_out", direction="up_left", zoom_amount=0.2)
+        motion = m.plan_transform(48)
+
+        assert motion.center[0][1][0] > 0.5
+        assert motion.center[0][1][1] > 0.5
+        assert motion.center[-1][1] == (0.5, 0.5)
+        assert motion.size[0][1] == pytest.approx(1.2)
+        assert motion.size[-1][1] == pytest.approx(1.0)
+
 
 # --------------------------------------------------------------------------- #
 # AudioSettings
@@ -349,6 +408,7 @@ class TestSlideshowProjectDefaults:
         assert p.default_item_duration_seconds == 4.0
         assert p.default_transition.kind == "dissolve"
         assert p.default_motion.kind == "none"
+        assert p.motion_intensity == 1.0
         assert p.audio is None
         assert p.target_total_duration_seconds is None
         assert p.soundtrack_path is None
@@ -382,6 +442,7 @@ class TestSlideshowProjectFromPaths:
             default_transition=TransitionChoice(kind="fade", duration_frames=12),
             default_motion=MotionChoice(kind="zoom_in", direction="center",
                                         zoom_amount=0.2),
+            motion_intensity=0.5,
         )
         assert p.name == "My Show"
         assert p.default_item_duration_seconds == 3.0
@@ -389,6 +450,7 @@ class TestSlideshowProjectFromPaths:
         assert p.default_transition.duration_frames == 12
         assert p.default_motion.kind == "zoom_in"
         assert p.default_motion.zoom_amount == 0.2
+        assert p.motion_intensity == 0.5
 
 
 class TestSlideshowProjectEffectiveDuration:
@@ -446,6 +508,48 @@ class TestMotionFor:
         assert m.kind == "zoom_in"
         # The default isn't a per-item override.
         assert p.items[0].motion is None
+
+    def test_global_intensity_scales_default_motion_without_mutating_it(self):
+        original = MotionChoice(
+            kind="zoom_in",
+            direction="center",
+            zoom_amount=0.2,
+            rotation_degrees=4.0,
+        )
+        p = SlideshowProject(
+            default_motion=original,
+            motion_intensity=0.5,
+            items=[MediaItem(path="a")],
+        )
+
+        scaled = p.motion_for(0)
+
+        assert scaled.zoom_amount == pytest.approx(0.1)
+        assert scaled.rotation_degrees == pytest.approx(2.0)
+        assert original.zoom_amount == pytest.approx(0.2)
+        assert original.rotation_degrees == pytest.approx(4.0)
+
+    def test_global_intensity_scales_item_override(self):
+        p = SlideshowProject(
+            motion_intensity=2.0,
+            items=[
+                MediaItem(
+                    path="a",
+                    motion=MotionChoice(kind="pan", zoom_amount=0.1),
+                )
+            ],
+        )
+
+        assert p.motion_for(0).zoom_amount == pytest.approx(0.2)
+
+    def test_zero_global_intensity_disables_motion(self):
+        p = SlideshowProject(
+            default_motion=MotionChoice(kind="pan", direction="left"),
+            motion_intensity=0.0,
+            items=[MediaItem(path="a")],
+        )
+
+        assert p.motion_for(0).is_static()
 
     def test_out_of_range_raises(self):
         p = SlideshowProject(items=[MediaItem(path="a")])
@@ -505,6 +609,11 @@ class TestValidate:
         problems = p.validate()
         assert any("target_total_duration_seconds" in m for m in problems)
 
+    @pytest.mark.parametrize("value", [-0.1, float("inf"), float("nan")])
+    def test_invalid_motion_intensity(self, value):
+        problems = SlideshowProject(motion_intensity=value).validate()
+        assert any("motion_intensity" in m for m in problems)
+
     def test_empty_item_path(self):
         p = SlideshowProject(items=[MediaItem(path=""), MediaItem(path="b")])
         problems = p.validate()
@@ -524,6 +633,7 @@ class TestJsonRoundTrip:
             default_transition=TransitionChoice(kind="fade", duration_frames=18),
             default_motion=MotionChoice(kind="zoom_in", direction="center",
                                         zoom_amount=0.12),
+            motion_intensity=0.75,
             audio=AudioSettings(
                 soundtrack_path="C:/music/aloha.mp3",
                 beat_sync_enabled=True,
@@ -614,6 +724,7 @@ class TestJsonRoundTrip:
         assert loaded.default_item_duration_seconds == 4.0
         assert loaded.default_transition.kind == "dissolve"
         assert loaded.default_motion.kind == "none"
+        assert loaded.motion_intensity == 1.0
         assert loaded.audio is None
         assert loaded.target_total_duration_seconds is None
 

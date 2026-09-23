@@ -11,6 +11,7 @@ Top-level shape::
     ├── default_item_duration_seconds      # used by items without an override
     ├── default_transition: TransitionChoice
     ├── default_motion: MotionChoice
+    ├── motion_intensity: float              # global motion strength multiplier
     ├── audio: AudioSettings | None
     ├── target_total_duration_seconds: float | None  # bulk-duration target
     └── items: list[MediaItem]
@@ -43,8 +44,11 @@ position/style.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from .fusion_comps import TransformAnimation
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +320,100 @@ class MotionChoice:
     def is_static(self) -> bool:
         """``True`` if this motion produces no animation."""
         return self.kind == "none"
+
+    def _direction_offset(self, travel: float = 0.2) -> Tuple[float, float]:
+        """Offset from the frame centre for a directional pan / drift."""
+        if self.direction == "center":
+            return (0.0, 0.0)
+        deltas = {
+            "left": (travel, 0.0),
+            "right": (-travel, 0.0),
+            "up": (0.0, travel),
+            "down": (0.0, -travel),
+            "up_left": (travel, travel),
+            "up_right": (-travel, travel),
+            "down_left": (travel, -travel),
+            "down_right": (-travel, -travel),
+        }
+        return deltas.get(self.direction, (0.0, 0.0))
+
+    def plan_transform(
+        self,
+        duration_frames: int,
+        *,
+        fps: float = 24.0,
+    ) -> TransformAnimation:
+        """Build the full-slide transform this motion implies.
+
+        The resulting animation is expressed in *clip-local* frame numbers,
+        so a split slide can slice it up later without re-planning.
+        """
+        if duration_frames <= 0 or self.kind == "none":
+            return TransformAnimation()
+
+        kind = "zoom_in" if self.kind == "auto" else self.kind
+        duration = max(1, int(duration_frames))
+        center = None
+        size = None
+        angle = None
+
+        # A directional offset must never ask for more drift than the crop
+        # margin a given zoom level actually provides — Size=1.1 only has
+        # 5% of overscan on each side, so a 10% offset would slide the
+        # image clean off one edge and expose the transparent canvas
+        # underneath. That gap is invisible while a transition still has
+        # something composited beneath it, then suddenly appears (or the
+        # picture appears to "snap") the instant the neighbouring segment
+        # goes away. Clamping offset to the margin keeps the frame fully
+        # covered for the whole motion, with no gap to reveal.
+        def margin_of(crop_size: float) -> float:
+            return max(0.0, (crop_size - 1.0) / 2.0)
+
+        if kind == "pan":
+            pan_amount = max(0.05, min(0.5, self.zoom_amount or 0.1))
+            crop_size = 1.0 + pan_amount
+            dx, dy = self._direction_offset(margin_of(crop_size))
+            start = (0.5 + dx, 0.5 + dy)
+            end = (0.5, 0.5)
+            center = [(0, start), (duration, end)]
+            size = [(0, crop_size), (duration, crop_size)]
+        else:
+            zoom = max(0.0, self.zoom_amount)
+            if kind == "zoom_in":
+                # Starts at a plain, uncropped fit and zooms in toward
+                # ``direction`` — the crop (and therefore the pan margin)
+                # only exists at the end, so that's where the offset goes.
+                start_size, end_size = 1.0, 1.0 + zoom
+            elif kind == "zoom_out":
+                # The inverse: starts cropped in on ``direction`` and
+                # settles back to a plain, centred fit.
+                start_size, end_size = 1.0 + zoom, 1.0
+            else:
+                start_size = end_size = 1.0
+            size = [(0, start_size), (duration, end_size)]
+            if self.direction != "center":
+                if end_size >= start_size:
+                    dx, dy = self._direction_offset(margin_of(end_size))
+                    center = [(0, (0.5, 0.5)), (duration, (0.5 + dx, 0.5 + dy))]
+                else:
+                    dx, dy = self._direction_offset(margin_of(start_size))
+                    center = [(0, (0.5 + dx, 0.5 + dy)), (duration, (0.5, 0.5))]
+
+        if self.rotation_degrees:
+            angle = [(0, float(self.rotation_degrees)), (duration, 0.0)]
+
+        return TransformAnimation(center=center, size=size, angle=angle)
+
+    def to_transform(
+        self,
+        duration_frames: int,
+        *,
+        fps: float = 24.0,
+    ) -> TransformAnimation:
+        """Back-compat alias: :meth:`plan_transform`."""
+        return self.plan_transform(duration_frames, fps=fps)
+
+    as_transform = to_transform
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -621,6 +719,13 @@ class SlideshowProject:
     audio: Optional[AudioSettings] = None
     framing: FramingSettings = field(default_factory=FramingSettings)
     target_total_duration_seconds: Optional[float] = None
+    #: Global Ken Burns strength multiplier applied on top of every clip's
+    #: ``MotionChoice`` (default or per-item). ``1.0`` = use each motion's
+    #: own ``zoom_amount``/``rotation_degrees`` unchanged; ``0.5`` halves
+    #: the zoom/pan/rotation range for a gentler show; ``2.0`` doubles it.
+    #: Scaling happens once, in :meth:`motion_for`, so every caller (the
+    #: timeline builder, tests, previews) sees the already-scaled motion.
+    motion_intensity: float = 1.0
 
     @property
     def soundtrack_path(self) -> Optional[str]:
@@ -644,6 +749,7 @@ class SlideshowProject:
         default_item_duration_seconds: float = 4.0,
         default_transition: Optional[TransitionChoice] = None,
         default_motion: Optional[MotionChoice] = None,
+        motion_intensity: float = 1.0,
     ) -> "SlideshowProject":
         return cls(
             name=name,
@@ -659,6 +765,7 @@ class SlideshowProject:
                 if default_motion is not None
                 else MotionChoice(kind="none")
             ),
+            motion_intensity=motion_intensity,
         )
 
     def effective_duration(self, item: MediaItem) -> float:
@@ -700,9 +807,16 @@ class SlideshowProject:
                 )
             )
         item = self.items[index]
-        if item.motion is not None:
-            return item.motion
-        return self.default_motion
+        motion = item.motion if item.motion is not None else self.default_motion
+        if self.motion_intensity == 1.0 or motion.is_static():
+            return motion
+        if self.motion_intensity == 0.0:
+            return replace(motion, kind="none")
+        return replace(
+            motion,
+            zoom_amount=motion.zoom_amount * self.motion_intensity,
+            rotation_degrees=motion.rotation_degrees * self.motion_intensity,
+        )
 
     def total_default_duration_seconds(self) -> float:
         """Sum of all items' effective durations (ignoring transition overlap)."""
@@ -730,6 +844,12 @@ class SlideshowProject:
                     self.target_total_duration_seconds
                 )
             )
+        if not math.isfinite(self.motion_intensity) or self.motion_intensity < 0:
+            problems.append(
+                "motion_intensity must be a finite value >= 0 (got {0})".format(
+                    self.motion_intensity
+                )
+            )
         for i, item in enumerate(self.items):
             if not item.path:
                 problems.append("items[{0}] has empty path".format(i))
@@ -744,6 +864,7 @@ class SlideshowProject:
             ),
             "default_transition": self.default_transition.to_dict(),
             "default_motion": self.default_motion.to_dict(),
+            "motion_intensity": float(self.motion_intensity),
             "audio": self.audio.to_dict() if self.audio is not None else None,
             "framing": self.framing.to_dict(),
             "target_total_duration_seconds": self.target_total_duration_seconds,
@@ -788,6 +909,7 @@ class SlideshowProject:
             ),
             default_transition=default_trans,
             default_motion=default_motion,
+            motion_intensity=float(data.get("motion_intensity", 1.0)),
             audio=audio,
             framing=framing,
             target_total_duration_seconds=_opt_float(

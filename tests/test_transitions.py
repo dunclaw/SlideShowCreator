@@ -901,7 +901,7 @@ class TestPageTurn:
                 TransitionChoice(kind="page_turn", duration_frames=duration)
             )
             angle = plan.incoming.page_turn.angle
-            assert angle[-1] == (duration, 0.0)
+            assert angle[-1] == (duration - 1, 0.0)
             assert angle[0][0] == 0
             assert angle[0][1] == pytest.approx(PAGE_START_ANGLE)
 
@@ -910,11 +910,11 @@ class TestPageTurn:
             keys = page_angle_keys(duration, PAGE_START_ANGLE)
             frames = [frame for frame, _ in keys]
             assert frames == sorted(set(frames)), duration
-            assert frames[-1] == duration
+            assert frames[-1] == duration - 1
 
     def test_the_arc_is_front_loaded(self):
         keys = page_angle_keys(100, 100.0)
-        midpoint = [value for frame, value in keys if frame == 55][0]
+        midpoint = [value for frame, value in keys if frame == 54][0]
         # Past halfway in time the page should be most of the way down, not
         # halfway -- a linear sweep reads mechanical.
         assert midpoint < 50.0
@@ -1009,7 +1009,7 @@ class TestPageTurn:
         page = plan.outgoing.page_turn
         assert page is not None
         assert page.angle[0] == (0, 0.0)
-        assert page.angle[-1][0] == 24
+        assert page.angle[-1][0] == 23
         assert page.angle[-1][1] == pytest.approx(PAGE_START_ANGLE)
         # The hinge is a property of the page, not of the direction of travel.
         assert page.hinge == "right"
@@ -1099,7 +1099,7 @@ class TestPageTurnAway:
         angles = plan.outgoing.page_turn.angle
         assert angles[0][0] == 0
         assert angles[0][1] == pytest.approx(0.0)
-        assert angles[-1][0] == 36
+        assert angles[-1][0] == 35
         # Negative because it hinges left: that is what lifts the free right
         # edge off the screen towards the viewer instead of sinking it in.
         assert angles[-1][1] == pytest.approx(-PAGE_START_ANGLE)

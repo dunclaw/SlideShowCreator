@@ -19,10 +19,17 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from slideshow import timeline_builder as tb
-from slideshow.layout import LOWER_TRACK
+from slideshow.layout import (
+    LOWER_TRACK,
+    PlacedClip,
+    SEGMENT_BODY,
+    SEGMENT_HEAD,
+    TimelineLayout,
+)
 from slideshow.project_model import (
     FramingSettings,
     MediaItem,
+    MotionChoice,
     SlideshowProject,
     TransitionChoice,
 )
@@ -165,6 +172,47 @@ def test_normalize_for_resolve_uses_forward_slashes():
     out = tb._normalize_for_resolve(r"C:\foo\bar\baz.jpg")
     assert "\\" not in out
     assert out.endswith("/foo/bar/baz.jpg")
+
+
+def test_motion_is_sliced_with_interpolated_values_for_each_segment():
+    project = SlideshowProject.from_paths(
+        ["a.jpg", "b.jpg"],
+        default_motion=MotionChoice(kind="pan", direction="left"),
+    )
+    layout = TimelineLayout(
+        fps=24.0,
+        transitions=[TransitionChoice(kind="dissolve", duration_frames=24)],
+    )
+    head = PlacedClip(
+        index=1,
+        track_index=2,
+        record_frame=72,
+        length_frames=24,
+        segment=SEGMENT_HEAD,
+    )
+    body = PlacedClip(
+        index=1,
+        track_index=1,
+        record_frame=96,
+        length_frames=72,
+        segment=SEGMENT_BODY,
+    )
+
+    head_motion = tb.TimelineBuilder._motion_for_segment(
+        project, layout, head, fps=24.0
+    )
+    body_motion = tb.TimelineBuilder._motion_for_segment(
+        project, layout, body, fps=24.0
+    )
+
+    assert head_motion is not None
+    assert body_motion is not None
+    assert head_motion.center[0][0] == 0
+    assert head_motion.center[-1][0] == 24
+    assert body_motion.center[0][0] == 0
+    assert body_motion.center[-1][0] == 72
+    assert head_motion.center[0][1][0] > body_motion.center[0][1][0] > 0.5
+    assert body_motion.center[-1][1] == pytest.approx((0.5, 0.5))
 
 
 # --------------------------------------------------------------------------- #

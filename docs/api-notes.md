@@ -665,3 +665,57 @@ find the real one (above).
 
 To darken an image, composite it over a black `Background` with a `Merge`
 and set the **Merge's** `Blend`. That is what the blur backdrop does.
+
+## Workflow: verify Ken Burns / transition changes without a human in the loop
+
+Live review in Resolve is slow to iterate on through a human. Prefer this
+loop when touching anything in `project_model.MotionChoice.plan_transform`,
+`timeline_builder._motion_for_segment`, or `transitions/applier.py`'s
+merge logic:
+
+1. **Read back keyframes via the scripting API first** (`item.GetFusionCompNameList()`
+   → `LoadFusionCompByName` → `comp.FindTool("SlideShowXf")` →
+   `tool.GetInput("Center"/"Size", frame)` for a dense per-frame range, not
+   just a couple of sample points — a 3-point spot check missed a real bug
+   here because the discontinuity only showed up mid-curve). Check:
+   - the value is continuous across every HEAD→BODY→TAIL segment boundary
+     of the same slide (the seam between separate Fusion comps on
+     different tracks/clips),
+   - the offset magnitude never exceeds the crop margin implied by `Size`
+     at that same frame (`|center - 0.5| <= (size - 1) / 2`), and
+   - when a transition and motion both touch the same channel (e.g. a
+     `slide_*`/`push_*`/`zoom_in`/`zoom_out` transition sharing `Center` or
+     `Size` with the clip's own Ken Burns motion), the transition's own
+     endpoints (e.g. the off-screen entry point) actually survive the
+     merge instead of being silently overwritten.
+2. **Use Resolve's Deliver/render API to actually export the timeline (or a
+   short frame range of it) and inspect the frames/video directly** —
+   `project.GetRenderJobList()` / `project.AddRenderJob()` /
+   `project.StartRendering()` (poll `project.IsRenderingInProgress()`),
+   or `project.SetCurrentTimeline(tl)` + save frames via the same route —
+   rather than only trusting keyframe numbers. A curve can be
+   mathematically continuous yet still look wrong once rendered (e.g. two
+   independent transform channels stomping each other, or an alpha gap
+   that a keyframe read-back wouldn't reveal). Analyze the rendered
+   output directly (e.g. sample pixel values/edges at the frames of
+   interest) instead of asking for visual confirmation first.
+3. **Regression-test every transition kind that shares the touched code
+   path**, not just the one variant that was reported broken. Motion and
+   the transition applier's merge logic (`_merge_transforms`,
+   `merge_clip_plans`) are shared by every transition kind — a fix aimed
+   at one combination (e.g. `pan` + `dissolve`) can silently break another
+   (e.g. `zoom_in` motion + `slide_left`, or the `zoom_in`/`zoom_out`
+   *geometry transitions*, which also animate `Size`/`Center` and can
+   collide with motion the same way a directional pan does). Build one
+   throwaway timeline per transition family (dissolve variants, slide/push,
+   zoom_in/zoom_out geometry, page turn, pixelate) crossed with a couple of
+   motion kinds, and read back keyframes/rendered frames for all of them
+   before declaring a fix done.
+4. **Prefer simple test-pattern images over photos for this kind of
+   geometry check** — a grid/checkerboard or frame with a border and
+   crosshair at centre makes it far easier to spot a sub-pixel gap at the
+   frame edge or a mismatched crop by eye (or by pixel sampling) than a
+   photograph does. Reuse `D:\Temp\Pictures\2005\2005-01 (Jan)\DSCF00*.JPG`
+   for the general smoke tests, but generate synthetic test-pattern images
+   (e.g. with Pillow) when specifically validating coverage/crop-margin
+   correctness.
