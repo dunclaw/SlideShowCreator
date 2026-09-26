@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 
@@ -82,6 +83,8 @@ RESIZE_TOOL = "BetterResize"
 #: fitted photograph onto it. See :func:`add_canvas`.
 DEFAULT_CANVAS_NAME = "SlideShowCanvas"
 DEFAULT_CANVAS_MERGE_NAME = "SlideShowCanvasMerge"
+DEFAULT_STABLE_BACKDROP_NAME = "SlideShowStableBackdrop"
+DEFAULT_STABLE_BACKDROP_MERGE_NAME = "SlideShowStableBackdropMerge"
 DEFAULT_FIT_NAME = "SlideShowFit"
 
 #: The blur-backdrop chain: a frame-filling copy of the photograph, blurred
@@ -164,7 +167,12 @@ FRAMING_MODES = ("fit", "fill")
 
 #: Recognised backdrops. Mirrors ``project_model.BACKDROP_KINDS``; kept
 #: here too so the Fusion layer does not import the model.
-BACKDROP_KINDS = ("none", "solid", "blur")
+BACKDROP_KINDS = ("none", "solid", "blur", "accumulate")
+
+#: Maximum number of settled photographs rebuilt behind an accumulated slide.
+#: Older images are fully occluded by the top of the stack, so bounding the
+#: graph keeps every comp a fixed size even in a long slideshow.
+ACCUMULATE_MAX_DEPTH = 8
 
 
 def framed_size(
@@ -405,6 +413,41 @@ def find_or_add_tool(
     except Exception:
         pass
     return tool
+
+
+LOADER_HOLD_FRAMES = 1000000
+
+
+def _first_attr(attrs: Any, key: str, default: Any) -> Any:
+    value = attrs.get(key, default) if isinstance(attrs, dict) else default
+    if isinstance(value, dict):
+        value = value.get(1, next(iter(value.values()), default))
+    return default if value is None else value
+
+
+def hold_loader_still(loader: Any, path: str) -> int:
+    """Lock a Loader to *path*'s own frame and hold it for the whole comp.
+
+    Fusion auto-detects numbered stills (``DSCF0107.JPG``) as an image
+    sequence spanning every sibling file, so an untrimmed Loader steps through
+    neighbouring photos on each frame. Returns the clip frame used.
+    """
+    try:
+        attrs = loader.GetAttrs() or {}
+    except Exception:
+        attrs = {}
+    length = int(_first_attr(attrs, "TOOLIT_Clip_Length", 1) or 1)
+    start = int(_first_attr(attrs, "TOOLIT_Clip_StartFrame", 0) or 0)
+    offset = 0
+    match = re.search(r"(\d+)(?=\.[^./\\]+$)", str(path))
+    if length > 1 and match:
+        offset = max(0, min(length - 1, int(match.group(1)) - start))
+    loader.SetInput("ClipTimeStart", offset)
+    loader.SetInput("ClipTimeEnd", offset)
+    loader.SetInput("Loop", 0)
+    loader.SetInput("HoldFirstFrame", 0)
+    loader.SetInput("HoldLastFrame", LOADER_HOLD_FRAMES)
+    return offset
 
 
 def connect(src_tool: Any, dst_tool: Any, dst_input: str = "Input") -> None:
@@ -839,13 +882,18 @@ def add_canvas(
     mode: str = "fit",
     backdrop: str = "none",
     color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    backdrop_sources: Sequence[Tuple[Any, ...]] = (),
     position: Tuple[int, int] = (0, -2),
 ) -> Dict[str, Any]:
     """Resample *source* into the frame and lay it on a frame-sized canvas.
 
-    Returns the tools created, keyed ``fit``, ``canvas`` and ``merge`` (plus
+    Returns the tools created, keyed ``fit``, ``canvas``, ``photo`` and
+    ``backdrop`` (plus
     ``backdrop_fit``, ``backdrop_blur`` and ``backdrop_merge`` for the blur
-    backdrop); the ``merge`` is the new head of the chain.
+    backdrop, or numbered Loader/fit/transform/merge tools for ``accumulate``).
+    ``photo`` is a frame-sized transparent photograph layer and ``backdrop``
+    is the stable frame-sized layer beneath it. ``merge`` composites the two
+    for callers that do not need to animate the photograph separately.
 
     **Why this exists.** A Fusion comp attached to a Resolve timeline clip
     runs at the *clip's* resolution, not the timeline's: on a 3840x2160
@@ -885,14 +933,34 @@ def add_canvas(
 
     canvas = add_background(
         comp,
-        color,
+        (0.0, 0.0, 0.0),
         name=DEFAULT_CANVAS_NAME,
-        alpha=0.0 if backdrop == "none" else 1.0,
+        alpha=0.0,
         position=(position[0], position[1] - 1),
         size=frame_size,
     )
     built["canvas"] = canvas
-    base: Any = canvas
+    photo = add_merge(
+        comp,
+        background=canvas,
+        foreground=resize,
+        name=DEFAULT_CANVAS_MERGE_NAME,
+        apply_mode="normal",
+        position=(position[0] + 1, position[1] - 1),
+    )
+    built["photo"] = photo
+
+    backdrop_canvas = add_background(
+        comp,
+        color,
+        name=DEFAULT_STABLE_BACKDROP_NAME,
+        alpha=0.0 if backdrop == "none" else 1.0,
+        position=(position[0], position[1] - 2),
+        size=frame_size,
+    )
+    built["backdrop_canvas"] = backdrop_canvas
+    built["backdrop"] = backdrop_canvas
+    base: Any = backdrop_canvas
 
     if backdrop == "blur":
         # A blurred, frame-filling copy of the photograph itself. It has to
@@ -907,7 +975,7 @@ def add_canvas(
             comp,
             RESIZE_TOOL,
             DEFAULT_BACKDROP_FIT_NAME,
-            position=(position[0], position[1] - 2),
+            position=(position[0], position[1] - 3),
         )
         if backdrop_fit is None:
             raise RuntimeError(
@@ -923,7 +991,7 @@ def add_canvas(
             comp,
             BLUR_TOOL,
             DEFAULT_BACKDROP_BLUR_NAME,
-            position=(position[0] + 1, position[1] - 2),
+            position=(position[0] + 1, position[1] - 3),
         )
         # Blur size is in pixels, so it has to scale with the frame or the
         # effect all but disappears at UHD.
@@ -932,11 +1000,11 @@ def add_canvas(
 
         base = add_merge(
             comp,
-            background=canvas,
+            background=backdrop_canvas,
             foreground=blur,
             name=DEFAULT_BACKDROP_MERGE_NAME,
             apply_mode="normal",
-            position=(position[0] + 3, position[1] - 2),
+            position=(position[0] + 3, position[1] - 3),
         )
         # Held down against the black canvas so the backdrop reads as a
         # backdrop; at full brightness it competes with the photograph
@@ -947,14 +1015,82 @@ def add_canvas(
         built["backdrop_fit"] = backdrop_fit
         built["backdrop_blur"] = blur
         built["backdrop_merge"] = base
+    elif backdrop == "accumulate":
+        for index, source in enumerate(backdrop_sources[-ACCUMULATE_MAX_DEPTH:]):
+            path, source_w, source_h = source[0], source[1], source[2]
+            final_pose = source[3] if len(source) > 3 else None
+            loader = find_or_add_tool(
+                comp,
+                "Loader",
+                "SlideShowBackdropLoader{0}".format(index),
+                position=(position[0] - 3, position[1] - 4 - index),
+            )
+            try:
+                loader.Clip[1] = path
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not set accumulated backdrop Loader path {0!r}.".format(path)
+                ) from exc
+            hold_loader_still(loader, path)
 
+            settled_w, settled_h = framed_size(
+                source_w, source_h, frame_w, frame_h, mode="fit"
+            )
+            settled = find_or_add_tool(
+                comp,
+                RESIZE_TOOL,
+                "SlideShowBackdropFit{0}".format(index),
+                position=(position[0] - 1, position[1] - 4 - index),
+            )
+            settled.SetInput("Width", float(settled_w))
+            settled.SetInput("Height", float(settled_h))
+            connect(loader, settled, primary_image_input(RESIZE_TOOL))
+
+            settled_layer = add_merge(
+                comp,
+                background=canvas,
+                foreground=settled,
+                name="SlideShowBackdropCanvasMerge{0}".format(index),
+                apply_mode="normal",
+                position=(position[0], position[1] - 4 - index),
+            )
+            pose = find_or_add_tool(
+                comp,
+                "Transform",
+                "SlideShowBackdropPose{0}".format(index),
+                position=(position[0] + 1, position[1] - 4 - index),
+            )
+            # Each photo settles exactly where it was last displayed: the
+            # pile is a snapshot of every outgoing photo layer, so the V2 to
+            # V1 hand-off shows the same pixels on both sides of the seam.
+            center, size, angle, pivot = final_pose or (None, None, None, None)
+            pose.SetInput("Center", list(center) if center else [0.5, 0.5])
+            pose.SetInput("Size", float(size) if size is not None else 1.0)
+            pose.SetInput("Angle", float(angle) if angle is not None else 0.0)
+            pose.SetInput("Pivot", list(pivot) if pivot else [0.5, 0.5])
+            connect(settled_layer, pose, "Input")
+
+            base = add_merge(
+                comp,
+                background=base,
+                foreground=pose,
+                name="SlideShowBackdropMerge{0}".format(index),
+                apply_mode="normal",
+                position=(position[0] + 3, position[1] - 4 - index),
+            )
+            built["backdrop_loader_{0}".format(index)] = loader
+            built["backdrop_fit_{0}".format(index)] = settled
+            built["backdrop_pose_{0}".format(index)] = pose
+            built["backdrop_merge_{0}".format(index)] = base
+
+    built["backdrop"] = base
     merge = add_merge(
         comp,
         background=base,
-        foreground=resize,
-        name=DEFAULT_CANVAS_MERGE_NAME,
+        foreground=photo,
+        name=DEFAULT_STABLE_BACKDROP_MERGE_NAME,
         apply_mode="normal",
-        position=(position[0] + 1, position[1] - 1),
+        position=(position[0] + 4, position[1] - 1),
     )
     built["merge"] = merge
     return built
@@ -1439,6 +1575,7 @@ def _safe_name(timeline_item: Any) -> str:
 
 
 __all__ = [
+    "ACCUMULATE_MAX_DEPTH",
     "BACKDROP_BLUR_FRACTION",
     "BACKDROP_BLUR_GAIN",
     "BACKDROP_KINDS",

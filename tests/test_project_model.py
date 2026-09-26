@@ -772,11 +772,16 @@ class TestFramingSettings:
         with pytest.raises(ValueError, match="mode"):
             pm.FramingSettings(mode="stretch")
 
+    def test_accumulate_is_supported(self):
+        settings = pm.FramingSettings(backdrop="accumulate")
+        assert settings.backdrop_alpha == 1.0
+        assert not settings.is_default()
+
     def test_rejects_unimplemented_backdrop(self):
         # Better to fail loudly than to silently ignore a backdrop the
         # builder cannot draw yet.
         with pytest.raises(ValueError, match="backdrop"):
-            pm.FramingSettings(backdrop="accumulate")
+            pm.FramingSettings(backdrop="dominant")
 
     def test_rejects_out_of_range_colour(self):
         with pytest.raises(ValueError, match="backdrop_color"):

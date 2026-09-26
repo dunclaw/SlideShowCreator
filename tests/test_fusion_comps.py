@@ -1005,9 +1005,11 @@ class TestAddCanvas:
             frame_size=(3840, 2160),
             source_size=(1536, 2048),
         )
-        assert set(built) == {"fit", "canvas", "merge"}
+        assert set(built) == {
+            "fit", "canvas", "photo", "backdrop_canvas", "backdrop", "merge"
+        }
 
-    def test_solid_backdrop_makes_the_canvas_opaque(self):
+    def test_solid_backdrop_is_separate_from_the_photo_canvas(self):
         comp, _ = self._comp()
         built = fc.add_canvas(
             comp,
@@ -1017,10 +1019,16 @@ class TestAddCanvas:
             backdrop="solid",
             color=(0.1, 0.2, 0.3),
         )
-        calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
-        assert calls["TopLeftAlpha"] == 1.0
-        assert calls["TopLeftRed"] == 0.1
-        assert set(built) == {"fit", "canvas", "merge"}
+        photo_canvas = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        backdrop = dict(
+            c.args for c in built["backdrop_canvas"].SetInput.call_args_list
+        )
+        assert photo_canvas["TopLeftAlpha"] == 0.0
+        assert backdrop["TopLeftAlpha"] == 1.0
+        assert backdrop["TopLeftRed"] == 0.1
+        assert set(built) == {
+            "fit", "canvas", "photo", "backdrop_canvas", "backdrop", "merge"
+        }
 
     def test_blur_backdrop_builds_its_own_chain(self):
         comp, _ = self._comp()
@@ -1034,6 +1042,9 @@ class TestAddCanvas:
         assert set(built) == {
             "fit",
             "canvas",
+            "photo",
+            "backdrop_canvas",
+            "backdrop",
             "merge",
             "backdrop_fit",
             "backdrop_blur",
@@ -1068,5 +1079,119 @@ class TestAddCanvas:
         calls = dict(c.args for c in built["backdrop_merge"].SetInput.call_args_list)
         assert calls["Blend"] == fc.BACKDROP_BLUR_GAIN
         # ...over an opaque canvas, or there would be nothing to darken against.
-        canvas_calls = dict(c.args for c in built["canvas"].SetInput.call_args_list)
+        canvas_calls = dict(
+            c.args for c in built["backdrop_canvas"].SetInput.call_args_list
+        )
         assert canvas_calls["TopLeftAlpha"] == 1.0
+
+    def test_accumulate_rebuilds_prior_photos_bottom_up(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(3840, 2160),
+            source_size=(1536, 2048),
+            backdrop="accumulate",
+            backdrop_sources=(
+                (r"D:\photos\one.jpg", 2048, 1536),
+                (r"D:\photos\two.jpg", 1536, 2048, ((0.4, 0.6), 1.2, 3.0, (0.5, 0.5))),
+            ),
+        )
+
+        assert built["backdrop_loader_0"].Clip.__setitem__.call_args.args == (
+            1,
+            r"D:\photos\one.jpg",
+        )
+        assert built["backdrop_loader_1"].Clip.__setitem__.call_args.args == (
+            1,
+            r"D:\photos\two.jpg",
+        )
+        first_size = dict(
+            c.args for c in built["backdrop_fit_0"].SetInput.call_args_list
+        )
+        second_size = dict(
+            c.args for c in built["backdrop_fit_1"].SetInput.call_args_list
+        )
+        assert (first_size["Width"], first_size["Height"]) == (2880.0, 2160.0)
+        assert (second_size["Width"], second_size["Height"]) == (1620.0, 2160.0)
+        # Each photo settles exactly where it was last displayed, so the pile
+        # matches the outgoing layer pixel for pixel at the hand-off.
+        first = dict(c.args for c in built["backdrop_pose_0"].SetInput.call_args_list)
+        assert (first["Center"], first["Size"], first["Angle"]) == ([0.5, 0.5], 1.0, 0.0)
+        second = dict(c.args for c in built["backdrop_pose_1"].SetInput.call_args_list)
+        assert (second["Center"], second["Size"], second["Angle"]) == (
+            [0.4, 0.6],
+            1.2,
+            3.0,
+        )
+
+    def test_accumulate_loaders_hold_a_single_still(self):
+        comp, _ = self._comp()
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(1920, 1080),
+            source_size=(1920, 1080),
+            backdrop="accumulate",
+            backdrop_sources=((r"D:\photos\one.jpg", 1920, 1080),),
+        )
+
+        calls = dict(c.args for c in built["backdrop_loader_0"].SetInput.call_args_list)
+        assert calls["ClipTimeStart"] == calls["ClipTimeEnd"] == 0
+        assert calls["Loop"] == 0
+        assert calls["HoldLastFrame"] == fc.LOADER_HOLD_FRAMES
+
+
+    def test_accumulate_caps_the_rebuilt_pile_depth(self):
+        comp, _ = self._comp()
+        sources = tuple(
+            (r"D:\photos\{0}.jpg".format(index), 1920, 1080)
+            for index in range(fc.ACCUMULATE_MAX_DEPTH + 3)
+        )
+        built = fc.add_canvas(
+            comp,
+            MagicMock(),
+            frame_size=(1920, 1080),
+            source_size=(1920, 1080),
+            backdrop="accumulate",
+            backdrop_sources=sources,
+        )
+
+        loaders = [key for key in built if key.startswith("backdrop_loader_")]
+        assert len(loaders) == fc.ACCUMULATE_MAX_DEPTH
+        assert built["backdrop_loader_0"].Clip.__setitem__.call_args.args[1].endswith(
+            r"\3.jpg"
+        )
+
+
+class TestHoldLoaderStill:
+    """Fusion treats numbered stills as sequences of their siblings."""
+
+    @staticmethod
+    def _loader(start, length):
+        loader = MagicMock()
+        loader.GetAttrs.return_value = {
+            "TOOLIT_Clip_StartFrame": {1: start},
+            "TOOLIT_Clip_Length": {1: length},
+        }
+        return loader
+
+    def test_locks_to_the_files_own_frame_in_a_detected_sequence(self):
+        loader = self._loader(start=43, length=114)
+
+        offset = fc.hold_loader_still(loader, "D:/pics/DSCF0107.JPG")
+
+        assert offset == 64
+        calls = dict(c.args for c in loader.SetInput.call_args_list)
+        assert calls["ClipTimeStart"] == calls["ClipTimeEnd"] == 64
+        assert calls["HoldLastFrame"] == fc.LOADER_HOLD_FRAMES
+
+    def test_single_frame_clip_uses_frame_zero(self):
+        loader = self._loader(start=0, length=1)
+
+        assert fc.hold_loader_still(loader, "D:/pics/IMG_2001.jpg") == 0
+
+    def test_offset_is_clamped_into_the_clip(self):
+        loader = self._loader(start=10, length=5)
+
+        assert fc.hold_loader_still(loader, "D:/pics/p0099.jpg") == 4

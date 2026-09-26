@@ -317,6 +317,16 @@ class Framing:
     mode: str = "fit"
     backdrop_kind: str = "none"
     backdrop_color: RgbColor = (0.0, 0.0, 0.0)
+    #: Prior photos for the ``accumulate`` pile, oldest first, as
+    #: ``(path, width, height)`` or ``(path, width, height, pose)`` where
+    #: ``pose`` is ``(center, size, angle, pivot)`` — the photo's final
+    #: displayed transform, any of which may be ``None`` for identity.
+    backdrop_sources: Tuple[Tuple[Any, ...], ...] = ()
+    #: Composite the backdrop *inside* the clip's opacity fade. Set for upper
+    #: track clips, whose backdrop must fade with them so the clip beneath
+    #: (carrying an identical backdrop) shows through; lower-track clips keep
+    #: theirs outside every fade so it never dims.
+    backdrop_fades: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in FRAMING_MODES:
@@ -337,6 +347,21 @@ class Framing:
         ):
             if value <= 0:
                 raise ValueError("{0} must be > 0, got {1}".format(label, value))
+        for source in self.backdrop_sources:
+            if len(source) not in (3, 4):
+                raise ValueError(
+                    "backdrop source must be (path, width, height[, pose]), "
+                    "got {0!r}".format(source)
+                )
+            path, width, height = source[0], source[1], source[2]
+            if not path:
+                raise ValueError("backdrop source path must not be empty")
+            if width <= 0 or height <= 0:
+                raise ValueError(
+                    "backdrop source size must be positive, got {0}x{1}".format(
+                        width, height
+                    )
+                )
 
     @property
     def backdrop_alpha(self) -> float:
@@ -557,8 +582,9 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
                 mode=spec.framing.mode,
                 backdrop=spec.framing.backdrop_kind,
                 color=spec.framing.backdrop_color,
+                backdrop_sources=spec.framing.backdrop_sources,
             )
-            source = canvas["merge"]
+            source = canvas["photo"]
             render_size = (spec.framing.frame_width, spec.framing.frame_height)
         built = build_page_turn_graph(
             comp,
@@ -571,16 +597,32 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
             for role in (
                 "fit",
                 "canvas",
+                "backdrop",
                 "backdrop_fit",
                 "backdrop_blur",
                 "backdrop_merge",
             ):
                 if role in canvas:
                     built[role] = canvas[role]
-            built["canvas_merge"] = canvas["merge"]
+            built["canvas_merge"] = canvas["photo"]
+            if spec.framing.backdrop_kind != "none":
+                stable_merge = add_merge(
+                    comp,
+                    background=canvas["backdrop"],
+                    foreground=built["renderer"],
+                    name="SlideShowStableBackdropMerge",
+                    apply_mode="normal",
+                    position=(8, 0),
+                )
+                media_out = find_tool(comp, "MediaOut1")
+                if media_out is None:
+                    raise RuntimeError("Composition has no 'MediaOut1' tool.")
+                connect(stable_merge, media_out, "Input")
+                built["stable_backdrop_merge"] = stable_merge
         return built
 
     built: Dict[str, Any] = {}
+    canvas = None
 
     # The canvas comes first, before any effect, so that everything
     # downstream animates in timeline pixels rather than in the
@@ -598,18 +640,20 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
             mode=spec.framing.mode,
             backdrop=spec.framing.backdrop_kind,
             color=spec.framing.backdrop_color,
+            backdrop_sources=spec.framing.backdrop_sources,
         )
         for role in (
             "fit",
             "canvas",
+            "backdrop",
             "backdrop_fit",
             "backdrop_blur",
             "backdrop_merge",
         ):
             if role in canvas:
                 built[role] = canvas[role]
-        built["canvas_merge"] = canvas["merge"]
-        source = canvas["merge"]
+        built["canvas_merge"] = canvas["photo"]
+        source = canvas["photo"]
 
     chain: List[Tuple[str, str]] = []
     if spec.blur_size:
@@ -670,6 +714,11 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
         else None
     )
     head = transform
+    has_backdrop = (
+        spec.framing is not None
+        and spec.framing.backdrop_kind != "none"
+        and canvas is not None
+    )
     if spec.background_from_image:
         # Same shape as the solid-colour dip, but the "colour" is a flat
         # field of the photograph's own average rather than a Background.
@@ -695,7 +744,34 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
     else:
         color_background = None
 
-    if color_background is not None:
+    if color_background is not None and has_backdrop:
+        # With a persistent backdrop the dip must tint only the photo, never
+        # the whole frame: a full-frame colour would hide the backdrop for
+        # the whole transition and let it snap back when the next segment
+        # starts. "Atop" keeps the colour inside the photo's own alpha, and
+        # its Blend is the inverse of the plain dip's (colour, not photo).
+        color_merge = add_merge(
+            comp,
+            background=head,
+            foreground=color_background,
+            name=DEFAULT_COLOR_MERGE_NAME,
+            apply_mode="normal",
+            position=(1, 2),
+        )
+        color_merge.SetInput("Operator", "Atop")
+        built["color_background"] = color_background
+        built["color_merge"] = color_merge
+        head = color_merge
+        if spec.color_blend:
+            set_scalar_keyframes(
+                comp,
+                color_merge,
+                "Blend",
+                [(frame, 1.0 - value) for frame, value in spec.color_blend],
+            )
+        else:
+            color_merge.SetInput("Blend", 0.0)
+    elif color_background is not None:
         color_merge = add_merge(
             comp,
             background=color_background,
@@ -709,6 +785,22 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
         head = color_merge
         if spec.color_blend:
             set_scalar_keyframes(comp, color_merge, "Blend", spec.color_blend)
+
+    def merge_stable_backdrop(foreground: Any) -> Any:
+        stable_merge = add_merge(
+            comp,
+            background=canvas["backdrop"],
+            foreground=foreground,
+            name="SlideShowStableBackdropMerge",
+            apply_mode="normal",
+            position=(4, 1),
+        )
+        built["stable_backdrop_merge"] = stable_merge
+        return stable_merge
+
+    backdrop_fades = has_backdrop and spec.framing.backdrop_fades
+    if backdrop_fades:
+        head = merge_stable_backdrop(head)
 
     if spec.blend:
         background = add_background(
@@ -729,6 +821,9 @@ def build_comp_graph(comp: Any, spec: CompSpec) -> Dict[str, Any]:
         built["merge"] = merge
         head = merge
         set_scalar_keyframes(comp, merge, "Blend", spec.blend)
+
+    if has_backdrop and not backdrop_fades:
+        head = merge_stable_backdrop(head)
 
     if head is not transform:
         media_out = find_tool(comp, "MediaOut1")
