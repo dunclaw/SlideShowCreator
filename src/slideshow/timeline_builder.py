@@ -19,15 +19,17 @@ plumbing that joins them.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional, Sequence, Tuple
 
+from .fusion_comps import ACCUMULATE_MAX_DEPTH
 from .layout import (
     LOWER_TRACK,
     SEGMENT_BODY,
     SEGMENT_HEAD,
     SEGMENT_TAIL,
     SEGMENT_WHOLE,
+    PlacedClip,
     TimelineLayout,
     plan_layout,
     seconds_to_frames,
@@ -348,6 +350,31 @@ def _resolve_duration(choice: TransitionChoice, slide_frames: int) -> int:
     return resolve_duration_frames(_concrete_choice(choice), slide_frames)
 
 
+def _outgoing_stays_in_place(plan: Optional[TransitionPlan]) -> bool:
+    """True when the outgoing photo is still at rest when its slide ends.
+
+    Cuts and incoming-only transitions (dissolves, dips, drops, slides)
+    leave the outgoing layer untouched, so it can be snapshotted into the
+    accumulated pile. Any outgoing effect — a push, peel, fade-out, blur or
+    pixelate — means the photo no longer looks like its settled self.
+    """
+    return plan is None or plan.outgoing is None or plan.outgoing.is_empty()
+
+
+def _fades_whole_clip(spec: Any) -> bool:
+    """True when *spec* hands off by opacity, so it may carry the backdrop.
+
+    Moving transitions (pushes, slides, page turns) must stay transparent
+    around the photo so the clip underneath remains visible, and additive
+    or lighten modes would brighten an opaque backdrop.
+    """
+    return (
+        bool(spec.blend)
+        and spec.composite_mode == "normal"
+        and (spec.page_turn is None or spec.page_turn.is_empty())
+    )
+
+
 def _incoming_on_top(layout: TimelineLayout, transition_index: int) -> bool:
     """Is the incoming slide on a higher track than the outgoing one?
 
@@ -659,7 +686,13 @@ class TimelineBuilder:
             # body that fits would change size mid-slide, turning the
             # split-track seam into a visible jump.
             clip_framing = self._framing_for(
-                timeline_item, framing, frame_size, placed.track_index
+                timeline_item,
+                framing,
+                frame_size,
+                placed.track_index,
+                backdrop_sources=self._accumulated_backdrop_sources(
+                    result, placed.index, fps
+                ),
             )
             if (
                 lead_in_plan is None
@@ -675,6 +708,39 @@ class TimelineBuilder:
                 framing=clip_framing,
                 motion=motion,
             )
+            if (
+                clip_framing is not None
+                and placed.track_index > LOWER_TRACK
+                and framing.backdrop != "none"
+                and _fades_whole_clip(spec)
+            ):
+                # An opacity-driven upper clip must carry the same backdrop
+                # as the track below. Otherwise a dip covers the lower
+                # backdrop with its own colour, and the backdrop snaps back
+                # only when the lower body resumes. Identical backdrops
+                # crossfade invisibly, and an accumulated pile gains its
+                # newest photo gradually.
+                lower_framing = self._framing_for(
+                    timeline_item,
+                    framing,
+                    frame_size,
+                    LOWER_TRACK,
+                    backdrop_sources=self._accumulated_backdrop_sources(
+                        result, placed.index, fps
+                    ),
+                )
+                clip_framing = (
+                    replace(lower_framing, backdrop_fades=True)
+                    if lower_framing is not None
+                    else None
+                )
+                spec = comp_spec_for_clip(
+                    placed,
+                    lead_in_plan=lead_in_plan,
+                    lead_out_plan=lead_out_plan,
+                    framing=clip_framing,
+                    motion=motion,
+                )
             if apply_comp_spec(timeline_item, spec) is not None:
                 result.comps_applied += 1
 
@@ -684,6 +750,7 @@ class TimelineBuilder:
         settings: FramingSettings,
         frame_size: Tuple[int, int],
         track_index: int,
+        backdrop_sources: Sequence[Tuple[Any, ...]] = (),
     ) -> Optional[Framing]:
         """Build the per-clip :class:`Framing`, or ``None`` if it can't be sized.
 
@@ -717,6 +784,67 @@ class TimelineBuilder:
             mode=settings.mode,
             backdrop_kind=settings.backdrop if on_lower_track else "none",
             backdrop_color=settings.backdrop_color,
+            backdrop_sources=(
+                tuple(backdrop_sources)
+                if on_lower_track and settings.backdrop == "accumulate"
+                else ()
+            ),
+        )
+
+    def _accumulated_backdrop_sources(
+        self, result: BuildResult, slide_index: int, fps: float = DEFAULT_TIMELINE_FPS
+    ) -> List[Tuple[Any, ...]]:
+        """Return the bounded, settled pile visible behind *slide_index*.
+
+        Fusion Loaders rebuild the pile directly from source paths, avoiding
+        rendered snapshots and keeping edits to earlier slides live. Each
+        photo joins at its final displayed pose, and only when its outgoing
+        transition leaves it in place — a photo pushed, peeled or faded away
+        has left the frame, so reappearing in the pile would be a pop.
+        """
+        if self.project.framing.backdrop != "accumulate" or slide_index <= 0:
+            return []
+        plans = result.transition_plans or []
+        sources: List[Tuple[Any, ...]] = []
+        for index in range(slide_index):
+            plan = plans[index] if index < len(plans) else None
+            if not _outgoing_stays_in_place(plan):
+                continue
+            size = _source_size(result.media_items[index])
+            if size is None:
+                continue
+            sources.append(
+                (
+                    _normalize_for_resolve(self.project.items[index].path),
+                    size[0],
+                    size[1],
+                    self._final_pose(index, fps),
+                )
+            )
+        return sources[-ACCUMULATE_MAX_DEPTH:]
+
+    def _final_pose(self, index: int, fps: float) -> Optional[Tuple[Any, ...]]:
+        """Return slide *index*'s last displayed ``(center, size, angle, pivot)``."""
+        motion = self.project.motion_for(index)
+        if motion.is_static():
+            return None
+        slide_frames = seconds_to_frames(
+            self.project.effective_duration(self.project.items[index]), fps
+        )
+        if slide_frames <= 0:
+            return None
+        animation = motion.plan_transform(slide_frames, fps=fps)
+
+        def last(channel):
+            if not channel:
+                return None
+            return max(channel, key=lambda item: int(item[0]))[1]
+
+        return (
+            last(animation.center),
+            last(animation.size),
+            last(animation.angle),
+            last(animation.pivot),
         )
 
     # -- entry point ------------------------------------------------------- #

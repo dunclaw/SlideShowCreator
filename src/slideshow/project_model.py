@@ -520,10 +520,10 @@ FRAMING_MODES = ("fit", "fill")
 #: ``blur`` fills it with a blurred, darkened, frame-filling copy of the
 #: photograph itself.
 #:
-#: The remaining options from issue #13 — ``dominant`` and ``accumulate`` —
-#: are deliberately *not* listed until they are implemented,
-#: so a project file can never ask for a backdrop that is silently ignored.
-BACKDROP_KINDS = ("none", "solid", "blur")
+#: ``accumulate`` rebuilds a bounded stack of previously shown photographs
+#: inside each slide's Fusion comp. ``dominant`` remains deliberately absent
+#: until its chroma-weighted sampler is implemented.
+BACKDROP_KINDS = ("none", "solid", "blur", "accumulate")
 
 DEFAULT_BACKDROP_COLOR = (0.0, 0.0, 0.0)
 

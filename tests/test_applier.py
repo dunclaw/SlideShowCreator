@@ -702,7 +702,91 @@ def test_no_blend_and_no_background_leaves_the_transform_wired_to_output():
     assert comp.tools["MediaOut1"].connections["Input"] == "Transform-out"
 
 
-def test_rebuilding_the_same_graph_does_not_duplicate_tools():
+def test_project_backdrop_is_composited_after_transition_opacity_and_transform():
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        transform=TransformAnimation(angle=[(0, 8.0), (10, 0.0)]),
+        blend=[(0, 0.0), (10, 1.0)],
+        framing=Framing(
+            frame_width=3840,
+            frame_height=2160,
+            source_width=1536,
+            source_height=2048,
+            backdrop_kind="solid",
+            backdrop_color=(0.1, 0.2, 0.3),
+        ),
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    assert built["transform"].connections["Input"] == built["canvas_merge"].Output
+    assert built["stable_backdrop_merge"].connections["Foreground"] == built["merge"].Output
+    assert (
+        built["stable_backdrop_merge"].connections["Background"]
+        == built["backdrop"].Output
+    )
+    assert comp.tools["MediaOut1"].connections["Input"] == (
+        built["stable_backdrop_merge"].Output
+    )
+
+
+def _solid_framing(**overrides):
+    values = dict(
+        frame_width=3840,
+        frame_height=2160,
+        source_width=1536,
+        source_height=2048,
+        backdrop_kind="solid",
+        backdrop_color=(0.1, 0.2, 0.3),
+    )
+    values.update(overrides)
+    return Framing(**values)
+
+
+def test_fading_backdrop_sits_inside_the_clip_opacity_merge():
+    # An upper clip's backdrop must fade with the clip, so the identical
+    # backdrop on the lower track shows through rather than being hidden.
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        blend=[(0, 0.0), (10, 1.0)],
+        framing=_solid_framing(backdrop_fades=True),
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    assert built["merge"].connections["Foreground"] == (
+        built["stable_backdrop_merge"].Output
+    )
+    assert comp.tools["MediaOut1"].connections["Input"] == built["merge"].Output
+
+
+def test_dip_colour_with_a_backdrop_tints_only_the_photo():
+    # A full-frame dip colour would hide the backdrop for the whole
+    # transition and snap it back afterwards.
+    comp = _FakeComp()
+    spec = CompSpec(
+        length_frames=50,
+        background_color=(1.0, 1.0, 1.0),
+        color_blend=[(0, 0.0), (10, 1.0)],
+        blend=[(0, 0.0), (5, 1.0)],
+        framing=_solid_framing(backdrop_fades=True),
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    color_merge = built["color_merge"]
+    assert color_merge.inputs["Operator"] == "Atop"
+    assert color_merge.connections["Background"] == built["transform"].Output
+    assert color_merge.connections["Foreground"] == (
+        built["color_background"].Output
+    )
+    assert built["stable_backdrop_merge"].connections["Foreground"] == (
+        color_merge.Output
+    )
+    spline = color_merge.connections["Blend"]
+    assert spline.keyframes == {0: [1.0], 10: [0.0]}
     comp = _FakeComp()
     spec = CompSpec(
         length_frames=50,
@@ -895,6 +979,29 @@ def test_page_turn_uses_the_same_frame_sized_canvas_as_2d_segments():
     assert built["renderer"].inputs["Height"] == 2160.0
     assert built["render_size"] == (3840.0, 2160.0)
     assert built["plane_size"] == (pytest.approx(16.0 / 9.0), 1.0)
+
+
+def test_page_turn_rotates_the_photo_over_a_stationary_project_backdrop():
+    comp = _FakeComp()
+    spec = _page_spec()
+    spec.framing = Framing(
+        frame_width=3840,
+        frame_height=2160,
+        source_width=1536,
+        source_height=2048,
+        backdrop_kind="solid",
+    )
+
+    built = build_comp_graph(comp, spec)
+
+    assert built["plane"].connections["MaterialInput"] == built["canvas_merge"].Output
+    assert (
+        built["stable_backdrop_merge"].connections["Foreground"]
+        == built["renderer"].Output
+    )
+    assert comp.tools["MediaOut1"].connections["Input"] == (
+        built["stable_backdrop_merge"].Output
+    )
 
 
 def test_camera_is_fitted_so_a_flat_page_fills_the_frame():
@@ -1163,6 +1270,7 @@ class TestFraming:
         assert self._framing().backdrop_alpha == 0.0
         assert self._framing(backdrop_kind="solid").backdrop_alpha == 1.0
         assert self._framing(backdrop_kind="blur").backdrop_alpha == 1.0
+        assert self._framing(backdrop_kind="accumulate").backdrop_alpha == 1.0
 
     def test_only_a_transparent_fit_is_a_noop(self):
         # A transparent fit canvas reproduces Resolve's own scaleToFit
@@ -1171,10 +1279,11 @@ class TestFraming:
         assert not self._framing(mode="fill").is_noop()
         assert not self._framing(backdrop_kind="solid").is_noop()
         assert not self._framing(backdrop_kind="blur").is_noop()
+        assert not self._framing(backdrop_kind="accumulate").is_noop()
 
     def test_rejects_an_unknown_backdrop_kind(self):
         with pytest.raises(ValueError, match="backdrop_kind"):
-            self._framing(backdrop_kind="accumulate")
+            self._framing(backdrop_kind="dominant")
 
     def test_rejects_an_unknown_mode(self):
         with pytest.raises(ValueError, match="mode"):

@@ -742,6 +742,27 @@ class TestFramingForClip:
         assert self._framing(settings, LOWER_TRACK).backdrop_kind == "blur"
         assert self._framing(settings, LOWER_TRACK + 1).backdrop_kind == "none"
 
+    def test_accumulate_sources_are_only_attached_to_the_lower_track(self):
+        settings = FramingSettings(backdrop="accumulate")
+        sources = ((r"D:\photos\old.jpg", 2048, 1536),)
+        lower = tb.TimelineBuilder._framing_for(
+            self._item(),
+            settings,
+            (3840, 2160),
+            LOWER_TRACK,
+            backdrop_sources=sources,
+        )
+        upper = tb.TimelineBuilder._framing_for(
+            self._item(),
+            settings,
+            (3840, 2160),
+            LOWER_TRACK + 1,
+            backdrop_sources=sources,
+        )
+        assert lower.backdrop_sources == sources
+        assert upper.backdrop_kind == "none"
+        assert upper.backdrop_sources == ()
+
     def test_upper_track_still_gets_a_frame_sized_canvas(self):
         # Suppressing the backdrop must not suppress the canvas: without it
         # the clip's animation moves in the photo's space, not the frame's.
@@ -766,6 +787,26 @@ class TestFramingForClip:
         ) is None
 
 
+class TestFadesWholeClip:
+    """Only opacity-driven upper clips may carry the persistent backdrop."""
+
+    def test_dissolve_and_dip_halves_carry_it(self):
+        from slideshow.transitions.applier import CompSpec
+
+        assert tb._fades_whole_clip(CompSpec(blend=[(0, 0.0), (10, 1.0)]))
+
+    def test_moving_and_additive_halves_do_not(self):
+        from slideshow.transitions.applier import CompSpec
+        from slideshow.transitions.base import TransformAnimation
+
+        moving = CompSpec(
+            transform=TransformAnimation(center=[(0, (1.5, 0.5)), (10, (0.5, 0.5))])
+        )
+        additive = CompSpec(blend=[(0, 0.0), (10, 1.0)], composite_mode="add")
+        assert not tb._fades_whole_clip(moving)
+        assert not tb._fades_whole_clip(additive)
+
+
 class TestSourceSize:
     def test_parses_a_resolution_string(self):
         mpi = MagicMock()
@@ -782,6 +823,91 @@ class TestSourceSize:
         mpi = MagicMock()
         mpi.GetClipProperty.side_effect = RuntimeError("boom")
         assert tb._source_size(mpi) is None
+
+
+class TestAccumulatedBackdropSources:
+    def test_uses_only_prior_photos_and_caps_depth(self):
+        count = tb.ACCUMULATE_MAX_DEPTH + 3
+        project = SlideshowProject.from_paths(
+            [r"D:\photos\{0}.jpg".format(index) for index in range(count)]
+        )
+        project.framing = FramingSettings(backdrop="accumulate")
+        media_items = []
+        for index in range(count):
+            item = MagicMock()
+            item.GetClipProperty.return_value = (
+                "2048x1536" if index % 2 == 0 else "1536x2048"
+            )
+            media_items.append(item)
+
+        sources = tb.TimelineBuilder(project)._accumulated_backdrop_sources(
+            tb.BuildResult(media_items=media_items), count - 1
+        )
+
+        assert len(sources) == tb.ACCUMULATE_MAX_DEPTH
+        assert sources[0][0].endswith("/2.jpg")
+        assert sources[-1][0].endswith("/{0}.jpg".format(count - 2))
+        assert sources[-1][1:3] == (1536, 2048)
+        assert sources[-1][3] is None  # static slide: settles at identity
+
+    @staticmethod
+    def _media(count):
+        items = []
+        for _ in range(count):
+            item = MagicMock()
+            item.GetClipProperty.return_value = "1920x1080"
+            items.append(item)
+        return items
+
+    def test_photos_whose_outgoing_transition_moves_them_are_left_out(self):
+        # A pushed or peeled photo has left the frame; reappearing in the
+        # pile at the seam would be a pop.
+        from slideshow.transitions import plan_transition
+        from slideshow.project_model import TransitionChoice
+
+        project = SlideshowProject.from_paths(
+            [r"D:\photos\{0}.jpg".format(index) for index in range(3)]
+        )
+        project.framing = FramingSettings(backdrop="accumulate")
+        plans = [
+            plan_transition(TransitionChoice(kind="push_left", duration_frames=12)),
+            plan_transition(TransitionChoice(kind="dissolve", duration_frames=12)),
+        ]
+
+        sources = tb.TimelineBuilder(project)._accumulated_backdrop_sources(
+            tb.BuildResult(media_items=self._media(3), transition_plans=plans), 2
+        )
+
+        assert [source[0][-5:] for source in sources] == ["1.jpg"]
+
+    def test_photo_settles_at_its_final_motion_pose(self):
+        from slideshow.project_model import MotionChoice
+
+        project = SlideshowProject.from_paths([r"D:\photos\a.jpg", r"D:\photos\b.jpg"])
+        project.framing = FramingSettings(backdrop="accumulate")
+        project.items[0].motion = MotionChoice(
+            kind="zoom_in", direction="center", zoom_amount=0.2, rotation_degrees=4.0
+        )
+        builder = tb.TimelineBuilder(project)
+        full = project.motion_for(0).plan_transform(
+            tb.seconds_to_frames(project.effective_duration(project.items[0]), 24.0),
+            fps=24.0,
+        )
+
+        (source,) = builder._accumulated_backdrop_sources(
+            tb.BuildResult(media_items=self._media(2)), 1, fps=24.0
+        )
+
+        center, size, angle, _pivot = source[3]
+        assert size == max(full.size, key=lambda item: item[0])[1]
+        assert angle == max(full.angle, key=lambda item: item[0])[1]
+        assert size != 1.0
+
+    def test_non_accumulate_projects_do_not_build_loader_sources(self):
+        project = SlideshowProject.from_paths([r"D:\photos\one.jpg"])
+        assert tb.TimelineBuilder(project)._accumulated_backdrop_sources(
+            tb.BuildResult(media_items=[MagicMock()]), 0
+        ) == []
 
 
 class TestTimelineFrameSize:
