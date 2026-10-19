@@ -620,9 +620,11 @@ def test_attach_transform_animation_locks_edits_and_marks_modified():
     comp = MagicMock()
     ti.LoadFusionCompByName.return_value = comp
 
-    media_in = MagicMock(); media_in.Output = "mi-out"
+    media_in = MagicMock()
+    media_in.Output = "mi-out"
     media_out = MagicMock()
-    xform = MagicMock(); xform.Output = "xf-out"
+    xform = MagicMock()
+    xform.Output = "xf-out"
     xform.GetAttrs.return_value = "SlideShowXf"
     tools = {"MediaIn1": media_in, "MediaOut1": media_out, "SlideShowXf": None}
 
@@ -639,7 +641,6 @@ def test_attach_transform_animation_locks_edits_and_marks_modified():
     events = []
     comp.Lock.side_effect = lambda: events.append("lock")
     comp.Unlock.side_effect = lambda: events.append("unlock")
-    orig_add = comp.AddTool.side_effect
     comp.SetAttrs.side_effect = lambda *a, **kw: events.append("setattrs")
 
     anim = fc.TransformAnimation(angle=[(0, 0.0), (24, 90.0)])
@@ -666,9 +667,11 @@ def test_attach_transform_animation_no_animation_still_attaches_chain():
     ti.GetFusionCompNameList.return_value = ["Composition 1"]
     comp = MagicMock()
     ti.LoadFusionCompByName.return_value = comp
-    media_in = MagicMock(); media_in.Output = "mi-out"
+    media_in = MagicMock()
+    media_in.Output = "mi-out"
     media_out = MagicMock()
-    xform = MagicMock(); xform.Output = "xf-out"
+    xform = MagicMock()
+    xform.Output = "xf-out"
     tools = {"MediaIn1": media_in, "MediaOut1": media_out, "SlideShowXf": None}
     comp.FindTool.side_effect = lambda name: tools.get(name)
     comp.AddTool.return_value = xform
@@ -686,9 +689,12 @@ def test_attach_transform_animation_no_animation_still_attaches_chain():
 
 def test_list_tools_returns_names_in_dict_key_order():
     comp = MagicMock()
-    t1 = MagicMock(); t1.GetAttrs.return_value = "MediaIn1"
-    t2 = MagicMock(); t2.GetAttrs.return_value = "MediaOut1"
-    t3 = MagicMock(); t3.GetAttrs.return_value = "SlideShowXf"
+    t1 = MagicMock()
+    t1.GetAttrs.return_value = "MediaIn1"
+    t2 = MagicMock()
+    t2.GetAttrs.return_value = "MediaOut1"
+    t3 = MagicMock()
+    t3.GetAttrs.return_value = "SlideShowXf"
     comp.GetToolList.return_value = {1: t1, 2: t3, 3: t2}
 
     names = fc.list_tools(comp)
