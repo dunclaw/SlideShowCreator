@@ -29,6 +29,11 @@ py -3.14 scripts\build_demo_timeline.py <folder-of-images> --transition slide_le
 py -3.14 scripts\build_demo_timeline.py --list-transitions
 ```
 
+For a read-only check that Resolve, a project, and a timeline are accessible,
+run `py -3.14 scripts\live_check.py integration`. Other `live_check.py`
+subcommands investigate Fusion behavior and may edit compositions or add them
+to clips; run those only on a disposable timeline.
+
 Still to come: auto-mix, per-clip motion (Ken Burns), bulk duration fitting,
 titles, soundtrack analysis / beat sync, and the in-Resolve UI.
 

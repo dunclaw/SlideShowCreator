@@ -28,8 +28,8 @@ from typing import Optional
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
 
-from slideshow import fusion_comps as fc
-from slideshow.resolve_bridge import ResolveContext, ResolveNotRunningError
+from slideshow import fusion_comps as fc  # noqa: E402
+from slideshow.resolve_bridge import ResolveContext, ResolveNotRunningError  # noqa: E402
 
 
 def _pick_clip(timeline, track: int, index: int):
