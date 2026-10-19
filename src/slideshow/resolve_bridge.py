@@ -10,8 +10,8 @@ to DaVinci Resolve. It can run in two contexts:
    The SDK location is not on ``sys.path``; we add it ourselves using the
    well-known install paths (or honor ``RESOLVE_SCRIPT_API`` if set).
 
-The bridge avoids any non-stdlib imports so it remains compatible with
-Resolve's bundled Python interpreter.
+The bridge avoids third-party dependencies. Resolve does not bundle Python;
+the menu launcher hands off to a separately provisioned sidecar interpreter.
 """
 
 from __future__ import annotations
