@@ -37,17 +37,7 @@ from slideshow.project_model import (  # noqa: E402
 from slideshow.resolve_bridge import ResolveNotRunningError  # noqa: E402
 from slideshow.timeline_builder import build_slideshow  # noqa: E402
 from slideshow.transitions import registered_kinds  # noqa: E402
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp", ".heic"}
-
-
-def _gather(folder: str) -> list:
-    files = []
-    for name in sorted(os.listdir(folder)):
-        full = os.path.join(folder, name)
-        if os.path.isfile(full) and os.path.splitext(name)[1].lower() in IMAGE_EXTS:
-            files.append(full)
-    return files
+from slideshow.folder_project import gather_images as _gather  # noqa: E402
 
 
 def _timecode(frame: int, fps: float) -> str:

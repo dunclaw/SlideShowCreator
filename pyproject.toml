@@ -22,9 +22,9 @@ classifiers = [
 # neither control nor should install into.
 #
 # So the plug-in is an external engine driven by a thin in-Resolve launcher
-# (see issue #9). Keeping the core import-free means the launcher and the
-# timeline builder run anywhere, including that unknown interpreter, and it
-# is what lets the test suite run with no Resolve and no dependencies. All
+# (see issue #9). The launcher stays compatible with the unknown host Python;
+# the UI and timeline builder run in the pinned sidecar. Keeping the builder
+# stdlib-only lets its test suite run with no Resolve or ML dependencies. All
 # heavy work is *analysis*, which happens ahead of the build in a sidecar
 # venv and reaches the builder as plain numbers in the project JSON.
 dependencies = []
